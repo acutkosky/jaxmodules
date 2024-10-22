@@ -1,0 +1,25 @@
+[build-system]
+requires = ["flit_core>=3.4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "jaxmodules"
+version = "0.1"
+authors = [
+  { name="Ashok Cutkosky", email="ashok@cutkosky.com" },
+]
+description = "some potentially useful jax functions"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+  equinox
+]
+
+[project.urls]
+Homepage = "https://github.com/acutkosky/jaxmodules"
+Issues = "https://github.com/acutkosky/jaxmodules/issues"
