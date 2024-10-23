@@ -16,14 +16,14 @@ from einops import einsum, rearrange
 def matrix_inverse_sqrt(M, eps=0):
     eig_vals, eig_vecs = jnp.linalg.eigh(M)
 
-    eig_vals = 1.0 / jnp.sqrt(eig_vals + eps)
+    inv_eig_vals = 1.0 / jnp.sqrt(jnp.maximum(eig_vals, eps))
 
-    result = eig_vecs @ jnp.diag(eig_vals) @ eig_vecs
+    result = einsum(eig_vecs, inv_eig_vals, eig_vecs, '... d1 d2, ... d2, ... d3 d2 -> ... d1  d3')
 
     return result
 
 
-class StandarizeNorm(StatefulLayer, strict=True):
+class StandardizeNorm(StatefulLayer, strict=True):
     state_index: StateIndex[
         tuple[Float[Array, "input_size"], Float[Array, "input_size"]]
     ]
@@ -86,7 +86,7 @@ class StandarizeNorm(StatefulLayer, strict=True):
         self.eps = eps
         self.momentum = momentum
 
-    @jax.named_scope("eqx.nn.BatchNorm")
+    @jax.named_scope("normalizers.StandardizeNorm")
     def __call__(
         self,
         x: Array,
@@ -120,7 +120,7 @@ class StandarizeNorm(StatefulLayer, strict=True):
         """
 
         x_flat = jnp.reshape(x, (-1, self.input_size))
-        N, _ = x.flat.shape
+        N, _ = x_flat.shape
         running_mean, running_cov, count = state.get(self.state_index)
 
         if inference is None:
@@ -181,7 +181,7 @@ class CausalNorm(StatefulLayer):
         self.var_resolution = var_resolution
         self.eps = eps
 
-    def __call__(self, x: jnp.Array):
+    def __call__(self, x: jax.Array):
         T, C = x.shape
 
 
@@ -192,7 +192,7 @@ class CausalNorm(StatefulLayer):
 
             if self.mean_resolution == "scalar":
                 means = jnp.mean(means, axis=1, keepdims=True)
-            centered_x = x
+            centered_x = x  - means
 
         if self.var_resolution == "scalar":
             vars = jnp.cumsum(centered_x**2, axis=0) / jnp.arange(1, T + 1).reshape(
@@ -212,9 +212,9 @@ class CausalNorm(StatefulLayer):
             result = centered_x / jnp.sqrt(vars)
         elif self.var_resolution == "matrix":
             vars = einsum(centered_x, centered_x, "t c1, t c2 -> t c1 c2")
-            vars = jnp.cumsum(vars, axis=0) / jnp.arange(1, T + 1).reshape((T, 1))
+            vars = jnp.cumsum(vars, axis=0) / jnp.arange(1, T + 1).reshape((T, 1, 1))
 
-            preconditioner = jax.vmap(lambda M: matrix_inverse_sqrt(M, self.eps))(vars)
+            preconditioner = matrix_inverse_sqrt(vars, self.eps)
 
             result = einsum(centered_x, preconditioner, "t c, t c c2 -> t c2")
 
