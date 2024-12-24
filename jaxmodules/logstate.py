@@ -75,3 +75,32 @@ def list_of_logs(tree: PyTree):
 
 def set_all_logs(tree: PyTree, value=None):
     return map_logs(lambda x: value, tree)
+
+
+def map_instances(
+    fn: Callable,
+    cls: type,
+    tree: PyTree
+):
+    
+    def map_fn(value):
+        if not isinstance(value, cls):
+            return None
+        return fn(value)
+
+    return jtu.tree_map(map_fn, tree, is_leaf=lambda x: isinstance(x, cls))
+
+def list_mapped_instances(
+    fn: Callable,
+    cls: type,
+    tree: PyTree
+):
+    result = []
+    def append(value):
+        result.append(value)
+        return None
+    map_instances(append, cls, tree)
+
+    result = [fn(cls) for cls in result]
+
+    return result

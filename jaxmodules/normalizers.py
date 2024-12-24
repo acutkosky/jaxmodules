@@ -27,7 +27,7 @@ class StandardizeNorm(StatefulLayer, strict=True):
     state_index: StateIndex[
         tuple[Float[Array, "input_size"], Float[Array, "input_size"]]
     ]
-    axis_name: Union[Hashable, Sequence[Hashable]]
+    axis_name: Union[Hashable, Sequence[Hashable]] = field(static=True)
     inference: bool
     input_size: int = field(static=True)
     eps: float = field(static=True)
@@ -181,7 +181,7 @@ class CausalNorm(StatefulLayer):
         self.var_resolution = var_resolution
         self.eps = eps
 
-    def __call__(self, x: jax.Array):
+    def __call__(self, x: jax.Array, return_stats=False):
         T, C = x.shape
 
 
@@ -218,6 +218,9 @@ class CausalNorm(StatefulLayer):
 
             result = einsum(centered_x, preconditioner, "t c, t c c2 -> t c2")
 
-        return result
+        if return_stats:
+            return result, means, vars
+        else:
+            return result
 
 
