@@ -67,74 +67,36 @@ class BlockMask(NamedTuple):
         mask = jnp.full((self.B, self.H, self.Q_LEN, self.KV_LEN), False, dtype=jnp.bool)
         mask = rearrange(mask, "B H (Q Qb) (KV KVb) ->B H Q KV Qb KVb", Qb = self.Q_BLOCK_SIZE, KVb = self.KV_BLOCK_SIZE)
 
-        def set_partial_value(b, h, q_block_idx, mask):
-            def loop_fn(sparse_idx, mask):
-                kv_block_idx = self.kv_indices[b, h, q_block_idx, sparse_idx]
-                partial_block = self.get_mask_for_partial_block(b, h, q_block_idx, kv_block_idx)
-                return mask.at[b, h, q_block_idx, kv_block_idx].set(partial_block)
-            
-            return jax.lax.fori_loop(
-                body_fun=loop_fn,
-                init_val = mask,
-                lower = 0,
-                upper = self.kv_num_blocks[b, h, q_block_idx]
-            )
-
-        def set_full_value(b, h, q_block_idx, mask):
-            def loop_fn(sparse_idx, mask):
-                kv_block_idx = self.full_kv_indices[b, h, q_block_idx, sparse_idx]
-                full_block = jnp.full((self.Q_BLOCK_SIZE, self.KV_BLOCK_SIZE), True)
-                return mask.at[b, h, q_block_idx, kv_block_idx].set(full_block)
-            
-            return jax.lax.fori_loop(
-                body_fun=loop_fn,
-                init_val = mask,
-                lower = 0,
-                upper = self.full_kv_num_blocks[b, h, q_block_idx]
-            )
-
-        def set_b_slice(b, mask):
-            return jax.lax.fori_loop(
-                body_fun=lambda h, mask: set_b_h_slice(b, h, mask),
-                init_val = mask,
-                lower = 0,
-                upper = self.H
-            )
-        def set_b_h_slice(b, h ,mask):
-            return jax.lax.fori_loop(
-                body_fun=lambda q_block_idx, mask: set_full_value(b, h, q_block_idx, mask) + set_partial_value(b, h, q_block_idx, mask),
-                init_val = mask,
-                lower = 0,
-                upper = num_q_blocks
-            )
+        # add in the partial blocks
+        def partial_loop_fn(b, h, q_block_idx, sparse_idx, mask):
+            kv_block_idx = self.kv_indices[b, h, q_block_idx, sparse_idx]
+            partial_block = self.get_mask_for_partial_block(b, h, q_block_idx, kv_block_idx)
+            return mask.at[b, h, q_block_idx, kv_block_idx].set(partial_block)
         
-        mask = jax.lax.fori_loop(
-            lower = 0,
-            upper = self.B,
-            body_fun=set_b_slice,
-            init_val = mask,
+        mask = nested_fori_loop(
+            lowers=(0, 0, 0, 0),
+            uppers=(self.B, self.H, num_q_blocks, lambda b, h, q_block_idx: self.kv_num_blocks[b, h, q_block_idx]),
+            body_fun=partial_loop_fn,
+            init_val=mask
+        )
+
+
+        # now add in the full blocks
+        def full_loop_fn(b, h, q_block_idx, sparse_idx, mask):
+            kv_block_idx = self.full_kv_indices[b, h, q_block_idx, sparse_idx]
+            # full_block = jnp.full((self.Q_BLOCK_SIZE, self.KV_BLOCK_SIZE), True)
+            return mask.at[b, h, q_block_idx, kv_block_idx].set(True)#full_block)
+
+        mask =nested_fori_loop(
+            lowers=(0, 0, 0, 0),
+            uppers=(self.B, self.H, num_q_blocks, lambda b, h, q_block_idx: self.full_kv_num_blocks[b, h, q_block_idx]),
+            body_fun=full_loop_fn,
+            init_val=mask
         )
 
         mask = rearrange(mask, "B H Q KV Qb KVb ->B H (Q Qb) (KV KVb)").astype(jnp.int32)
 
         return mask
-
-    def _get_sparse_kv_blocks(self, kv_indices, kv_num_blocks) -> Array:
-        """
-        Get the block mask as a dense matrix from indices.
-        
-        Args:
-            kv_indices: Indices of the key-value blocks
-            kv_num_blocks: Number of blocks for each key-value position
-            
-        Returns:
-            A dense matrix representation of the block mask
-        """
-
-        ROWS = kv_num_blocks.shape[-1]
-        COLS = self.q_num_blocks.shape[-1]
-
-        return get_dense_from_kv_blocks(self.B, self.H, ROWS, COLS, kv_num_blocks, kv_indices)
 
     def get_full_blocks(self) -> Array:
         """
