@@ -172,4 +172,56 @@ def test_get_dense_from_kv_blocks():
     
     # Verify the output
     expected = jnp.array([[[[1, 0], [1, 1]]]])
-    assert jnp.array_equal(dense, expected) 
+    assert jnp.array_equal(dense, expected)
+
+def test_block_mask_causal_mask():
+    """Test BlockMask.causal_mask class method"""
+    B, H, L = 2, 2, 8
+    BLOCK_SIZE = 4
+    
+    # Create causal mask
+    block_mask = BlockMask.causal_mask(B, H, L, L, BLOCK_SIZE)
+    
+    # Test basic properties
+    assert block_mask.B == B
+    assert block_mask.H == H
+    assert block_mask.Q_LEN == L
+    assert block_mask.KV_LEN == L
+    assert block_mask.Q_BLOCK_SIZE == BLOCK_SIZE
+    assert block_mask.KV_BLOCK_SIZE == BLOCK_SIZE
+    
+    # Test materialized mask matches expected causal pattern
+    dense_mask = block_mask.materialize_mask()
+    expected_mask = jnp.array([
+        [[1, 0, 0, 0, 0, 0, 0, 0],
+         [1, 1, 0, 0, 0, 0, 0, 0],
+         [1, 1, 1, 0, 0, 0, 0, 0],
+         [1, 1, 1, 1, 0, 0, 0, 0],
+         [1, 1, 1, 1, 1, 0, 0, 0],
+         [1, 1, 1, 1, 1, 1, 0, 0],
+         [1, 1, 1, 1, 1, 1, 1, 0],
+         [1, 1, 1, 1, 1, 1, 1, 1]]
+    ])
+    expected_mask = jnp.broadcast_to(expected_mask, (B, H, L, L))
+    assert jnp.array_equal(dense_mask, expected_mask)
+
+def test_block_mask_full_mask():
+    """Test BlockMask.full_mask class method"""
+    B, H, L = 2, 2, 8
+    BLOCK_SIZE = 4
+    
+    # Create full mask
+    block_mask = BlockMask.full_mask(B, H, L, L, BLOCK_SIZE)
+    
+    # Test basic properties
+    assert block_mask.B == B
+    assert block_mask.H == H
+    assert block_mask.Q_LEN == L
+    assert block_mask.KV_LEN == L
+    assert block_mask.Q_BLOCK_SIZE == BLOCK_SIZE
+    assert block_mask.KV_BLOCK_SIZE == BLOCK_SIZE
+    
+    # Test materialized mask is all ones
+    dense_mask = block_mask.materialize_mask()
+    expected_mask = jnp.ones((B, H, L, L), dtype=jnp.int32)
+    assert jnp.array_equal(dense_mask, expected_mask) 

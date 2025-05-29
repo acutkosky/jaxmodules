@@ -152,7 +152,7 @@ class BlockMask(NamedTuple):
         )
     
     @classmethod
-    def causal(cls, B, H, Q_LEN, KV_LEN, BLOCK_SIZE):
+    def causal_mask(cls, B, H, Q_LEN, KV_LEN, BLOCK_SIZE):
         return create_block_mask(
             lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
             B,
