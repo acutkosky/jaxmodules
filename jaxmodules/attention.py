@@ -177,6 +177,7 @@ def flex_attention(
     if block_mask is None:
         Q_BLOCK_SIZE = L
         KV_BLOCK_SIZE = S
+        block_mask = BlockMask.full_mask(B, Hq, L, S, (Q_BLOCK_SIZE, KV_BLOCK_SIZE))
     else:
         Q_BLOCK_SIZE = block_mask.Q_BLOCK_SIZE
         KV_BLOCK_SIZE = block_mask.KV_BLOCK_SIZE

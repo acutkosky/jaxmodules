@@ -131,6 +131,39 @@ class BlockMask(NamedTuple):
         return self.get_full_blocks() + self.get_partial_blocks()
     
     @classmethod
+    def full_mask(cls, B, H, Q_LEN, KV_LEN, BLOCK_SIZE):
+        if isinstance(BLOCK_SIZE, int):
+            Q_BLOCK_SIZE = BLOCK_SIZE
+            KV_BLOCK_SIZE = BLOCK_SIZE
+        else:
+            Q_BLOCK_SIZE, KV_BLOCK_SIZE = BLOCK_SIZE
+
+        KV_BLOCKS = KV_LEN // KV_BLOCK_SIZE
+        Q_BLOCKS = Q_LEN // Q_BLOCK_SIZE
+
+        return cls.from_kv_blocks(
+            kv_num_blocks=jnp.zeros((B, H, Q_BLOCKS), dtype=jnp.int32),
+            kv_indices=jnp.ones((B, H, Q_BLOCKS, 1), dtype=jnp.int32),
+            full_kv_num_blocks=jnp.full((B, H, Q_BLOCKS), KV_BLOCKS, dtype=jnp.int32),
+            full_kv_indices=jnp.broadcast_to(jnp.arange(KV_BLOCKS), (B, H, Q_BLOCKS, KV_BLOCKS)),
+            BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+            mask_mod=lambda b, h, q_idx, kv_idx: True,
+            seq_lengths=(Q_LEN, KV_LEN)
+        )
+    
+    @classmethod
+    def causal(cls, B, H, Q_LEN, KV_LEN, BLOCK_SIZE):
+        return create_block_mask(
+            lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
+            B,
+            H,
+            Q_LEN,
+            KV_LEN,
+            BLOCK_SIZE
+        )
+            
+    
+    @classmethod
     def from_kv_blocks(
             cls,
             kv_num_blocks: Array,
