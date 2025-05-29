@@ -9,6 +9,16 @@ from jaxmodules.block_mask import BlockMask
 
 
 def threshold_kernel(threshold: Optional[float] = None):
+    """
+    Create a kernel function that applies a threshold to the dot product before exponentiating.
+    
+    Args:
+        threshold: Optional threshold to subtract from the dot product before exponentiating.
+            If None, no threshold is applied.
+            
+    Returns:
+        A kernel function that takes query and key vectors and returns their attention score
+    """
     def kernel_fn(q, k):
         dotp = jnp.dot(q,k)
         if threshold is not None:
@@ -18,6 +28,16 @@ def threshold_kernel(threshold: Optional[float] = None):
     return kernel_fn
 
 def default_kernel(q, k):
+    """
+    Default attention kernel that computes exp(q^T k / sqrt(d)).
+    
+    Args:
+        q: Query vector
+        k: Key vector
+        
+    Returns:
+        Attention score between q and k
+    """
     return jnp.exp(jnp.dot(q,k)/jnp.sqrt(k.shape[-1]))
 
 def masked_attention_via_scan(
@@ -115,6 +135,31 @@ def flex_attention(
         scale: Optional[Array] = None,
         enable_gqa: bool = False,
         return_lse=False):
+    """
+    Flexible attention implementation that supports block-sparse attention patterns.
+    This is a JAX implementation of the PyTorch flex_attention function.
+    
+    Args:
+        query: Query tensor of shape (B, Hq, L, E)
+        key: Key tensor of shape (B, Hkv, S, E)
+        value: Value tensor of shape (B, Hkv, S, Ev)
+        score_mod: Optional function to modify attention scores
+        block_mask: Optional BlockMask to specify block-sparse attention pattern
+        scale: Optional scaling factor for attention scores. If None, uses 1/sqrt(E)
+        enable_gqa: If True, enables grouped-query attention where Hq can be larger than Hkv
+        return_lse: If True, returns log-sum-exp of attention scores along with output (currently not supported)
+        
+    Returns:
+        If return_lse is False:
+            Output tensor of shape (B, Hq, L, Ev)
+        If return_lse is True:
+            Tuple of (output, lse) where:
+            - output: Output tensor of shape (B, Hq, L, Ev)
+            - lse: Log-sum-exp of attention scores
+    """
+
+    if return_lse:
+        raise NotImplementedError("return_lse is not supported yet")
 
     B, Hq, L, E = query.shape
     Bk, Hkv, S, Ek = key.shape
@@ -241,8 +286,30 @@ def flex_attention_slow(
         scale: Optional[Array] = None,
         enable_gqa: bool = False,
         return_lse=False):
+    """
+    Slower but more slightly more straightforward implementation of flex_attention.
+    This is used for testing and debugging purposes.
     
-    # first, let's do a very naive implementation to make sure it's working
+    Args:
+        query: Query tensor of shape (B, Hq, L, E)
+        key: Key tensor of shape (B, Hkv, S, E)
+        value: Value tensor of shape (B, Hkv, S, Ev)
+        score_mod: Optional function to modify attention scores
+        block_mask: Optional BlockMask to specify block-sparse attention pattern
+        scale: Optional scaling factor for attention scores. If None, uses 1/sqrt(E)
+        enable_gqa: If True, enables grouped-query attention where Hq can be larger than Hkv
+        return_lse: If True, returns log-sum-exp of attention scores along with output
+        
+    Returns:
+        If return_lse is False:
+            Output tensor of shape (B, Hq, L, Ev)
+        If return_lse is True:
+            Tuple of (output, lse) where:
+            - output: Output tensor of shape (B, Hq, L, Ev)
+            - lse: Log-sum-exp of attention scores
+    """
+    
+    # first, let's do a naive implementation to make sure it's working
 
     B, Hq, L, E = query.shape
     Bk, Hkv, S, Ek = key.shape

@@ -33,6 +33,18 @@ class BlockMask(NamedTuple):
     mask_mod: Callable[[Array, Array], Array]
 
     def get_mask_for_partial_block(self, b, h, q_block_idx, kv_block_idx):
+        """
+        Get the mask for a partial block at the specified indices.
+        
+        Args:
+            b: batch index
+            h: head index
+            q_block_idx: query block index
+            kv_block_idx: key-value block index
+            
+        Returns:
+            A boolean mask of shape (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for the specified block
+        """
         def coord_fn(rel_q_idx, rel_k_idx):
             q_idx = rel_q_idx + q_block_idx*self.Q_BLOCK_SIZE
             k_idx = rel_k_idx + kv_block_idx*self.KV_BLOCK_SIZE
@@ -44,6 +56,12 @@ class BlockMask(NamedTuple):
         )
 
     def materialize_mask(self):
+        """
+        Convert the block mask into a dense boolean mask.
+        
+        Returns:
+            A dense boolean mask of shape (B, H, Q_LEN, KV_LEN)
+        """
         num_q_blocks = self.kv_num_blocks.shape[-1]
 
         mask = jnp.full((self.B, self.H, self.Q_LEN, self.KV_LEN), False, dtype=jnp.bool)
@@ -103,7 +121,14 @@ class BlockMask(NamedTuple):
 
     def _get_sparse_kv_blocks(self, kv_indices, kv_num_blocks) -> Array:
         """
-        get the block mask fas a dense matrix from indices.
+        Get the block mask as a dense matrix from indices.
+        
+        Args:
+            kv_indices: Indices of the key-value blocks
+            kv_num_blocks: Number of blocks for each key-value position
+            
+        Returns:
+            A dense matrix representation of the block mask
         """
 
         ROWS = kv_num_blocks.shape[-1]
@@ -112,11 +137,23 @@ class BlockMask(NamedTuple):
         return get_dense_from_kv_blocks(self.B, self.H, ROWS, COLS, kv_num_blocks, kv_indices)
 
     def get_full_blocks(self) -> Array:
+        """
+        Get the block representation of full (all-ones) blocks.
+        
+        Returns:
+            A dense matrix where 1 indicates a full block and 0 indicates no block
+        """
         ROWS = self.full_kv_num_blocks.shape[-1]
         COLS = self.full_q_num_blocks.shape[-1]
         return get_dense_from_kv_blocks(self.B, self.H, ROWS, COLS, self.full_kv_num_blocks, self.full_kv_indices)
 
     def get_partial_blocks(self) -> Array:
+        """
+        Get the block representation of partial blocks.
+        
+        Returns:
+            A dense matrix where 1 indicates a partial block and 0 indicates no block
+        """
         ROWS = self.kv_num_blocks.shape[-1]
         COLS = self.q_num_blocks.shape[-1]
         return get_dense_from_kv_blocks(self.B, self.H, ROWS, COLS, self.kv_num_blocks, self.kv_indices)
@@ -205,6 +242,23 @@ class BlockMask(NamedTuple):
         )
 
 def get_partial_block(mask_mod, b, h, block_q_idx, block_kv_idx, Q_BLOCK_SIZE, KV_BLOCK_SIZE, B, H):
+    """
+    Get a partial block mask for the specified indices.
+    
+    Args:
+        mask_mod: Function that computes the mask for a single position
+        b: batch index
+        h: head index
+        block_q_idx: query block index
+        block_kv_idx: key-value block index
+        Q_BLOCK_SIZE: Size of query blocks
+        KV_BLOCK_SIZE: Size of key-value blocks
+        B: Batch size
+        H: Number of heads
+        
+    Returns:
+        A boolean mask of shape (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for the specified block
+    """
     block_q_start = block_q_idx * Q_BLOCK_SIZE
     block_q_end = block_q_start + Q_BLOCK_SIZE
     block_kv_start = block_kv_idx * KV_BLOCK_SIZE
@@ -221,6 +275,21 @@ def get_sparse_kv_data_from_blocks(
     num_blocks_in_row,
     blocks: Array
 ):
+    """
+    Convert a dense block mask into sparse matrix block data along the key-value (row) axis.
+    
+    Args:
+        B: Batch size
+        H: Number of heads
+        num_blocks_in_col: Number of blocks in each column
+        num_blocks_in_row: Number of blocks in each row
+        blocks: Dense block mask
+        
+    Returns:
+        Tuple of (kv_num_blocks, kv_indices) where:
+        - kv_num_blocks: Number of blocks for each key-value position
+        - kv_indices: Indices of the blocks for each key-value position
+    """
     kv_num_blocks = einsum(blocks, "b h kv q -> b h kv") # [b h kv q] -> [b h kv]
     MAX_PARTIAL_BLOCKS_IN_ROW = int(jnp.max(kv_num_blocks))
 
@@ -247,6 +316,21 @@ def get_sparse_q_data_from_blocks(
     num_blocks_in_row,
     blocks: Array
 ):
+    """
+    Convert a dense block mask into sparse query block data.
+    
+    Args:
+        B: Batch size
+        H: Number of heads
+        num_blocks_in_col: Number of blocks in each column
+        num_blocks_in_row: Number of blocks in each row
+        blocks: Dense block mask
+        
+    Returns:
+        Tuple of (q_num_blocks, q_indices) where:
+        - q_num_blocks: Number of blocks for each query position
+        - q_indices: Indices of the blocks for each query position
+    """
     return get_sparse_kv_data_from_blocks(B, H, num_blocks_in_row, num_blocks_in_col, rearrange(blocks, "b h q kv -> b h kv q"))
 
 def create_block_mask(
@@ -318,7 +402,18 @@ def create_block_mask(
 
 def get_dense_from_kv_blocks(B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, kv_num_blocks, kv_indices) -> Array:
     """
-    get the block mask as a dense matrix from indices.
+    Convert sparse key-value block data into a dense block mask.
+    
+    Args:
+        B: Batch size
+        H: Number of heads
+        NUM_Q_BLOCKS: Number of query blocks
+        NUM_KV_BLOCKS: Number of key-value blocks
+        kv_num_blocks: Number of blocks for each key-value position
+        kv_indices: Indices of the blocks for each key-value position
+        
+    Returns:
+        A dense matrix where 1 indicates a block and 0 indicates no block
     """
 
     ROWS = NUM_Q_BLOCKS

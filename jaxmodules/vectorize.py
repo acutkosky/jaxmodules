@@ -105,8 +105,53 @@ def partial(fn, arg):
     return lambda *args: fn(arg, *args)
     
 def nested_fori_loop(lowers: Tuple[int], uppers: Tuple[int], body_fun: Callable, init_val: Array) -> Array:
+    """
+    Execute a nested sequence of for loops using JAX's fori_loop.
+    
+    This function implements nested loops by recursively applying JAX's fori_loop.
+    Each level of nesting corresponds to one element in the lowers and uppers tuples.
+    The body_fun is called at the innermost level with all loop indices.
+    
+    Args:
+        lowers: Tuple of lower bounds for each loop level. Each element can be either:
+            - An integer for a fixed lower bound
+            - A callable that takes the outer loop indices and returns the lower bound
+        uppers: Tuple of upper bounds for each loop level. Each element can be either:
+            - An integer for a fixed upper bound
+            - A callable that takes the outer loop indices and returns the upper bound
+        body_fun: Function to execute at each iteration. Takes loop indices as arguments
+            followed by the accumulated value. The first argument is the outermost loop index,
+            the second is the next level, and so on.
+        init_val: Initial value for the accumulated result
+        
+    Returns:
+        The final accumulated value after executing all nested loops
+        
+    Examples:
+        # Example 1: Fixed bounds
+        # Equivalent to:
+        # for i in range(2):
+        #     for j in range(3):
+        #         result = body_fun(i, j, result)
+        result = nested_fori_loop(
+            lowers=(0, 0),
+            uppers=(2, 3),
+            body_fun=lambda i, j, val: body_fun(i, j, val),
+            init_val=initial_value
+        )
 
-
+        # Example 2: Dynamic bounds using functions
+        # Equivalent to:
+        # for i in range(2):
+        #     for j in range(i, i + 3):  # inner loop range depends on i
+        #         result = body_fun(i, j, result)
+        result = nested_fori_loop(
+            lowers=(0, lambda i: i),  # inner loop starts at i
+            uppers=(2, lambda i: i + 3),  # inner loop ends at i + 3
+            body_fun=lambda i, j, val: body_fun(i, j, val),
+            init_val=initial_value
+        )
+    """
     nest_count = len(lowers)
 
     lowers = [_process_limit_fn(limit) for limit in lowers]
