@@ -26,8 +26,7 @@ def masked_attention_via_scan(
     V: Array,
     *,
     is_causal: bool=False,
-    # kernel_fn: Callable[float, float] = jnp.exp, 
-    kernel_fn: Callable[[Array, Array],  float] = default_kernel, #lambda q, k: jnp.exp(jnp.dot(q,k)/jnp.sqrt(3)),
+    kernel_fn: Callable[[Array, Array],  float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]]=None,
     block_size=None
 ) -> Array:
@@ -107,10 +106,6 @@ def masked_attention_via_scan(
 
     return values
 
-
-
-
-
 def flex_attention(
         query: Array,
         key: Array,
@@ -128,14 +123,11 @@ def flex_attention(
     if scale is None:
         scale = 1.0/jnp.sqrt(E)
 
-    
-
     assert E == Ek, "query and key must have the same embedding dimension"
     assert B == Bk, "query and key must have the same batch dimension"
     assert Sv == S, "value and key must have the same sequence length"
     assert Bv == B, "value and query must have the same batch dimension"
     assert Hv == Hkv, "value and key must have the same head count"
-
 
     if block_mask is None:
         Q_BLOCK_SIZE = L
@@ -155,14 +147,11 @@ def flex_attention(
 
     GROUP_SIZE = Hq // Hkv
 
-
-
     query = rearrange(query, "B (Hkv G) (L Qb) E -> B Hkv G L Qb E", Hkv = Hkv, Qb=Q_BLOCK_SIZE)
     key = rearrange(key, "B Hkv (S KVb) E -> B Hkv S KVb E", KVb=KV_BLOCK_SIZE)
     value = rearrange(value, "B Hvk (S KVb) Ev -> B Hvk S KVb Ev", KVb=KV_BLOCK_SIZE)
 
     def get_score_for_query_kv_block(b, h, g, l, s):
-        jax.debug.print("getting score for block: {b}, {h}, {g}, {l}, {s}", b=b, h=h, g=g, l=l, s=s)
         score = einsum(
             query[b, h, g, l],
             key[b, h, s],
@@ -200,22 +189,12 @@ def flex_attention(
             value[b, h, s],
             "Qb KVb, KVb Ev -> Qb Ev"
         )
-        jax.debug.print("value_for_block: {value_for_block}", value_for_block=value_for_block)
-        jax.debug.print("score_normalized: {score_normalized}", score_normalized=score_normalized)
-        jax.debug.print("next_max_score: {next_max_score}", next_max_score=next_max_score)
 
         next_sum_exp_score = jnp.nan_to_num(sum_exp_score*jnp.exp(max_score - next_max_score) + jnp.sum(jnp.exp(score_normalized), axis=-1, keepdims=True))
-        jax.debug.print("next_sum_exp_score: {next_sum_exp_score}", next_sum_exp_score=next_sum_exp_score)
-        jax.debug.print("adjusted carry: {}", result_carry*jnp.exp(max_score - next_max_score)*(sum_exp_score/next_sum_exp_score))
-        # next_sum_exp_score = sum_exp_score + jnp.sum(jnp.exp(score_normalized), axis=-1, keepdims=True)
         next_result_carry = jnp.nan_to_num(
             result_carry*jnp.exp(max_score - next_max_score)*(sum_exp_score/next_sum_exp_score) + value_for_block/next_sum_exp_score
         )
-        # next_result_carry = result_carry + value_for_block
         return (next_result_carry, next_sum_exp_score, next_max_score)
-    
-
-    
     
     def get_value_from_full_masks_for_query_block(b, h, g, l):
         hq = h*GROUP_SIZE + g
@@ -225,7 +204,6 @@ def flex_attention(
         result_carry = jnp.zeros((Q_BLOCK_SIZE, Ev))
         sum_exp_score = jnp.zeros((Q_BLOCK_SIZE, 1))
         max_score = jnp.full((Q_BLOCK_SIZE, 1), -jnp.inf)
-
 
         result_carry, sum_exp_score, max_score = jax.lax.fori_loop(
             lower=0,
@@ -242,13 +220,8 @@ def flex_attention(
             body_fun=lambda j, acc: accumulate_value_for_query_block(b, h, g, l, kv_indices[j], acc, do_mask=True),
             init_val=(result_carry, sum_exp_score, max_score)
         )
-        # for j in range(block_limit):
-        #     block_coord = kv_indices[b, hq, l, j]
-        #     result_carry, sum_exp_score, max_score = accumulate_value_for_query_block(b, h, g, l, block_coord, (result_carry, sum_exp_score, max_score))
 
         return result_carry
-    
-
     
     result = array_from_coords(
         shape=(B, Hkv, GROUP_SIZE, L // Q_BLOCK_SIZE),
@@ -258,7 +231,6 @@ def flex_attention(
     result = rearrange(result, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev", Qb=Q_BLOCK_SIZE)
 
     return result
-
 
 def flex_attention_slow(
         query: Array,
@@ -298,17 +270,11 @@ def flex_attention_slow(
 
     GROUP_SIZE = Hq // Hkv
 
-
-
     query = rearrange(query, "B (Hkv G) (L Qb) E -> B Hkv G L Qb E", Hkv = Hkv, Qb=Q_BLOCK_SIZE)
     key = rearrange(key, "B Hkv (S KVb) E -> B Hkv S KVb E", KVb=KV_BLOCK_SIZE)
-    # value = rearrange(value, "B Hkv (S KVb) Ev -> B Hkv KVb S Ev", V=KV_BLOCK_SIZE)
-
-    # now, each query 
 
     scores = einsum(query, key, "B Hkv G L Qb E, B Hkv S KVb E -> B Hkv G L S Qb KVb")/jnp.sqrt(E)
     if score_mod is not None:
-
         def block_grouped_score_mod(score, b, h, g, l, s, qb, kb):
             h = h * GROUP_SIZE + g
             l = l * Q_BLOCK_SIZE + qb
@@ -339,16 +305,11 @@ def flex_attention_slow(
             jnp.arange(Q_BLOCK_SIZE, dtype=jnp.int32), # Q_BLOCK_SIZE
             jnp.arange(KV_BLOCK_SIZE, dtype=jnp.int32) # KV_BLOCK_SIZE
         )
-        # scores = rearrange(scores, "B (Hkv G) L S Qb KVb -> B Hkv G L S Qb KVb")
 
     if block_mask is not None:
         mask = block_mask.materialize_mask()
-        print("mask", mask)
-        print("scores: ",rearrange(scores, "B Hkv G L S Qb KVb -> B (Hkv G) (L Qb) (S KVb)"))
         mask = rearrange(mask, "B (Hkv G) (L Qb) (S KVb) -> B Hkv G L S Qb KVb", Hkv=Hkv, Qb=Q_BLOCK_SIZE, KVb=KV_BLOCK_SIZE)
         scores = jnp.where(mask, scores, jnp.full_like(scores, -jnp.inf))
-        print("masked scores: ",rearrange(scores, "B Hkv G L S Qb KVb -> B (Hkv G) (L Qb) (S KVb)"))
-
 
     scores = rearrange(scores, "B Hkv G L S Qb KVb-> B Hkv G L Qb (S KVb)")
     scores = scores - jnp.max(scores, axis = -1, keepdims=True)
