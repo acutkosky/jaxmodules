@@ -1,6 +1,11 @@
 import jax
 from jax import numpy as jnp
-from typing import Callable, Union, Optional
+from typing import Callable, Union, Optional, Dict, Any, NamedTuple
+from jaxtyping import Array, Float, UInt
+import equinox as eqx
+from einops import einsum, rearrange
+from jaxmodules.vectorize import array_from_coords, multi_vmap, nested_fori_loop
+from jaxmodules.block_mask import BlockMask
 
 
 def threshold_kernel(threshold: Optional[float] = None):
@@ -13,19 +18,19 @@ def threshold_kernel(threshold: Optional[float] = None):
     return kernel_fn
 
 def default_kernel(q, k):
-    return jnp.exp(jnp.dot(q,k)/jnp.sqrt(q.shape[-1]))
+    return jnp.exp(jnp.dot(q,k)/jnp.sqrt(k.shape[-1]))
 
 def masked_attention_via_scan(
-    K: jax.Array,
-    Q: jax.Array,
-    V: jax.Array,
+    K: Array,
+    Q: Array,
+    V: Array,
     *,
     is_causal: bool=False,
     # kernel_fn: Callable[float, float] = jnp.exp, 
-    kernel_fn: Callable[float,  float] = default_kernel, #lambda q, k: jnp.exp(jnp.dot(q,k)/jnp.sqrt(3)),
-    mask_fn: Optional[Union[Callable[int, jax.Array], jax.Array]]=None,
+    kernel_fn: Callable[[Array, Array],  float] = default_kernel, #lambda q, k: jnp.exp(jnp.dot(q,k)/jnp.sqrt(3)),
+    mask_fn: Optional[Union[Callable[int, Array], Array]]=None,
     block_size=None
-):
+) -> Array:
     '''
     Same functionality and memory cost as attention_via_map by default, but also
     allows for user-specified masking as well as alternative kernels.
@@ -34,10 +39,10 @@ def masked_attention_via_scan(
     Q: array of queries, shape [N, d]
     V: array of values, shape [L, d]
     is_causal: if true, apply a causal mask
-    kernel_fn: the  unnnormalized attention score is kernel_fn(Q @ K.T/sqrt(d)).
-        default is jnp.exp
+    kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
+        default is q, k -> jnp.exp( <q, k> / sqrt(d) )
     mask_fn: takes a integer index i and returns a size [d] array of booleans
-        specifying the attention mask for the  ith query.
+        specifying the attention mask for the ith query.
         If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
         If is_causal is False and mask_fn is None, then the default  value of no masking will
         be used.
@@ -102,3 +107,260 @@ def masked_attention_via_scan(
 
     return values
 
+
+
+
+
+def flex_attention(
+        query: Array,
+        key: Array,
+        value: Array,
+        score_mod: Optional[Callable] = None,
+        block_mask: Optional[BlockMask] = None,
+        scale: Optional[Array] = None,
+        enable_gqa: bool = False,
+        return_lse=False):
+
+    B, Hq, L, E = query.shape
+    Bk, Hkv, S, Ek = key.shape
+    Bv, Hv, Sv, Ev = value.shape
+
+    if scale is None:
+        scale = 1.0/jnp.sqrt(E)
+
+    
+
+    assert E == Ek, "query and key must have the same embedding dimension"
+    assert B == Bk, "query and key must have the same batch dimension"
+    assert Sv == S, "value and key must have the same sequence length"
+    assert Bv == B, "value and query must have the same batch dimension"
+    assert Hv == Hkv, "value and key must have the same head count"
+
+
+    if block_mask is None:
+        Q_BLOCK_SIZE = L
+        KV_BLOCK_SIZE = S
+    else:
+        Q_BLOCK_SIZE = block_mask.Q_BLOCK_SIZE
+        KV_BLOCK_SIZE = block_mask.KV_BLOCK_SIZE
+        assert L == block_mask.Q_LEN, "query length must match block mask"
+        assert S == block_mask.KV_LEN, "key length must match block mask"
+
+    assert L % Q_BLOCK_SIZE == 0, "query length must be divisible by Q_BLOCK_SIZE"
+    assert S % KV_BLOCK_SIZE == 0, "key length must be divisible by KV_BLOCK_SIZE"
+
+    if not enable_gqa:
+        assert Hq == Hkv, "query and key must have the same head count, unless enable_gqa is True"
+    assert Hq % Hkv == 0, "kv head count must divide query head count"
+
+    GROUP_SIZE = Hq // Hkv
+
+
+
+    query = rearrange(query, "B (Hkv G) (L Qb) E -> B Hkv G L Qb E", Hkv = Hkv, Qb=Q_BLOCK_SIZE)
+    key = rearrange(key, "B Hkv (S KVb) E -> B Hkv S KVb E", KVb=KV_BLOCK_SIZE)
+    value = rearrange(value, "B Hvk (S KVb) Ev -> B Hvk S KVb Ev", KVb=KV_BLOCK_SIZE)
+
+    def get_score_for_query_kv_block(b, h, g, l, s):
+        jax.debug.print("getting score for block: {b}, {h}, {g}, {l}, {s}", b=b, h=h, g=g, l=l, s=s)
+        score = einsum(
+            query[b, h, g, l],
+            key[b, h, s],
+            "Qb E, KVb E -> Qb KVb"
+        )*scale
+        if score_mod is not None:
+            score = multi_vmap(
+                lambda score, qidx, kidx: score_mod(score, b, h, l*Q_BLOCK_SIZE + qidx, s*KV_BLOCK_SIZE + kidx),
+                in_axes=(
+                    (0, 0, None),
+                    (1, None, 0)
+                ),
+                out_axes=(0, 1)
+            )(
+                score,
+                jnp.arange(Q_BLOCK_SIZE, dtype=jnp.int32), # Q_BLOCK_SIZE
+                jnp.arange(KV_BLOCK_SIZE, dtype=jnp.int32) # KV_BLOCK_SIZE
+            )
+        return score
+    
+    def accumulate_value_for_query_block(b, h, g, l, s, accumulated, do_mask=False):
+        result_carry, sum_exp_score, max_score = accumulated
+        score = get_score_for_query_kv_block(b, h, g, l, s)
+
+        if do_mask:
+            hq = h*GROUP_SIZE + g
+            mask = block_mask.get_mask_for_partial_block(b, hq, l, s)
+            score = jnp.where(mask, score, jnp.full_like(score, -jnp.inf))
+
+        next_max_score = jnp.maximum(max_score, jnp.max(score, axis=-1, keepdims=True))
+        score_normalized = score  - next_max_score
+
+        value_for_block = einsum(
+            jnp.exp(score_normalized),
+            value[b, h, s],
+            "Qb KVb, KVb Ev -> Qb Ev"
+        )
+        jax.debug.print("value_for_block: {value_for_block}", value_for_block=value_for_block)
+        jax.debug.print("score_normalized: {score_normalized}", score_normalized=score_normalized)
+        jax.debug.print("next_max_score: {next_max_score}", next_max_score=next_max_score)
+
+        next_sum_exp_score = jnp.nan_to_num(sum_exp_score*jnp.exp(max_score - next_max_score) + jnp.sum(jnp.exp(score_normalized), axis=-1, keepdims=True))
+        jax.debug.print("next_sum_exp_score: {next_sum_exp_score}", next_sum_exp_score=next_sum_exp_score)
+        jax.debug.print("adjusted carry: {}", result_carry*jnp.exp(max_score - next_max_score)*(sum_exp_score/next_sum_exp_score))
+        # next_sum_exp_score = sum_exp_score + jnp.sum(jnp.exp(score_normalized), axis=-1, keepdims=True)
+        next_result_carry = jnp.nan_to_num(
+            result_carry*jnp.exp(max_score - next_max_score)*(sum_exp_score/next_sum_exp_score) + value_for_block/next_sum_exp_score
+        )
+        # next_result_carry = result_carry + value_for_block
+        return (next_result_carry, next_sum_exp_score, next_max_score)
+    
+
+    
+    
+    def get_value_from_full_masks_for_query_block(b, h, g, l):
+        hq = h*GROUP_SIZE + g
+        full_block_limit = block_mask.full_kv_num_blocks[b, hq, l]
+        full_kv_indices = block_mask.full_kv_indices[b, hq, l]
+
+        result_carry = jnp.zeros((Q_BLOCK_SIZE, Ev))
+        sum_exp_score = jnp.zeros((Q_BLOCK_SIZE, 1))
+        max_score = jnp.full((Q_BLOCK_SIZE, 1), -jnp.inf)
+
+
+        result_carry, sum_exp_score, max_score = jax.lax.fori_loop(
+            lower=0,
+            upper=full_block_limit,
+            body_fun=lambda j, acc: accumulate_value_for_query_block(b, h, g, l, full_kv_indices[j], acc, do_mask=False),
+            init_val=(result_carry, sum_exp_score, max_score)
+        )
+
+        partial_block_limit = block_mask.kv_num_blocks[b, hq, l]
+        kv_indices = block_mask.kv_indices[b, hq, l]
+        result_carry, sum_exp_score, max_score = jax.lax.fori_loop(
+            lower=0,
+            upper=partial_block_limit,
+            body_fun=lambda j, acc: accumulate_value_for_query_block(b, h, g, l, kv_indices[j], acc, do_mask=True),
+            init_val=(result_carry, sum_exp_score, max_score)
+        )
+        # for j in range(block_limit):
+        #     block_coord = kv_indices[b, hq, l, j]
+        #     result_carry, sum_exp_score, max_score = accumulate_value_for_query_block(b, h, g, l, block_coord, (result_carry, sum_exp_score, max_score))
+
+        return result_carry
+    
+
+    
+    result = array_from_coords(
+        shape=(B, Hkv, GROUP_SIZE, L // Q_BLOCK_SIZE),
+        fn=get_value_from_full_masks_for_query_block
+    )
+
+    result = rearrange(result, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev", Qb=Q_BLOCK_SIZE)
+
+    return result
+
+
+def flex_attention_slow(
+        query: Array,
+        key: Array,
+        value: Array,
+        score_mod: Optional[Callable] = None,
+        block_mask: Optional[BlockMask] = None,
+        scale: Optional[Array] = None,
+        enable_gqa: bool = False,
+        return_lse=False):
+    
+    # first, let's do a very naive implementation to make sure it's working
+
+    B, Hq, L, E = query.shape
+    Bk, Hkv, S, Ek = key.shape
+    Bv, Hv, Sv, Ev = value.shape
+
+    assert E == Ek, "query and key must have the same embedding dimension"
+    assert B == Bk, "query and key must have the same batch dimension"
+    assert Sv == S, "value and key must have the same sequence length"
+    assert Bv == B, "value and query must have the same batch dimension"
+    assert Hv == Hkv, "value and key must have the same head count"
+
+    if block_mask is None:
+        Q_BLOCK_SIZE = L
+        KV_BLOCK_SIZE = S
+    else:
+        Q_BLOCK_SIZE = block_mask.Q_BLOCK_SIZE
+        KV_BLOCK_SIZE = block_mask.KV_BLOCK_SIZE
+        assert L == block_mask.Q_LEN, "query length must match block mask"
+        assert S == block_mask.KV_LEN, "key length must match block mask"
+
+    assert L % Q_BLOCK_SIZE == 0, "query length must be divisible by Q_BLOCK_SIZE"
+    assert S % KV_BLOCK_SIZE == 0, "key length must be divisible by KV_BLOCK_SIZE"
+
+    assert Hq % Hkv == 0, "kv head count must divide query head count"
+
+    GROUP_SIZE = Hq // Hkv
+
+
+
+    query = rearrange(query, "B (Hkv G) (L Qb) E -> B Hkv G L Qb E", Hkv = Hkv, Qb=Q_BLOCK_SIZE)
+    key = rearrange(key, "B Hkv (S KVb) E -> B Hkv S KVb E", KVb=KV_BLOCK_SIZE)
+    # value = rearrange(value, "B Hkv (S KVb) Ev -> B Hkv KVb S Ev", V=KV_BLOCK_SIZE)
+
+    # now, each query 
+
+    scores = einsum(query, key, "B Hkv G L Qb E, B Hkv S KVb E -> B Hkv G L S Qb KVb")/jnp.sqrt(E)
+    if score_mod is not None:
+
+        def block_grouped_score_mod(score, b, h, g, l, s, qb, kb):
+            h = h * GROUP_SIZE + g
+            l = l * Q_BLOCK_SIZE + qb
+            s = s * KV_BLOCK_SIZE + kb
+            return score_mod(score, b, h, l, s)
+        
+        scores = multi_vmap(
+            block_grouped_score_mod,
+            in_axes=(
+                (0, 0, None, None, None, None, None, None),
+                (1, None, 0, None, None, None, None, None),
+                (2, None, None, 0, None, None, None, None),
+                (3, None, None, None, 0, None, None, None),
+                (4, None, None, None, None, 0, None, None),
+                (5, None, None, None, None, None, 0, None),
+                (6, None, None, None, None, None, None, 0)
+            ),
+            out_axes=(
+                0, 1, 2, 3, 4, 5, 6
+            )
+        )(
+            scores,
+            jnp.arange(B, dtype=jnp.int32), # B
+            jnp.arange(Hkv, dtype=jnp.int32), # Hkv
+            jnp.arange(GROUP_SIZE, dtype=jnp.int32), # GROUP_SIZE
+            jnp.arange(L // Q_BLOCK_SIZE, dtype=jnp.int32), # L/Q_BLOCK_SIZE
+            jnp.arange(S // KV_BLOCK_SIZE, dtype=jnp.int32), # S/KV_BLOCK_SIZE
+            jnp.arange(Q_BLOCK_SIZE, dtype=jnp.int32), # Q_BLOCK_SIZE
+            jnp.arange(KV_BLOCK_SIZE, dtype=jnp.int32) # KV_BLOCK_SIZE
+        )
+        # scores = rearrange(scores, "B (Hkv G) L S Qb KVb -> B Hkv G L S Qb KVb")
+
+    if block_mask is not None:
+        mask = block_mask.materialize_mask()
+        print("mask", mask)
+        print("scores: ",rearrange(scores, "B Hkv G L S Qb KVb -> B (Hkv G) (L Qb) (S KVb)"))
+        mask = rearrange(mask, "B (Hkv G) (L Qb) (S KVb) -> B Hkv G L S Qb KVb", Hkv=Hkv, Qb=Q_BLOCK_SIZE, KVb=KV_BLOCK_SIZE)
+        scores = jnp.where(mask, scores, jnp.full_like(scores, -jnp.inf))
+        print("masked scores: ",rearrange(scores, "B Hkv G L S Qb KVb -> B (Hkv G) (L Qb) (S KVb)"))
+
+
+    scores = rearrange(scores, "B Hkv G L S Qb KVb-> B Hkv G L Qb (S KVb)")
+    scores = scores - jnp.max(scores, axis = -1, keepdims=True)
+    
+    scores = jax.nn.softmax(scores, axis=-1)
+
+    output_values = einsum(
+        scores,
+        value,
+        "B Hkv G L Qb S, B Hkv S Ev -> B Hkv G L Qb Ev"
+    )
+
+    output_values = rearrange(output_values, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev")
+
+    return output_values
