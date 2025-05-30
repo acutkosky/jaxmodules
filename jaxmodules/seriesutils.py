@@ -11,7 +11,6 @@ from equinox.nn import StateIndex, StatefulLayer, State
 from equinox import field
 
 from einops import einsum, rearrange
-import math
 
 
 def patch_series(
@@ -56,7 +55,7 @@ def patch_series(
 
     L = series.shape[0]
     # Number of patches
-    num_patches = math.ceil((L - patch_len + 1) / stride)
+    num_patches = 1 + (L - patch_len + 1) // stride
 
     # Indices along the first dimension to gather from
     patch_starts = jnp.arange(num_patches) * stride  # shape: [num_patches]
