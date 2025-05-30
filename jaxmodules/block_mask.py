@@ -237,6 +237,9 @@ class BlockMask(NamedTuple):
         B = partial_blocks.shape[0]
         H = partial_blocks.shape[1]
 
+        # remove the full blocks if they were left in the partial blocks.
+        partial_blocks = jnp.where(full_blocks, jnp.zeros_like(partial_blocks), partial_blocks)
+
         NUM_Q_BLOCKS = partial_blocks.shape[2]
         NUM_KV_BLOCKS = partial_blocks.shape[3]
 
@@ -360,9 +363,7 @@ def get_partial_block(
         A boolean mask of shape (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for the specified block
     """
     block_q_start = block_q_idx * Q_BLOCK_SIZE
-    block_q_end = block_q_start + Q_BLOCK_SIZE
     block_kv_start = block_kv_idx * KV_BLOCK_SIZE
-    block_kv_end = block_kv_start + KV_BLOCK_SIZE
 
     block_mask_mod = lambda q_idx, kv_idx: mask_mod(
         b, h, block_q_start + q_idx, block_kv_start + kv_idx
@@ -446,42 +447,18 @@ def create_block_mask(
         shape=(B, H, num_blocks_in_col, num_blocks_in_row), fn=is_partial_block
     )
 
-    kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(B, H, partial_block_mask)
-
     # create full block mask:
     full_block_mask = array_from_coords(
         shape=(B, H, num_blocks_in_col, num_blocks_in_row), fn=is_full_block
     )
 
-    full_kv_num_blocks, full_kv_indices = get_sparse_kv_data_from_blocks(
-        B, H, full_block_mask
-    )
-
-    partial_q_num_blocks, partial_q_indices = get_sparse_q_data_from_blocks(
-        B, H, partial_block_mask
-    )
-
-    full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
-        B, H, full_block_mask
-    )
-
-    return BlockMask(
-        B=B,
-        H=H,
-        Q_LEN=Q_LEN,
-        KV_LEN=KV_LEN,
-        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
-        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-        kv_num_blocks=kv_num_blocks,
-        kv_indices=kv_indices,
-        q_num_blocks=partial_q_num_blocks,
-        q_indices=partial_q_indices,
-        full_kv_num_blocks=full_kv_num_blocks,
-        full_kv_indices=full_kv_indices,
-        full_q_num_blocks=full_q_num_blocks,
-        full_q_indices=full_q_indices,
+    return BlockMask.from_blocks(
+        partial_blocks=partial_block_mask,
+        full_blocks=full_block_mask,
+        BLOCK_SIZE=BLOCK_SIZE,
         mask_mod=mask_mod,
     )
+
 
 
 def get_dense_from_kv_blocks(

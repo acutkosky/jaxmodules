@@ -195,6 +195,13 @@ def flex_attention(
         assert L == block_mask.Q_LEN, "query length must match block mask"
         assert S == block_mask.KV_LEN, "key length must match block mask"
 
+    # handle broadcasting the block mask over batch and head dimension
+    # jax seems to allow out-of-bounds indexing by clipping the index, so
+    # technically this would allow the broadcasting to work automatically
+    # but this seems like non-obvious behavior so I don't want to rely on it.
+    broadcast_mask_B = block_mask.B == 1
+    broadcast_mask_H = block_mask.H == 1
+
     assert L % Q_BLOCK_SIZE == 0, "query length must be divisible by Q_BLOCK_SIZE"
     assert S % KV_BLOCK_SIZE == 0, "key length must be divisible by KV_BLOCK_SIZE"
 
@@ -231,11 +238,18 @@ def flex_attention(
     def accumulate_value_for_query_block(b, h, g, l, s, accumulated, do_mask=False):
         result_carry, sum_exp_score, max_score = accumulated
         score = get_score_for_query_kv_block(b, h, g, l, s)
+        if broadcast_mask_B:
+            block_b = 0
+        else:
+            block_b = b
 
-        if do_mask:
-            hq = h * GROUP_SIZE + g
-            mask = block_mask.get_mask_for_partial_block(b, hq, l, s)
-            score = jnp.where(mask, score, jnp.full_like(score, -jnp.inf))
+        if broadcast_mask_H:
+            block_h = 0
+        else:
+            block_h = h
+
+        mask = block_mask.get_mask_for_partial_block(block_b, block_h, l, s)
+        score = jnp.where(mask, score, jnp.full_like(score, -jnp.inf))
 
         next_max_score = jnp.maximum(max_score, jnp.max(score, axis=-1, keepdims=True))
         score_normalized = score - next_max_score
@@ -258,8 +272,20 @@ def flex_attention(
 
     def get_value_from_full_masks_for_query_block(b, h, g, l):
         hq = h * GROUP_SIZE + g
-        full_block_limit = block_mask.full_kv_num_blocks[b, hq, l]
-        full_kv_indices = block_mask.full_kv_indices[b, hq, l]
+        
+
+        if broadcast_mask_B:
+            block_b = 0
+        else:
+            block_b = b
+
+        if broadcast_mask_H:
+            block_hq = 0
+        else:
+            block_hq = hq
+
+        full_block_limit = block_mask.full_kv_num_blocks[block_b, block_hq, l]
+        full_kv_indices = block_mask.full_kv_indices[block_b, block_hq, l]
 
         result_carry = jnp.zeros((Q_BLOCK_SIZE, Ev))
         sum_exp_score = jnp.zeros((Q_BLOCK_SIZE, 1))
@@ -274,8 +300,8 @@ def flex_attention(
             init_val=(result_carry, sum_exp_score, max_score),
         )
 
-        partial_block_limit = block_mask.kv_num_blocks[b, hq, l]
-        kv_indices = block_mask.kv_indices[b, hq, l]
+        partial_block_limit = block_mask.kv_num_blocks[block_b, block_hq, l]
+        kv_indices = block_mask.kv_indices[block_b, block_hq, l]
         result_carry, sum_exp_score, max_score = jax.lax.fori_loop(
             lower=0,
             upper=partial_block_limit,
