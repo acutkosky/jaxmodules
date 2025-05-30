@@ -266,3 +266,82 @@ def test_flex_attention_block_mask_broadcasting():
     assert jnp.allclose(output_batch_broadcast, output_no_broadcast)
     assert jnp.allclose(output_head_broadcast, output_no_broadcast)
     assert jnp.allclose(output_both_broadcast, output_no_broadcast)
+
+
+def test_flex_attention_with_scale():
+    """Test flex_attention with different scale parameters"""
+    B, H, L, E = 2, 4, 8, 16
+    BLOCK_SIZE = 4
+
+    # Create random inputs
+    key = jax.random.normal(jax.random.PRNGKey(0), (B, H, L, E))
+    query = jax.random.normal(jax.random.PRNGKey(1), (B, H, L, E))
+    value = jax.random.normal(jax.random.PRNGKey(2), (B, H, L, E))
+
+    # Test with default scale (None, should be 1/sqrt(E))
+    output_default = flex_attention(query, key, value, scale=None)
+    output_slow_default = flex_attention_slow(query, key, value, scale=None)
+    output_torch_default = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value), scale=None
+    ).numpy()
+
+    # Test with explicit default scale
+    default_scale = 1.0 / jnp.sqrt(E)
+    output_explicit_default = flex_attention(query, key, value, scale=default_scale)
+    output_slow_explicit_default = flex_attention_slow(query, key, value, scale=default_scale)
+    output_torch_explicit_default = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value), scale=float(default_scale)
+    ).numpy()
+
+    # Test with custom scale
+    custom_scale = 0.5
+    output_custom = flex_attention(query, key, value, scale=custom_scale)
+    output_slow_custom = flex_attention_slow(query, key, value, scale=custom_scale)
+    output_torch_custom = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value), scale=custom_scale
+    ).numpy()
+
+    # Test with another custom scale
+    custom_scale2 = 2.0
+    output_custom2 = flex_attention(query, key, value, scale=custom_scale2)
+    output_slow_custom2 = flex_attention_slow(query, key, value, scale=custom_scale2)
+    output_torch_custom2 = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value), scale=custom_scale2
+    ).numpy()
+
+    # Check shapes
+    assert output_default.shape == (B, H, L, E)
+    assert output_explicit_default.shape == (B, H, L, E)
+    assert output_custom.shape == (B, H, L, E)
+    assert output_custom2.shape == (B, H, L, E)
+
+    # Check that fast and slow implementations match for all scale values
+    assert jnp.allclose(output_default, output_slow_default, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_explicit_default, output_slow_explicit_default, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_custom, output_slow_custom, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_custom2, output_slow_custom2, rtol=1e-5, atol=1e-5)
+
+    # Check that JAX and PyTorch implementations match
+    assert jnp.allclose(output_default, output_torch_default, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_explicit_default, output_torch_explicit_default, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_custom, output_torch_custom, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_custom2, output_torch_custom2, rtol=1e-5, atol=1e-5)
+
+    # Check that default scale and explicit default scale give the same result
+    assert jnp.allclose(output_default, output_explicit_default, rtol=1e-5, atol=1e-5)
+
+    # Check that different scales give different results
+    assert not jnp.allclose(output_default, output_custom, rtol=1e-3, atol=1e-3)
+    assert not jnp.allclose(output_custom, output_custom2, rtol=1e-3, atol=1e-3)
+
+    # Test with zero scale (should give uniform attention)
+    zero_scale = 0.0
+    output_zero = flex_attention(query, key, value, scale=zero_scale)
+    output_slow_zero = flex_attention_slow(query, key, value, scale=zero_scale)
+    
+    # With zero scale, all attention weights should be equal (uniform distribution)
+    # So the output should be the mean of all values
+    expected_zero = jnp.mean(value, axis=2, keepdims=True).repeat(L, axis=2)
+    
+    assert jnp.allclose(output_zero, output_slow_zero, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(output_zero, expected_zero, rtol=1e-4, atol=1e-4)

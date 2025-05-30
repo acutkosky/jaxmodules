@@ -136,7 +136,7 @@ def masked_attention_via_scan(
     return values
 
 
-def flex_attention(
+def _flex_attention(
     query: Array,
     key: Array,
     value: Array,
@@ -339,13 +339,12 @@ def flex_attention(
 
     return result
 
-
 flex_attention = jax.jit(
-    flex_attention, static_argnames=["score_mod", "enable_gqa", "return_lse"]
+    _flex_attention, static_argnames=["score_mod", "enable_gqa", "return_lse"]
 )
 
 
-def flex_attention_slow(
+def _flex_attention_slow(
     query: Array,
     key: Array,
     value: Array,
@@ -390,6 +389,9 @@ def flex_attention_slow(
     assert Bv == B, "value and query must have the same batch dimension"
     assert Hv == Hkv, "value and key must have the same head count"
 
+    if scale is None:
+        scale = 1.0 / jnp.sqrt(E)
+
     if block_mask is None:
         Q_BLOCK_SIZE = L
         KV_BLOCK_SIZE = S
@@ -413,7 +415,7 @@ def flex_attention_slow(
 
     scores = einsum(
         query, key, "B Hkv G L Qb E, B Hkv S KVb E -> B Hkv G L S Qb KVb"
-    ) / jnp.sqrt(E)
+    ) * scale
     if score_mod is not None:
 
         def block_grouped_score_mod(score, b, h, g, l, s, qb, kb):
@@ -468,3 +470,7 @@ def flex_attention_slow(
     output_values = rearrange(output_values, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev")
 
     return output_values
+
+flex_attention_slow = jax.jit(
+    _flex_attention_slow, static_argnames=["score_mod", "enable_gqa", "return_lse"]
+)
