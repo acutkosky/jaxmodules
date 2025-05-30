@@ -249,24 +249,37 @@ def flex_attention(
             block_h = h
 
         mask = block_mask.get_mask_for_partial_block(block_b, block_h, l, s)
-        score = jnp.where(mask, score, jnp.full_like(score, -jnp.inf))
 
-        next_max_score = jnp.maximum(max_score, jnp.max(score, axis=-1, keepdims=True))
+        masked_score = jnp.where(mask, score, jnp.full_like(score, -jnp.inf))
+        next_max_score = jnp.maximum(max_score, jnp.max(masked_score, axis=-1, keepdims=True))
+
         score_normalized = score - next_max_score
-
+        score_normalized = jnp.where(mask, score_normalized, jnp.full_like(score_normalized, -jnp.inf))
         value_for_block = einsum(
             jnp.exp(score_normalized), value[b, h, s], "Qb KVb, KVb Ev -> Qb Ev"
         )
 
-        next_sum_exp_score = jnp.nan_to_num(
-            sum_exp_score * jnp.exp(max_score - next_max_score)
+        max_score_delta = jnp.where(next_max_score == -jnp.inf, -jnp.inf, max_score - next_max_score)
+        next_sum_exp_score = (
+            sum_exp_score * jnp.exp(max_score_delta)
             + jnp.sum(jnp.exp(score_normalized), axis=-1, keepdims=True)
         )
-        next_result_carry = jnp.nan_to_num(
+        # r_next_sum_exp_score = jnp.where(next_sum_exp_score == 0, 0, 1.0/next_sum_exp_score)
+        carry_multiplier = jnp.where(
+            next_sum_exp_score == 0,
+            0.0,
+            jnp.exp(max_score - next_max_score) * (sum_exp_score / next_sum_exp_score)
+        )
+        value_multiplier = jnp.where(
+            next_sum_exp_score == 0,
+            0.0,
+            1.0/next_sum_exp_score
+        )
+
+        next_result_carry = (
             result_carry
-            * jnp.exp(max_score - next_max_score)
-            * (sum_exp_score / next_sum_exp_score)
-            + value_for_block / next_sum_exp_score
+            * carry_multiplier
+            + value_for_block * value_multiplier
         )
         return (next_result_carry, next_sum_exp_score, next_max_score)
 
