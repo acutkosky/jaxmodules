@@ -20,7 +20,9 @@ def test_flex_attention_basic():
     # Test without block mask
     output = flex_attention(query, key, value)
     output_slow = flex_attention_slow(query, key, value)
-    output_torch = torch_fa.flex_attention(torch.tensor(query), torch.tensor(key), torch.tensor(value)).numpy()
+    output_torch = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value)
+    ).numpy()
     # Check shapes
     assert output.shape == (B, H, L, E)
     assert output_slow.shape == (B, H, L, E)
@@ -28,6 +30,7 @@ def test_flex_attention_basic():
     # Check that fast and slow implementations match
     assert jnp.allclose(output, output_slow, rtol=1e-5, atol=1e-5)
     assert jnp.allclose(output, output_torch, rtol=1e-5, atol=1e-5)
+
 
 def test_flex_attention_gqa():
     """Test flex_attention with grouped query attention (GQA)"""
@@ -42,7 +45,9 @@ def test_flex_attention_gqa():
     # Test with GQA enabled
     output = flex_attention(query, key, value, enable_gqa=True)
     output_slow = flex_attention_slow(query, key, value, enable_gqa=True)
-    output_torch = torch_fa.flex_attention(torch.tensor(query), torch.tensor(key), torch.tensor(value), enable_gqa=True).numpy()
+    output_torch = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value), enable_gqa=True
+    ).numpy()
 
     # Check shapes
     assert output.shape == (B, Hq, L, E)
@@ -51,6 +56,7 @@ def test_flex_attention_gqa():
     # Check that fast and slow implementations match
     assert jnp.allclose(output, output_slow, rtol=1e-5, atol=1e-5)
     assert jnp.allclose(output, output_torch, rtol=1e-5, atol=1e-5)
+
 
 def test_flex_attention_with_block_mask():
     """Test flex_attention with different block mask patterns"""
@@ -71,19 +77,31 @@ def test_flex_attention_with_block_mask():
 
     def alternating_mask(b, h, q_idx, k_idx):
         return (q_idx + k_idx) % 2 == 0
-    
+
     def batch_head_sliding_mask(b, h, q_idx, k_idx):
         return abs(q_idx - k_idx) <= b + h
 
     # Test with different mask patterns
-    for mask_fn in [causal_mask, sliding_window_mask, alternating_mask, batch_head_sliding_mask]:
+    for mask_fn in [
+        causal_mask,
+        sliding_window_mask,
+        alternating_mask,
+        batch_head_sliding_mask,
+    ]:
         block_mask = create_block_mask(mask_fn, B, H, L, L, BLOCK_SIZE)
 
-        block_mask_torch = torch_fa.create_block_mask(mask_fn, B, H, L, L, device="cpu", BLOCK_SIZE=BLOCK_SIZE)
+        block_mask_torch = torch_fa.create_block_mask(
+            mask_fn, B, H, L, L, device="cpu", BLOCK_SIZE=BLOCK_SIZE
+        )
 
         output = flex_attention(query, key, value, block_mask=block_mask)
         output_slow = flex_attention_slow(query, key, value, block_mask=block_mask)
-        output_torch = torch_fa.flex_attention(torch.tensor(query), torch.tensor(key), torch.tensor(value), block_mask=block_mask_torch).numpy()
+        output_torch = torch_fa.flex_attention(
+            torch.tensor(query),
+            torch.tensor(key),
+            torch.tensor(value),
+            block_mask=block_mask_torch,
+        ).numpy()
         # Check shapes
         assert output.shape == (B, H, L, E)
         assert output_slow.shape == (B, H, L, E)
@@ -91,6 +109,7 @@ def test_flex_attention_with_block_mask():
         # Check that fast and slow implementations match
         # assert jnp.allclose(output, output_slow, rtol=1e-5, atol=1e-5)
         assert jnp.allclose(output, output_torch, rtol=1e-5, atol=1e-5)
+
 
 def test_flex_attention_with_score_mod():
     """Test flex_attention with score modification function"""
@@ -108,7 +127,9 @@ def test_flex_attention_with_score_mod():
 
     output = flex_attention(query, key, value, score_mod=score_mod)
     output_slow = flex_attention_slow(query, key, value, score_mod=score_mod)
-    output_torch = torch_fa.flex_attention(torch.tensor(query), torch.tensor(key), torch.tensor(value), score_mod=score_mod).numpy()
+    output_torch = torch_fa.flex_attention(
+        torch.tensor(query), torch.tensor(key), torch.tensor(value), score_mod=score_mod
+    ).numpy()
 
     # Check shapes
     assert output.shape == (B, H, L, E)
@@ -136,7 +157,9 @@ def test_flex_attention_edge_cases():
 
     output = flex_attention(zero_query, zero_key, zero_value)
     output_slow = flex_attention_slow(zero_query, zero_key, zero_value)
-    output_torch = torch_fa.flex_attention(torch.tensor(zero_query), torch.tensor(zero_key), torch.tensor(zero_value)).numpy()
+    output_torch = torch_fa.flex_attention(
+        torch.tensor(zero_query), torch.tensor(zero_key), torch.tensor(zero_value)
+    ).numpy()
     assert jnp.allclose(output, output_slow, rtol=1e-5, atol=1e-5)
 
     # Test with very large inputs
@@ -146,7 +169,9 @@ def test_flex_attention_edge_cases():
 
     output = flex_attention(large_query, large_key, large_value)
     output_slow = flex_attention_slow(large_query, large_key, large_value)
-    output_torch = torch_fa.flex_attention(torch.tensor(large_query), torch.tensor(large_key), torch.tensor(large_value)).numpy()
+    output_torch = torch_fa.flex_attention(
+        torch.tensor(large_query), torch.tensor(large_key), torch.tensor(large_value)
+    ).numpy()
     assert jnp.allclose(output, output_slow, rtol=1e-5, atol=1e-5)
 
 
@@ -205,24 +230,34 @@ def test_flex_attention_block_mask_broadcasting():
 
     # Test broadcasting over batch dimension
     block_mask_batch1 = create_block_mask(sliding_window_mask, 1, H, L, L, BLOCK_SIZE)
-    output_batch_broadcast = flex_attention(query, key, value, block_mask=block_mask_batch1)
+    output_batch_broadcast = flex_attention(
+        query, key, value, block_mask=block_mask_batch1
+    )
 
     # Check that fast and slow implementations match with batch broadcasting
     # assert jnp.allclose(output_batch_broadcast, output_slow_batch_broadcast, rtol=1e-5, atol=1e-5)
 
     # Test broadcasting over head dimension
     block_mask_head1 = create_block_mask(sliding_window_mask, B, 1, L, L, BLOCK_SIZE)
-    output_head_broadcast = flex_attention(query, key, value, block_mask=block_mask_head1)
+    output_head_broadcast = flex_attention(
+        query, key, value, block_mask=block_mask_head1
+    )
 
     # Check that fast and slow implementations match with head broadcasting
     # assert jnp.allclose(output_head_broadcast, output_slow_head_broadcast, rtol=1e-5, atol=1e-5)
 
     # Test broadcasting over both dimensions
     block_mask_both1 = create_block_mask(sliding_window_mask, 1, 1, L, L, BLOCK_SIZE)
-    output_both_broadcast = flex_attention(query, key, value, block_mask=block_mask_both1)
+    output_both_broadcast = flex_attention(
+        query, key, value, block_mask=block_mask_both1
+    )
 
-    block_mask_no_broadcast = create_block_mask(sliding_window_mask, B, H, L, L, BLOCK_SIZE)
-    output_no_broadcast = flex_attention(query, key, value, block_mask=block_mask_no_broadcast)
+    block_mask_no_broadcast = create_block_mask(
+        sliding_window_mask, B, H, L, L, BLOCK_SIZE
+    )
+    output_no_broadcast = flex_attention(
+        query, key, value, block_mask=block_mask_no_broadcast
+    )
 
     # Check that fast and slow implementations match with both dimensions broadcasting
     # assert jnp.allclose(output_both_broadcast, output_slow_both_broadcast, rtol=1e-5, atol=1e-5)

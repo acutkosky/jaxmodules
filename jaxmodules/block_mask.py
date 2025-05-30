@@ -12,6 +12,7 @@ def extract_block_size(BLOCK_SIZE: int | Tuple[int, int]) -> Tuple[int, int]:
     else:
         return BLOCK_SIZE
 
+
 class BlockMask(NamedTuple):
     B: int
     H: int
@@ -223,7 +224,7 @@ class BlockMask(NamedTuple):
             full_q_indices=full_q_indices,
             mask_mod=lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
         )
-    
+
     @classmethod
     def from_blocks(
         cls,
@@ -238,7 +239,9 @@ class BlockMask(NamedTuple):
         H = partial_blocks.shape[1]
 
         # remove the full blocks if they were left in the partial blocks.
-        partial_blocks = jnp.where(full_blocks, jnp.zeros_like(partial_blocks), partial_blocks)
+        partial_blocks = jnp.where(
+            full_blocks, jnp.zeros_like(partial_blocks), partial_blocks
+        )
 
         NUM_Q_BLOCKS = partial_blocks.shape[2]
         NUM_KV_BLOCKS = partial_blocks.shape[3]
@@ -339,7 +342,6 @@ class BlockMask(NamedTuple):
             BLOCK_SIZE=BLOCK_SIZE,
             mask_mod=mask_mod,
         )
-
 
 
 def get_partial_block(
@@ -458,7 +460,6 @@ def create_block_mask(
         BLOCK_SIZE=BLOCK_SIZE,
         mask_mod=mask_mod,
     )
-
 
 
 def get_dense_from_kv_blocks(

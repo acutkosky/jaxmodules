@@ -147,7 +147,9 @@ def test_get_sparse_kv_data_from_blocks():
     relevant_indices = jnp.array([[True, False], [True, True]])
 
     assert jnp.array_equal(kv_num_blocks, expected_num_blocks)
-    assert jnp.array_equal(kv_indices * relevant_indices, expected_indices * relevant_indices)
+    assert jnp.array_equal(
+        kv_indices * relevant_indices, expected_indices * relevant_indices
+    )
 
 
 def test_get_sparse_q_data_from_blocks():
@@ -169,7 +171,9 @@ def test_get_sparse_q_data_from_blocks():
     relevant_indices = jnp.array([[True, True], [True, False]])
 
     assert jnp.array_equal(q_num_blocks, expected_num_blocks)
-    assert jnp.array_equal(q_indices * relevant_indices, expected_indices * relevant_indices)
+    assert jnp.array_equal(
+        q_indices * relevant_indices, expected_indices * relevant_indices
+    )
 
 
 def test_get_dense_from_kv_blocks():
