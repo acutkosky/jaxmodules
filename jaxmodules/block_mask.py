@@ -4,6 +4,7 @@ from jaxtyping import Array, UInt
 from jaxmodules.vectorize import array_from_coords, nested_fori_loop, multi_vmap
 from einops import rearrange, einsum
 from typing import Callable, NamedTuple, Tuple
+import equinox as eqx
 
 
 def extract_block_size(BLOCK_SIZE: int | Tuple[int, int]) -> Tuple[int, int]:
@@ -13,13 +14,13 @@ def extract_block_size(BLOCK_SIZE: int | Tuple[int, int]) -> Tuple[int, int]:
         return BLOCK_SIZE
 
 
-class BlockMask(NamedTuple):
-    B: int
-    H: int
-    Q_LEN: int
-    KV_LEN: int
-    Q_BLOCK_SIZE: int
-    KV_BLOCK_SIZE: int
+class BlockMask(eqx.Module):
+    B: int = eqx.field(static=True)
+    H: int = eqx.field(static=True)
+    Q_LEN: int = eqx.field(static=True)
+    KV_LEN: int = eqx.field(static=True)
+    Q_BLOCK_SIZE: int = eqx.field(static=True)
+    KV_BLOCK_SIZE: int = eqx.field(static=True)
     # these are the number of PARTIAL blocks in each row
     # we name it this way as opposed to something more descriptive like "partial_kv_num_blocks"
     # to maintain consistency with the pytorch implementation
@@ -38,7 +39,7 @@ class BlockMask(NamedTuple):
     full_q_indices: UInt[Array, "b h num_kv_blocks max_q_blocks_in_row"]
 
     # function used to fill in partial blocks
-    mask_mod: Callable[[Array, Array], Array]
+    mask_mod: Callable[[Array, Array], Array] = eqx.field(static=True)
 
     def get_mask_for_partial_block(self, b, h, q_block_idx, kv_block_idx):
         """

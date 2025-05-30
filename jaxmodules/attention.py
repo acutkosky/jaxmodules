@@ -248,17 +248,19 @@ def flex_attention(
         else:
             block_h = h
 
+        # using a block rather than just a scalar -jnp.inf maybe be slightly faster
+        # when not jitted; haven't tested with jit though.
+        inf_block = jnp.full_like(score, -jnp.inf)
+
         mask = block_mask.get_mask_for_partial_block(block_b, block_h, l, s)
 
-        masked_score = jnp.where(mask, score, jnp.full_like(score, -jnp.inf))
+        masked_score = jnp.where(mask, score, inf_block)
         next_max_score = jnp.maximum(
             max_score, jnp.max(masked_score, axis=-1, keepdims=True)
         )
 
         score_normalized = score - next_max_score
-        score_normalized = jnp.where(
-            mask, score_normalized, jnp.full_like(score_normalized, -jnp.inf)
-        )
+        score_normalized = jnp.where(mask, score_normalized, inf_block)
         value_for_block = einsum(
             jnp.exp(score_normalized), value[b, h, s], "Qb KVb, KVb Ev -> Qb Ev"
         )
@@ -336,6 +338,11 @@ def flex_attention(
     )
 
     return result
+
+
+flex_attention = jax.jit(
+    flex_attention, static_argnames=["score_mod", "enable_gqa", "return_lse"]
+)
 
 
 def flex_attention_slow(
