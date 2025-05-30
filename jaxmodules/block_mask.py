@@ -28,12 +28,12 @@ class BlockMask(eqx.Module):
     # for each row, these are the indices of the PARTIAL blocks
     kv_indices: UInt[Array, "b h num_q_blocks max_kv_blocks_in_row"]
 
-    q_num_blocks: UInt[Array, "b h num_kv_blocks"]
-    q_indices: UInt[Array, "b h num_kv_blocks max_q_blocks_in_row"]
+    q_num_blocks: UInt[Array, "b h num_kv_blocks"] | None
+    q_indices: UInt[Array, "b h num_kv_blocks max_q_blocks_in_row"] | None
 
     # these are the number of FULL (all-ones) blocks in each row
-    full_kv_num_blocks: UInt[Array, "b h num_q_blocks"]
-    full_kv_indices: UInt[Array, "b h num_q_blocks max_kv_blocks_in_row"]
+    full_kv_num_blocks: UInt[Array, "b h num_q_blocks"] | None
+    full_kv_indices: UInt[Array, "b h num_q_blocks max_kv_blocks_in_row"] | None
 
     full_q_num_blocks: UInt[Array, "b h num_kv_blocks"]
     full_q_indices: UInt[Array, "b h num_kv_blocks max_q_blocks_in_row"]
@@ -288,6 +288,7 @@ class BlockMask(eqx.Module):
         BLOCK_SIZE: int,
         mask_mod: Callable[[Array, Array, Array, Array], Array],
         seq_lengths: Tuple[int, int] = None,
+        generate_q_blocks: bool = False,
     ) -> "BlockMask":
         Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
 
@@ -329,20 +330,39 @@ class BlockMask(eqx.Module):
         NUM_Q_BLOCKS = Q_LEN // Q_BLOCK_SIZE
         NUM_KV_BLOCKS = KV_LEN // KV_BLOCK_SIZE
 
-        partial_mask = get_dense_from_kv_blocks(
-            B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, kv_num_blocks, kv_indices
-        )
+        if not generate_q_blocks:
+            return cls(
+                B=B,
+                H=H,
+                Q_LEN=Q_LEN,
+                KV_LEN=KV_LEN,
+                Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+                KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+                kv_num_blocks=kv_num_blocks,
+                kv_indices=kv_indices,
+                q_num_blocks=None,
+                q_indices=None,
+                full_kv_num_blocks=full_kv_num_blocks,
+                full_kv_indices=full_kv_indices,
+                full_q_num_blocks=None,
+                full_q_indices=None,
+                mask_mod=mask_mod,
+            )
+        else:
+            partial_mask = get_dense_from_kv_blocks(
+                B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, kv_num_blocks, kv_indices
+            )
 
-        full_mask = get_dense_from_kv_blocks(
-            B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, full_kv_num_blocks, full_kv_indices
-        )
+            full_mask = get_dense_from_kv_blocks(
+                B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, full_kv_num_blocks, full_kv_indices
+            )
 
-        return cls.from_blocks(
-            partial_blocks=partial_mask,
-            full_blocks=full_mask,
-            BLOCK_SIZE=BLOCK_SIZE,
-            mask_mod=mask_mod,
-        )
+            return cls.from_blocks(
+                partial_blocks=partial_mask,
+                full_blocks=full_mask,
+                BLOCK_SIZE=BLOCK_SIZE,
+                mask_mod=mask_mod,
+            )
 
 
 def get_partial_block(
