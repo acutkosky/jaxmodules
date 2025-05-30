@@ -6,6 +6,12 @@ from einops import rearrange, einsum
 from typing import Callable, NamedTuple, Tuple
 
 
+def extract_block_size(BLOCK_SIZE: int | Tuple[int, int]) -> Tuple[int, int]:
+    if isinstance(BLOCK_SIZE, int):
+        return BLOCK_SIZE, BLOCK_SIZE
+    else:
+        return BLOCK_SIZE
+
 class BlockMask(NamedTuple):
     B: int
     H: int
@@ -158,11 +164,7 @@ class BlockMask(NamedTuple):
 
     @classmethod
     def full_mask(cls, B, H, Q_LEN, KV_LEN, BLOCK_SIZE):
-        if isinstance(BLOCK_SIZE, int):
-            Q_BLOCK_SIZE = BLOCK_SIZE
-            KV_BLOCK_SIZE = BLOCK_SIZE
-        else:
-            Q_BLOCK_SIZE, KV_BLOCK_SIZE = BLOCK_SIZE
+        Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
 
         KV_BLOCKS = KV_LEN // KV_BLOCK_SIZE
         Q_BLOCKS = Q_LEN // Q_BLOCK_SIZE
@@ -181,11 +183,7 @@ class BlockMask(NamedTuple):
 
     @classmethod
     def causal_mask(cls, B, H, Q_LEN, KV_LEN, BLOCK_SIZE):
-        if isinstance(BLOCK_SIZE, int):
-            Q_BLOCK_SIZE = BLOCK_SIZE
-            KV_BLOCK_SIZE = BLOCK_SIZE
-        else:
-            Q_BLOCK_SIZE, KV_BLOCK_SIZE = BLOCK_SIZE
+        Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
         KV_BLOCKS = KV_LEN // KV_BLOCK_SIZE
         Q_BLOCKS = Q_LEN // Q_BLOCK_SIZE
 
@@ -225,6 +223,53 @@ class BlockMask(NamedTuple):
             full_q_indices=full_q_indices,
             mask_mod=lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
         )
+    
+    @classmethod
+    def from_blocks(
+        cls,
+        partial_blocks,
+        full_blocks,
+        BLOCK_SIZE: int | Tuple[int, int],
+        mask_mod: Callable[[Array, Array, Array, Array], Array],
+    ):
+        Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
+
+        B = partial_blocks.shape[0]
+        H = partial_blocks.shape[1]
+
+        NUM_Q_BLOCKS = partial_blocks.shape[2]
+        NUM_KV_BLOCKS = partial_blocks.shape[3]
+
+        Q_LEN = NUM_Q_BLOCKS * Q_BLOCK_SIZE
+        KV_LEN = NUM_KV_BLOCKS * KV_BLOCK_SIZE
+
+        kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(B, H, partial_blocks)
+        q_num_blocks, q_indices = get_sparse_q_data_from_blocks(B, H, partial_blocks)
+
+        full_kv_num_blocks, full_kv_indices = get_sparse_kv_data_from_blocks(
+            B, H, full_blocks
+        )
+        full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
+            B, H, full_blocks
+        )
+
+        return cls(
+            B=B,
+            H=H,
+            Q_LEN=Q_LEN,
+            KV_LEN=KV_LEN,
+            Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+            kv_num_blocks=kv_num_blocks,
+            kv_indices=kv_indices,
+            q_num_blocks=q_num_blocks,
+            q_indices=q_indices,
+            full_kv_num_blocks=full_kv_num_blocks,
+            full_kv_indices=full_kv_indices,
+            full_q_num_blocks=full_q_num_blocks,
+            full_q_indices=full_q_indices,
+            mask_mod=mask_mod,
+        )
 
     @classmethod
     def from_kv_blocks(
@@ -237,11 +282,7 @@ class BlockMask(NamedTuple):
         mask_mod: Callable[[Array, Array, Array, Array], Array],
         seq_lengths: Tuple[int, int] = None,
     ) -> "BlockMask":
-        if isinstance(BLOCK_SIZE, int):
-            Q_BLOCK_SIZE = BLOCK_SIZE
-            KV_BLOCK_SIZE = BLOCK_SIZE
-        else:
-            Q_BLOCK_SIZE, KV_BLOCK_SIZE = BLOCK_SIZE
+        Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
 
         B = kv_num_blocks.shape[0]
         H = kv_num_blocks.shape[1]
@@ -285,33 +326,17 @@ class BlockMask(NamedTuple):
             B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, kv_num_blocks, kv_indices
         )
 
-        q_num_blocks, q_indices = get_sparse_q_data_from_blocks(B, H, partial_mask)
-
         full_mask = get_dense_from_kv_blocks(
             B, H, NUM_Q_BLOCKS, NUM_KV_BLOCKS, full_kv_num_blocks, full_kv_indices
         )
 
-        full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
-            B, H, full_mask
-        )
-
-        return BlockMask(
-            B=B,
-            H=H,
-            Q_LEN=Q_LEN,
-            KV_LEN=KV_LEN,
-            Q_BLOCK_SIZE=Q_BLOCK_SIZE,
-            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-            kv_num_blocks=kv_num_blocks,
-            kv_indices=kv_indices,
-            q_num_blocks=q_num_blocks,
-            q_indices=q_indices,
-            full_kv_num_blocks=full_kv_num_blocks,
-            full_kv_indices=full_kv_indices,
-            full_q_num_blocks=full_q_num_blocks,
-            full_q_indices=full_q_indices,
+        return cls.from_blocks(
+            partial_blocks=partial_mask,
+            full_blocks=full_mask,
+            BLOCK_SIZE=BLOCK_SIZE,
             mask_mod=mask_mod,
         )
+
 
 
 def get_partial_block(
@@ -353,8 +378,6 @@ def get_sparse_kv_data_from_blocks(B, H, blocks: Array):
     Args:
         B: Batch size
         H: Number of heads
-        num_blocks_in_col: Number of blocks in each column
-        num_blocks_in_row: Number of blocks in each row
         blocks: Dense block mask
 
     Returns:
@@ -363,23 +386,7 @@ def get_sparse_kv_data_from_blocks(B, H, blocks: Array):
         - kv_indices: Indices of the blocks for each key-value position
     """
     kv_num_blocks = einsum(blocks, "b h kv q -> b h kv")  # [b h kv q] -> [b h kv]
-    MAX_PARTIAL_BLOCKS_IN_ROW = int(jnp.max(kv_num_blocks))
-
-    num_blocks_in_col, num_blocks_in_row = blocks.shape[2:]
-
-    kv_counts = jnp.cumsum(blocks, axis=-1)  # [b h kv q] -> [b h kv q]
-
-    # kv_indices[b, h, i, j] = index of j-th partial block in row i.
-    kv_indices = array_from_coords(
-        shape=(B, H, num_blocks_in_col, num_blocks_in_row),
-        fn=lambda b, h, i, j: jnp.min(
-            jnp.where(
-                kv_counts[b, h, i, :] == j + 1,
-                jnp.arange(num_blocks_in_row),
-                jnp.full(num_blocks_in_row, num_blocks_in_row),
-            )
-        ),
-    )[:, :, :, : max(MAX_PARTIAL_BLOCKS_IN_ROW, 1)]
+    kv_indices = jax.vmap(lambda x: jnp.argsort(-x))(blocks)
 
     return kv_num_blocks, kv_indices
 
@@ -417,11 +424,7 @@ def create_block_mask(
     Create a block mask for the given mask_mod.
     """
 
-    if isinstance(BLOCK_SIZE, int):
-        Q_BLOCK_SIZE = BLOCK_SIZE
-        KV_BLOCK_SIZE = BLOCK_SIZE
-    else:
-        Q_BLOCK_SIZE, KV_BLOCK_SIZE = BLOCK_SIZE
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
 
     num_blocks_in_col = Q_LEN // Q_BLOCK_SIZE
     num_blocks_in_row = KV_LEN // KV_BLOCK_SIZE
