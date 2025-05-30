@@ -1,4 +1,4 @@
-'''
+"""
 plumbing log (or other) data through a jax.jit is a huge pain
 This is intended to make it a bit easier.
 
@@ -13,7 +13,7 @@ In order to actually do the logging, you'd need to have some monstrosity like
 
 log_data(train_state.model.trunk.layers[2].transformer.attention.activations_to_log)
 
-Worse, if your model architecture changes slightly, you might have to go back and 
+Worse, if your model architecture changes slightly, you might have to go back and
 change all these log  calls.
 
 Instead, we'll introduce a simple way to get around this:
@@ -29,8 +29,7 @@ list_logs(train_state) to get a list of all the (unwrapped) objects that were wr
 So, you could do
 map_logs(log_data, train_state)
 to automatically call log_data on all the log stuff.
-'''
-
+"""
 
 from typing import NamedTuple, Callable
 from jaxtyping import PyTree
@@ -42,10 +41,11 @@ class Log(NamedTuple):
 
 
 def map_logs(fn: Callable, tree: PyTree, state_fn: Callable = lambda x: x):
-    '''
+    """
     Wraps tree_map to treats Log instances as leaves.
     Calls fn on Log instance leaves and state_fn (default identity) on non-Log leaves
-    '''
+    """
+
     def map_fn(value):
         if not isinstance(value, Log):
             return state_fn(value)
@@ -55,20 +55,22 @@ def map_logs(fn: Callable, tree: PyTree, state_fn: Callable = lambda x: x):
 
 
 def filter_logs(tree: PyTree):
-    '''
+    """
     return a tree where all non-Log values are set to None.
-    '''
+    """
     return map_logs(lambda x: x, tree, state_fn=lambda x: None)
 
 
 def list_of_logs(tree: PyTree):
-    '''
+    """
     get a list of Log instances present in tree
-    '''
+    """
     result = []
+
     def append(log):
         result.append(log)
         return log
+
     map_logs(append, tree)
     return result
 
@@ -77,12 +79,7 @@ def set_all_logs(tree: PyTree, value=None):
     return map_logs(lambda x: value, tree)
 
 
-def map_instances(
-    fn: Callable,
-    cls: type,
-    tree: PyTree
-):
-    
+def map_instances(fn: Callable, cls: type, tree: PyTree):
     def map_fn(value):
         if not isinstance(value, cls):
             return None
@@ -90,15 +87,14 @@ def map_instances(
 
     return jtu.tree_map(map_fn, tree, is_leaf=lambda x: isinstance(x, cls))
 
-def list_mapped_instances(
-    fn: Callable,
-    cls: type,
-    tree: PyTree
-):
+
+def list_mapped_instances(fn: Callable, cls: type, tree: PyTree):
     result = []
+
     def append(value):
         result.append(value)
         return None
+
     map_instances(append, cls, tree)
 
     result = [fn(cls) for cls in result]

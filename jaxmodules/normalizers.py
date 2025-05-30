@@ -18,7 +18,9 @@ def matrix_inverse_sqrt(M, eps=0):
 
     inv_eig_vals = 1.0 / jnp.sqrt(jnp.maximum(eig_vals, eps))
 
-    result = einsum(eig_vecs, inv_eig_vals, eig_vecs, '... d1 d2, ... d2, ... d3 d2 -> ... d1  d3')
+    result = einsum(
+        eig_vecs, inv_eig_vals, eig_vecs, "... d1 d2, ... d2, ... d3 d2 -> ... d1  d3"
+    )
 
     return result
 
@@ -184,15 +186,14 @@ class CausalNorm(StatefulLayer):
     def __call__(self, x: jax.Array, return_stats=False):
         T, C = x.shape
 
-
-        if self.mean_resolution == 'none':
+        if self.mean_resolution == "none":
             centered_x = x
         else:
             means = jnp.cumsum(x, axis=0) / jnp.arange(1, T + 1).reshape((T, 1))
 
             if self.mean_resolution == "scalar":
                 means = jnp.mean(means, axis=1, keepdims=True)
-            centered_x = x  - means
+            centered_x = x - means
 
         if self.var_resolution == "scalar":
             vars = jnp.cumsum(centered_x**2, axis=0) / jnp.arange(1, T + 1).reshape(
@@ -204,8 +205,7 @@ class CausalNorm(StatefulLayer):
 
         elif self.var_resolution == "diag":
             vars = (
-                jnp.cumsum(centered_x**2, axis=0)
-                / jnp.arange(1, T + 1).reshape((T, 1))
+                jnp.cumsum(centered_x**2, axis=0) / jnp.arange(1, T + 1).reshape((T, 1))
                 + self.eps
             )
 
@@ -222,5 +222,3 @@ class CausalNorm(StatefulLayer):
             return result, means, vars
         else:
             return result
-
-
