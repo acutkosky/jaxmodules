@@ -304,7 +304,6 @@ class BlockMask(eqx.Module):
             Q_LEN = kv_indices.shape[2] * Q_BLOCK_SIZE
 
             def get_max_index(b, h, i, num_blocks, sparse_indices):
-                # jax.debug.print("num_blocks: {num_blocks}, indices: {indices}", num_blocks=num_blocks, indices=indices)
                 column_indices = jnp.arange(sparse_indices.shape[3], dtype=jnp.int32)
                 return jnp.max(
                     jnp.where(
