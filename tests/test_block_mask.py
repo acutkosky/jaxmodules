@@ -138,7 +138,11 @@ def test_get_sparse_kv_data_from_blocks():
     # Create a simple block pattern
     blocks = jnp.array([[[[1, 0], [1, 1]]]])
 
-    kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(B, H, blocks)
+    kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(blocks)
+
+    blocks = jnp.array([[1, 0], [1, 1]])
+
+    broadcasted_kv_num_blocks, broadcasted_kv_indices = get_sparse_kv_data_from_blocks(blocks)
 
     # Verify the output
     expected_num_blocks = jnp.array([[[1, 2]]])  # First row has 1 block, second has 2
@@ -151,6 +155,11 @@ def test_get_sparse_kv_data_from_blocks():
         kv_indices * relevant_indices, expected_indices * relevant_indices
     )
 
+    assert jnp.array_equal(broadcasted_kv_num_blocks, expected_num_blocks)
+    assert jnp.array_equal(
+        broadcasted_kv_indices * relevant_indices, expected_indices * relevant_indices
+    )
+
 
 def test_get_sparse_q_data_from_blocks():
     """Test get_sparse_q_data_from_blocks function"""
@@ -161,7 +170,7 @@ def test_get_sparse_q_data_from_blocks():
     # Create a simple block pattern
     blocks = jnp.array([[[[1, 0], [1, 1]]]])
 
-    q_num_blocks, q_indices = get_sparse_q_data_from_blocks(B, H, blocks)
+    q_num_blocks, q_indices = get_sparse_q_data_from_blocks(blocks)
 
     # Verify the output
     expected_num_blocks = jnp.array(

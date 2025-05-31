@@ -197,15 +197,15 @@ class BlockMask(eqx.Module):
             jnp.eye(Q_BLOCKS, KV_BLOCKS, dtype=jnp.int32), (B, H, Q_BLOCKS, KV_BLOCKS)
         )
 
-        kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(B, H, partial_blocks)
-        q_num_blocks, q_indices = get_sparse_q_data_from_blocks(B, H, partial_blocks)
+        kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(partial_blocks)
+        q_num_blocks, q_indices = get_sparse_q_data_from_blocks(partial_blocks)
 
         full_kv_num_blocks, full_kv_indices = get_sparse_kv_data_from_blocks(
-            B, H, full_blocks
+            full_blocks
         )
 
         full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
-            B, H, full_blocks
+            full_blocks
         )
 
         return BlockMask(
@@ -250,14 +250,14 @@ class BlockMask(eqx.Module):
         Q_LEN = NUM_Q_BLOCKS * Q_BLOCK_SIZE
         KV_LEN = NUM_KV_BLOCKS * KV_BLOCK_SIZE
 
-        kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(B, H, partial_blocks)
-        q_num_blocks, q_indices = get_sparse_q_data_from_blocks(B, H, partial_blocks)
+        kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(partial_blocks)
+        q_num_blocks, q_indices = get_sparse_q_data_from_blocks(partial_blocks)
 
         full_kv_num_blocks, full_kv_indices = get_sparse_kv_data_from_blocks(
-            B, H, full_blocks
+            full_blocks
         )
         full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
-            B, H, full_blocks
+            full_blocks
         )
 
         return cls(
@@ -395,7 +395,7 @@ def get_partial_block(
     return array_from_coords(shape=(Q_BLOCK_SIZE, KV_BLOCK_SIZE), fn=block_mask_mod)
 
 
-def get_sparse_kv_data_from_blocks(B, H, blocks: Array):
+def get_sparse_kv_data_from_blocks(blocks: Array):
     """
     Convert a dense block mask into sparse matrix block data along the key-value (row) axis.
 
@@ -409,13 +409,15 @@ def get_sparse_kv_data_from_blocks(B, H, blocks: Array):
         - kv_num_blocks: Number of blocks for each key-value position
         - kv_indices: Indices of the blocks for each key-value position
     """
-    kv_num_blocks = einsum(blocks, "b h kv q -> b h kv")  # [b h kv q] -> [b h kv]
+    if blocks.ndim == 2:
+        blocks = rearrange(blocks, "kv q -> 1 1 kv q")
+    kv_num_blocks = einsum(blocks, "... kv q -> ... kv")  # [b h kv q] -> [b h kv]
     kv_indices = jax.vmap(lambda x: jnp.argsort(-x))(blocks)
 
     return kv_num_blocks, kv_indices
 
 
-def get_sparse_q_data_from_blocks(B, H, blocks: Array):
+def get_sparse_q_data_from_blocks(blocks: Array):
     """
     Convert a dense block mask into sparse query block data.
 
@@ -432,7 +434,7 @@ def get_sparse_q_data_from_blocks(B, H, blocks: Array):
         - q_indices: Indices of the blocks for each query position
     """
     return get_sparse_kv_data_from_blocks(
-        B, H, rearrange(blocks, "b h q kv -> b h kv q")
+        rearrange(blocks, "b h q kv -> b h kv q")
     )
 
 
