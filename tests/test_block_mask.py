@@ -142,13 +142,18 @@ def test_get_sparse_kv_data_from_blocks():
 
     blocks = jnp.array([[1, 0], [1, 1]])
 
-    broadcasted_kv_num_blocks, broadcasted_kv_indices = get_sparse_kv_data_from_blocks(blocks)
+    broadcasted_kv_num_blocks, broadcasted_kv_indices = get_sparse_kv_data_from_blocks(
+        blocks
+    )
 
     # Verify the output
     expected_num_blocks = jnp.array([[[1, 2]]])  # First row has 1 block, second has 2
     expected_indices = jnp.array([[[[0, 2], [0, 1]]]])  # Indices of the blocks
 
     relevant_indices = jnp.array([[True, False], [True, True]])
+
+    print(kv_indices)
+    print(expected_indices)
 
     assert jnp.array_equal(kv_num_blocks, expected_num_blocks)
     assert jnp.array_equal(

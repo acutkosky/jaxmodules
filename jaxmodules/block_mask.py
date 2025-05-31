@@ -190,11 +190,11 @@ class BlockMask(eqx.Module):
         Q_BLOCKS = Q_LEN // Q_BLOCK_SIZE
 
         full_blocks = jnp.broadcast_to(
-            jnp.tri(Q_BLOCKS, KV_BLOCKS, -1, dtype=jnp.int32),
+            jnp.tri(Q_BLOCKS, KV_BLOCKS, -1, dtype=jnp.bool),
             (B, H, Q_BLOCKS, KV_BLOCKS),
         )
         partial_blocks = jnp.broadcast_to(
-            jnp.eye(Q_BLOCKS, KV_BLOCKS, dtype=jnp.int32), (B, H, Q_BLOCKS, KV_BLOCKS)
+            jnp.eye(Q_BLOCKS, KV_BLOCKS, dtype=jnp.bool), (B, H, Q_BLOCKS, KV_BLOCKS)
         )
 
         kv_num_blocks, kv_indices = get_sparse_kv_data_from_blocks(partial_blocks)
@@ -204,9 +204,7 @@ class BlockMask(eqx.Module):
             full_blocks
         )
 
-        full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
-            full_blocks
-        )
+        full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(full_blocks)
 
         return BlockMask(
             B=B,
@@ -256,9 +254,7 @@ class BlockMask(eqx.Module):
         full_kv_num_blocks, full_kv_indices = get_sparse_kv_data_from_blocks(
             full_blocks
         )
-        full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(
-            full_blocks
-        )
+        full_q_num_blocks, full_q_indices = get_sparse_q_data_from_blocks(full_blocks)
 
         return cls(
             B=B,
@@ -409,10 +405,12 @@ def get_sparse_kv_data_from_blocks(blocks: Array):
         - kv_num_blocks: Number of blocks for each key-value position
         - kv_indices: Indices of the blocks for each key-value position
     """
+    blocks = blocks.astype(jnp.int32)
     if blocks.ndim == 2:
         blocks = rearrange(blocks, "kv q -> 1 1 kv q")
     kv_num_blocks = einsum(blocks, "... kv q -> ... kv")  # [b h kv q] -> [b h kv]
-    kv_indices = jax.vmap(lambda x: jnp.argsort(-x))(blocks)
+    # kv_indices = jax.vmap(jax.vmap(jax.vmap(lambda x: jnp.flip(jnp.argsort(x)))))(blocks)
+    kv_indices = jnp.argsort(-blocks, axis=-1)
 
     return kv_num_blocks, kv_indices
 
@@ -433,9 +431,7 @@ def get_sparse_q_data_from_blocks(blocks: Array):
         - q_num_blocks: Number of blocks for each query position
         - q_indices: Indices of the blocks for each query position
     """
-    return get_sparse_kv_data_from_blocks(
-        rearrange(blocks, "b h q kv -> b h kv q")
-    )
+    return get_sparse_kv_data_from_blocks(rearrange(blocks, "b h q kv -> b h kv q"))
 
 
 def create_block_mask(
@@ -506,10 +502,10 @@ def get_dense_from_kv_blocks(
     ROWS = NUM_Q_BLOCKS
     COLS = NUM_KV_BLOCKS
 
-    data = jnp.zeros((B, H, ROWS, COLS), dtype=jnp.int32)
+    data = jnp.zeros((B, H, ROWS, COLS), dtype=jnp.bool)
 
     def set_value(b, h, i, j, acc):
-        return acc.at[b, h, i, kv_indices[b, h, i, j]].set(1)
+        return acc.at[b, h, i, kv_indices[b, h, i, j]].set(True)
 
     def get_upper(b, h, i):
         result = kv_num_blocks[b, h, i]

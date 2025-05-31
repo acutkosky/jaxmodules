@@ -288,9 +288,14 @@ def test_flex_attention_with_scale():
     # Test with explicit default scale
     default_scale = 1.0 / jnp.sqrt(E)
     output_explicit_default = flex_attention(query, key, value, scale=default_scale)
-    output_slow_explicit_default = flex_attention_slow(query, key, value, scale=default_scale)
+    output_slow_explicit_default = flex_attention_slow(
+        query, key, value, scale=default_scale
+    )
     output_torch_explicit_default = torch_fa.flex_attention(
-        torch.tensor(query), torch.tensor(key), torch.tensor(value), scale=float(default_scale)
+        torch.tensor(query),
+        torch.tensor(key),
+        torch.tensor(value),
+        scale=float(default_scale),
     ).numpy()
 
     # Test with custom scale
@@ -317,13 +322,17 @@ def test_flex_attention_with_scale():
 
     # Check that fast and slow implementations match for all scale values
     assert jnp.allclose(output_default, output_slow_default, rtol=1e-5, atol=1e-5)
-    assert jnp.allclose(output_explicit_default, output_slow_explicit_default, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(
+        output_explicit_default, output_slow_explicit_default, rtol=1e-5, atol=1e-5
+    )
     assert jnp.allclose(output_custom, output_slow_custom, rtol=1e-5, atol=1e-5)
     assert jnp.allclose(output_custom2, output_slow_custom2, rtol=1e-5, atol=1e-5)
 
     # Check that JAX and PyTorch implementations match
     assert jnp.allclose(output_default, output_torch_default, rtol=1e-5, atol=1e-5)
-    assert jnp.allclose(output_explicit_default, output_torch_explicit_default, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(
+        output_explicit_default, output_torch_explicit_default, rtol=1e-5, atol=1e-5
+    )
     assert jnp.allclose(output_custom, output_torch_custom, rtol=1e-5, atol=1e-5)
     assert jnp.allclose(output_custom2, output_torch_custom2, rtol=1e-5, atol=1e-5)
 
@@ -338,10 +347,10 @@ def test_flex_attention_with_scale():
     zero_scale = 0.0
     output_zero = flex_attention(query, key, value, scale=zero_scale)
     output_slow_zero = flex_attention_slow(query, key, value, scale=zero_scale)
-    
+
     # With zero scale, all attention weights should be equal (uniform distribution)
     # So the output should be the mean of all values
     expected_zero = jnp.mean(value, axis=2, keepdims=True).repeat(L, axis=2)
-    
+
     assert jnp.allclose(output_zero, output_slow_zero, rtol=1e-5, atol=1e-5)
     assert jnp.allclose(output_zero, expected_zero, rtol=1e-4, atol=1e-4)

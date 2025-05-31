@@ -339,6 +339,7 @@ def _flex_attention(
 
     return result
 
+
 flex_attention = jax.jit(
     _flex_attention, static_argnames=["score_mod", "enable_gqa", "return_lse"]
 )
@@ -413,9 +414,10 @@ def _flex_attention_slow(
     )
     key = rearrange(key, "B Hkv (S KVb) E -> B Hkv S KVb E", KVb=KV_BLOCK_SIZE)
 
-    scores = einsum(
-        query, key, "B Hkv G L Qb E, B Hkv S KVb E -> B Hkv G L S Qb KVb"
-    ) * scale
+    scores = (
+        einsum(query, key, "B Hkv G L Qb E, B Hkv S KVb E -> B Hkv G L S Qb KVb")
+        * scale
+    )
     if score_mod is not None:
 
         def block_grouped_score_mod(score, b, h, g, l, s, qb, kb):
@@ -470,6 +472,7 @@ def _flex_attention_slow(
     output_values = rearrange(output_values, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev")
 
     return output_values
+
 
 flex_attention_slow = jax.jit(
     _flex_attention_slow, static_argnames=["score_mod", "enable_gqa", "return_lse"]
