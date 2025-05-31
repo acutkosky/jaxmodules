@@ -113,6 +113,62 @@ def test_block_mask_from_kv_blocks():
             assert dense_mask[0, 0, q_idx, k_idx] == expected
 
 
+def test_block_mask_from_kv_blocks_no_seq_len():
+    """Test BlockMask.from_kv_blocks when seq_len is not provided - should infer from indices"""
+    B, H = 1, 1
+    BLOCK_SIZE = 2
+
+    # Create a simple pattern where each query block attends to specific key blocks
+    kv_num_blocks = jnp.array(
+        [[[1, 2, 1]]]
+    )  # 3 query blocks, varying number of kv blocks
+    kv_indices = jnp.array(
+        [[[[0, 3], [1, 2], [3, 3]]]]  # Max index is 3
+    )
+
+    # Create full blocks (all-ones blocks)
+    full_kv_num_blocks = jnp.array([[[1, 0, 1]]])  # Some full blocks
+    full_kv_indices = jnp.array([[[[2, 0], [0, 0], [1, 0]]]])  # Max index is 2
+
+    def mask_mod(b, h, q_idx, k_idx):
+        # Simple pattern for testing
+        return (q_idx + k_idx) % 2 == 0
+
+    # Test without providing seq_lengths
+    block_mask = BlockMask.from_kv_blocks(
+        kv_num_blocks=kv_num_blocks,
+        kv_indices=kv_indices,
+        full_kv_num_blocks=full_kv_num_blocks,
+        full_kv_indices=full_kv_indices,
+        BLOCK_SIZE=BLOCK_SIZE,
+        mask_mod=mask_mod,
+        # seq_lengths not provided - should be inferred
+    )
+
+    # The sequence lengths should be inferred as:
+    # Q_LEN = kv_indices.shape[2] * Q_BLOCK_SIZE = 3 * 2 = 6
+    # KV_LEN = max(max(kv_indices), max(full_kv_indices)) * KV_BLOCK_SIZE = max(3, 2) * 2 = 8
+    # Note: the max index is 3, so we need 4 blocks (0,1,2,3), so KV_LEN = 4 * 2 = 8
+
+    expected_q_len = 6  # 3 query blocks * 2 = 6
+    expected_kv_len = 8  # max index 3 + 1 = 4 blocks, 4 * 2 = 8
+
+    assert block_mask.Q_LEN == expected_q_len
+    assert block_mask.KV_LEN == expected_kv_len
+    assert block_mask.B == B
+    assert block_mask.H == H
+    assert block_mask.Q_BLOCK_SIZE == BLOCK_SIZE
+    assert block_mask.KV_BLOCK_SIZE == BLOCK_SIZE
+
+    # Test that the mask can be materialized without errors
+    dense_mask = block_mask.materialize_mask()
+    assert dense_mask.shape == (B, H, expected_q_len, expected_kv_len)
+
+    # Verify some basic properties
+    assert jnp.all(dense_mask >= 0)  # All values should be non-negative
+    assert jnp.all(dense_mask <= 1)  # All values should be 0 or 1
+
+
 def test_get_partial_block():
     """Test get_partial_block function"""
     B, H, L = 1, 1, 8

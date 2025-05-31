@@ -288,17 +288,29 @@ class BlockMask(eqx.Module):
     ) -> "BlockMask":
         Q_BLOCK_SIZE, KV_BLOCK_SIZE = extract_block_size(BLOCK_SIZE)
 
+        if kv_num_blocks.ndim < 3:
+            kv_num_blocks = rearrange(kv_num_blocks, "... q -> 1 1 q")
+        if kv_indices.ndim < 4:
+            kv_indices = rearrange(kv_indices, "... q kv -> 1 1 q kv")
+        if full_kv_num_blocks.ndim < 3:
+            full_kv_num_blocks = rearrange(full_kv_num_blocks, "... q -> 1 1 q")
+        if full_kv_indices.ndim < 4:
+            full_kv_indices = rearrange(full_kv_indices, "... q kv -> 1 1 q kv")
+
         B = kv_num_blocks.shape[0]
         H = kv_num_blocks.shape[1]
 
         if seq_lengths is None:
             Q_LEN = kv_indices.shape[2] * Q_BLOCK_SIZE
 
-            def get_max_index(b, h, i, num_blocks, indices):
-                indices = jnp.arange(num_blocks.shape[2], dtype=jnp.int32)
+            def get_max_index(b, h, i, num_blocks, sparse_indices):
+                # jax.debug.print("num_blocks: {num_blocks}, indices: {indices}", num_blocks=num_blocks, indices=indices)
+                column_indices = jnp.arange(sparse_indices.shape[3], dtype=jnp.int32)
                 return jnp.max(
                     jnp.where(
-                        indices < num_blocks[b, h, i], indices[b, h, i, :], -jnp.inf
+                        column_indices < num_blocks[b, h, i],
+                        sparse_indices[b, h, i, :],
+                        -jnp.inf,
                     ).astype(jnp.int32)
                 )
 
@@ -319,7 +331,13 @@ class BlockMask(eqx.Module):
                     ),
                 )
             )
-            KV_LEN = jnp.maximum(max_kv_index, max_full_kv_index) * KV_BLOCK_SIZE
+            try:
+                KV_LEN = (
+                    int(jnp.maximum(max_kv_index, max_full_kv_index) + 1)
+                    * KV_BLOCK_SIZE
+                )
+            except jax.errors.ConcretizationTypeError:
+                raise (ValueError, "cannot jit from_kv_blocks if seq_lengths is None!")
         else:
             Q_LEN, KV_LEN = seq_lengths
 
