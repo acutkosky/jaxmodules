@@ -15,7 +15,7 @@ class PRNGContext:
         # Context manager cleanup - nothing special needed for PRNG keys
         return False
 
-    def new(self, tree: PyTree | None) -> Array:
+    def new(self, tree: PyTree | None = None) -> Array:
         """Split the current key in two and return one of the splits.
 
         The current key is updated to use the other split, ensuring

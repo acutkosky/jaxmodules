@@ -20,8 +20,8 @@ def test_single_key_generation():
     key = jr.PRNGKey(42)
 
     with PRNGContext(key) as rng:
-        key1 = rng.new(None)
-        key2 = rng.new(None)
+        key1 = rng.new()
+        key2 = rng.new()
 
         # Keys should be different
         assert not jnp.array_equal(key1, key2)
@@ -58,8 +58,8 @@ def test_key_independence():
     key = jr.PRNGKey(42)
 
     with PRNGContext(key) as rng:
-        key1 = rng.new(None)
-        key2 = rng.new(None)
+        key1 = rng.new()
+        key2 = rng.new()
 
         # Generate random values with each key
         values1 = jr.normal(key1, (10,))
@@ -92,7 +92,7 @@ def test_context_manager_exit():
 
     try:
         with PRNGContext(key) as rng:
-            _ = rng.new(None)
+            _ = rng.new()
             # Simulate an exception
             raise ValueError("Test exception")
     except ValueError:
