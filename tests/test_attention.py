@@ -354,3 +354,72 @@ def test_flex_attention_with_scale():
 
     assert jnp.allclose(output_zero, output_slow_zero, rtol=1e-5, atol=1e-5)
     assert jnp.allclose(output_zero, expected_zero, rtol=1e-4, atol=1e-4)
+
+
+def test_flex_attention_jit_grad():
+    """Test that we can differentiate a jitted function that applies flex_attention"""
+    B, H, L, E = 2, 4, 8, 16
+    BLOCK_SIZE = 4
+
+    # Create random inputs
+    key = jax.random.normal(jax.random.PRNGKey(0), (B, H, L, E))
+    query = jax.random.normal(jax.random.PRNGKey(1), (B, H, L, E))
+    value = jax.random.normal(jax.random.PRNGKey(2), (B, H, L, E))
+
+    # Create a block mask
+    def causal_mask(b, h, q_idx, k_idx):
+        return q_idx >= k_idx
+
+    block_mask = create_block_mask(causal_mask, B, H, L, L, BLOCK_SIZE)
+
+    # Define a jitted function that takes (key, query, value) tuple and block_mask
+    @jax.jit
+    def flex_attention_fn(kqv_tuple, block_mask):
+        key, query, value = kqv_tuple
+        output = flex_attention(query, key, value, block_mask=block_mask)
+        # Return a scalar function of the result
+        return jnp.sum(output)
+
+    kqv_tuple = (key, query, value)
+
+    # Test value_and_grad
+    loss_value, grads = jax.value_and_grad(flex_attention_fn)(kqv_tuple, block_mask)
+
+    # Check that we get a scalar loss
+    assert loss_value.shape == ()
+
+    # Check that gradients have the same shape as inputs
+    grad_key, grad_query, grad_value = grads
+    assert grad_key.shape == key.shape
+    assert grad_query.shape == query.shape
+    assert grad_value.shape == value.shape
+
+    # Check that gradients are not all zeros (ensuring they're meaningful)
+    assert not jnp.allclose(grad_key, 0.0)
+    assert not jnp.allclose(grad_query, 0.0)
+    assert not jnp.allclose(grad_value, 0.0)
+
+    # Test that we can also just compute gradients
+    grads_only = jax.grad(flex_attention_fn)(kqv_tuple, block_mask)
+
+    # Check that grad-only computation matches value_and_grad
+    grad_key_only, grad_query_only, grad_value_only = grads_only
+    assert jnp.allclose(grad_key, grad_key_only)
+    assert jnp.allclose(grad_query, grad_query_only)
+    assert jnp.allclose(grad_value, grad_value_only)
+
+    # Test with different block masks to ensure it works generally
+    def sliding_window_mask(b, h, q_idx, k_idx):
+        return abs(q_idx - k_idx) <= 2
+
+    block_mask_2 = create_block_mask(sliding_window_mask, B, H, L, L, BLOCK_SIZE)
+
+    loss_value_2, grads_2 = jax.value_and_grad(
+        lambda kqv, bm: flex_attention_fn(kqv, bm)
+    )(kqv_tuple, block_mask_2)
+
+    # Check that different masks give different results
+    assert loss_value != loss_value_2
+    assert not jnp.allclose(grads[0], grads_2[0])  # Different gradients for key
+    assert not jnp.allclose(grads[1], grads_2[1])  # Different gradients for query
+    assert not jnp.allclose(grads[2], grads_2[2])  # Different gradients for value

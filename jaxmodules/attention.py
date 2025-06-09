@@ -235,7 +235,24 @@ def _flex_attention(
             )
         return score
 
-    def accumulate_value_for_query_block(b, h, g, l, s, accumulated, do_mask=False):
+    def accumulate_value_for_query_block(
+        b, h, g, l, s, accumulated, is_over_limit, do_mask=False
+    ):
+        return jax.lax.cond(
+            is_over_limit,
+            lambda b, h, g, l, s, accumulated: accumulated,
+            lambda b, h, g, l, s, accumulated: _accumulate_value_for_query_block(
+                b, h, g, l, s, accumulated, do_mask=do_mask
+            ),
+            b,
+            h,
+            g,
+            l,
+            s,
+            accumulated,
+        )
+
+    def _accumulate_value_for_query_block(b, h, g, l, s, accumulated, do_mask=False):
         result_carry, sum_exp_score, max_score = accumulated
         score = get_score_for_query_kv_block(b, h, g, l, s)
         if broadcast_mask_B:
@@ -252,9 +269,13 @@ def _flex_attention(
         # when not jitted; haven't tested with jit though.
         inf_block = jnp.full_like(score, -jnp.inf)
 
-        mask = block_mask.get_mask_for_partial_block(block_b, block_h, l, s)
+        if do_mask:
+            mask = block_mask.get_mask_for_partial_block(block_b, block_h, l, s)
+            masked_score = jnp.where(mask, score, inf_block)
+        else:
+            mask = jnp.ones_like(score)
+            masked_score = score
 
-        masked_score = jnp.where(mask, score, inf_block)
         next_max_score = jnp.maximum(
             max_score, jnp.max(masked_score, axis=-1, keepdims=True)
         )
@@ -308,9 +329,16 @@ def _flex_attention(
 
         result_carry, sum_exp_score, max_score = jax.lax.fori_loop(
             lower=0,
-            upper=full_block_limit,
+            upper=full_kv_indices.shape[0],
             body_fun=lambda j, acc: accumulate_value_for_query_block(
-                b, h, g, l, full_kv_indices[j], acc, do_mask=False
+                b,
+                h,
+                g,
+                l,
+                full_kv_indices[j],
+                acc,
+                j >= full_block_limit,
+                do_mask=False,
             ),
             init_val=(result_carry, sum_exp_score, max_score),
         )
@@ -319,9 +347,9 @@ def _flex_attention(
         kv_indices = block_mask.kv_indices[block_b, block_hq, l]
         result_carry, sum_exp_score, max_score = jax.lax.fori_loop(
             lower=0,
-            upper=partial_block_limit,
+            upper=kv_indices.shape[0],
             body_fun=lambda j, acc: accumulate_value_for_query_block(
-                b, h, g, l, kv_indices[j], acc, do_mask=True
+                b, h, g, l, kv_indices[j], acc, j >= partial_block_limit, do_mask=True
             ),
             init_val=(result_carry, sum_exp_score, max_score),
         )
