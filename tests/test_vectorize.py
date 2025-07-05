@@ -2,6 +2,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 from jaxmodules.vectorize import array_from_coords, multi_vmap, nested_fori_loop
+import numpy as np
 
 
 def test_array_from_coords_basic():
@@ -64,6 +65,32 @@ def test_multi_vmap_complex():
     # expected = jnp.array([[15, 18], [21, 24]])
     assert jnp.array_equal(result, expected)
 
+def test_multi_vmap_out_axes():
+    """Test multi_vmap with complex out_axes"""
+
+    # If in_axes = ((0, None, 1), (1, 1, None)) and out_axes = (2, 0), then:
+    # output[i0, :, i1,...] = fn(A[i1, i0, ...], B[:, i0, ...], C[:, i1, ...])
+
+    def fn(x, y, z):
+        return x + jnp.sum(y, axis=0) * jnp.sum(z, axis=0)
+
+
+    x = jnp.arange(2*2*2).reshape((2,2,2))
+    y = jnp.arange(5, 5+ 2*2*2).reshape((2,2,2))
+    z = jnp.arange(10, 10+ 2*2*2).reshape((2,2,2))
+
+    result = multi_vmap(
+        fn,
+        in_axes=[(1, 1, None), (0, None, 1)],
+        out_axes=(0, 2),
+    )(x, y, z)
+
+    expected = np.zeros((2,2,2))
+    for i0 in range(2):
+        for i1 in range(2):
+            expected[i0, :, i1] = fn(x[i1, i0, :], y[:, i0, :], z[:, i1, :])
+
+    assert jnp.array_equal(result, expected)
 
 def test_multi_vmap_unmapped_inputs():
     """Test multi_vmap with some inputs having no mapped axes"""

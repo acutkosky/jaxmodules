@@ -3,9 +3,16 @@ from jax import numpy as jnp
 from typing import Callable, Union, Optional, Dict, Any, NamedTuple
 from jaxtyping import Array, Float, UInt
 import equinox as eqx
-from einops import einsum, rearrange
-from jaxmodules.vectorize import array_from_coords, multi_vmap, nested_fori_loop
+from einops import rearrange, repeat
+from jaxmodules.vectorize import array_from_coords, multi_vmap, multi_vmap_transposed_in_axes, nested_fori_loop
 from jaxmodules.block_mask import BlockMask
+
+from einops import einsum
+
+def use_custom_einsum():
+    global einsum
+    from jaxmodules.vectorize import einsum as use_custom_einsum
+    einsum = use_custom_einsum
 
 
 def threshold_kernel(threshold: Optional[float] = None):
@@ -488,7 +495,7 @@ def _flex_attention_slow(
         )
         scores = jnp.where(mask, scores, jnp.full_like(scores, -jnp.inf))
 
-    scores = rearrange(scores, "B Hkv G L S Qb KVb-> B Hkv G L Qb (S KVb)")
+    scores = rearrange(scores, "B Hkv G L S Qb KVb -> B Hkv G L Qb (S KVb)")
     scores = scores - jnp.max(scores, axis=-1, keepdims=True)
 
     scores = jax.nn.softmax(scores, axis=-1)
@@ -500,7 +507,6 @@ def _flex_attention_slow(
     output_values = rearrange(output_values, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev")
 
     return output_values
-
 
 flex_attention_slow = jax.jit(
     _flex_attention_slow, static_argnames=["score_mod", "enable_gqa", "return_lse"]

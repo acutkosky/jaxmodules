@@ -17,7 +17,15 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+  "einops",
   "equinox"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "torch",
+  "numpy"
 ]
 
 [project.urls]
