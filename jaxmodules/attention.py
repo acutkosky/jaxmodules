@@ -6,7 +6,7 @@ import equinox as eqx
 from einops import rearrange, repeat
 from jaxmodules.vectorize import array_from_coords, multi_vmap, multi_vmap_transposed_in_axes, nested_fori_loop
 from jaxmodules.block_mask import BlockMask
-
+from functools import partial
 from einops import einsum
 
 def use_custom_einsum():
@@ -49,12 +49,11 @@ def default_kernel(q, k):
     """
     return jnp.exp(jnp.dot(q, k) / jnp.sqrt(k.shape[-1]))
 
-
-def masked_attention_via_scan(
-    K: Array,
+@partial(jax.custom_vjp, nondiff_argnames=['is_causal', 'kernel_fn', 'mask_fn', 'block_size'])
+def _masked_attention_via_scan(
     Q: Array,
+    K: Array,
     V: Array,
-    *,
     is_causal: bool = False,
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
@@ -70,7 +69,7 @@ def masked_attention_via_scan(
     is_causal: if true, apply a causal mask
     kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
         default is q, k -> jnp.exp( <q, k> / sqrt(d) )
-    mask_fn: takes a integer index i and returns a size [d] array of booleans
+    mask_fn: takes a integer index i and returns a size [L] array of booleans
         specifying the attention mask for the ith query.
         If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
         If is_causal is False and mask_fn is None, then the default  value of no masking will
@@ -78,10 +77,13 @@ def masked_attention_via_scan(
     block_size: If specified, group the Q values [block_size,  d] sized blocks and
         perform attention on these blocks. Allows to trade-off the memory savings of scan.
     """
-
     L, d = K.shape
     N, dq = Q.shape
     Lv, dv = V.shape
+
+
+    if block_size is None:
+        block_size = N
 
     assert d == dq and Lv == L and dv == d, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
@@ -91,22 +93,46 @@ def masked_attention_via_scan(
         f"block_size must divide number of queries!"
     )
 
+    is_full_mask = False
     if is_causal and mask_fn is not None:
         raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
     if is_causal:
         base_range = jnp.arange(L)
         mask_fn = lambda i: base_range <= i
     if mask_fn is None:
-        mask_fn = lambda i: jnp.ones(L)
+        is_full_mask = True
+        mask_fn = lambda i: jnp.full(L, True)
 
-    def attn_fn(idx, q):
-        # q is [block_size, d]
-        # i is an integer or an array of integers
+    # print("in the primals!")
+
+
+    def attn_fn(idx_q):
+        idx, q = idx_q
+        # idx is an array of integers
         if block_size is not None:
             mask = jax.vmap(mask_fn)(idx)  # [block_size, L]
         else:
             mask = mask_fn(idx)  # [L]
-
+        next_idx = idx + 1 if block_size is None else idx + block_size
+        if kernel_fn == default_kernel:
+            # print("q.shape", q.shape)
+            q = rearrange(q, "Q d -> Q 1 d")
+            Khat = rearrange(K, "L d -> L 1 d")
+            Vhat = rearrange(V, "L d -> L 1 d")
+            mask = jnp.reshape(mask, (1, mask.shape[0], mask.shape[1]))
+            if is_full_mask:
+                values = jax.nn.dot_product_attention(q, Khat, Vhat, implementation='cudnn')
+            else:
+                # print("mask.shape", mask.shape)
+                # print("q.shape", q.shape)
+                # print("Khat.shape", Khat.shape)
+                # print("Vhat.shape", Vhat.shape)
+                values = jax.nn.dot_product_attention(q, Khat, Vhat, mask=mask, implementation='cudnn')
+                # print("values.shape", values.shape)
+            # values = rearrange(values, "Q 1 d -> Q d")
+            # return jax.lax.stop_gradient(next_idx), values
+            return values
+        # else:
         if block_size is not None:
             # we want to make  a [block_size, L] matrix whose i,j entry is kernel_fn(q[i], K[j])
             # we do this with two vmaps. First, "inner_fn" will take input q, K[i] and vmap over
@@ -127,20 +153,185 @@ def masked_attention_via_scan(
         normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [block_size, 1]
         scores = scores / normalizer
         values = scores @ V  # [block_size, L] @ [L, d] -> [block_size, d]
-        next_idx = idx + 1 if block_size is None else idx + block_size
-        return next_idx, values
+        # return values
+        return jax.lax.stop_gradient(next_idx), values
 
     if block_size is not None:
         Q = jnp.reshape(Q, (N // block_size, block_size, d))
+    # print("Q.shape", Q.shape)
+    idx_blocks = jnp.arange(N)
+    idx_blocks = jax.lax.stop_gradient(jnp.reshape(jnp.arange(N), (N//block_size, block_size)))
+    # print("idx_blocks.shape", idx_blocks.shape)
 
-    _, values = jax.lax.scan(
-        attn_fn, init=0 if block_size is None else jnp.arange(block_size), xs=Q
-    )
+    values = jax.lax.map(jax.checkpoint(attn_fn), (idx_blocks, Q))#, batch_size=block_size)
+    # _, values = jax.lax.scan(
+    #     jax.checkpoint(attn_fn), init=0 if block_size is None else jnp.arange(block_size), xs=(idx_blocks, Q)
+    # )
+    # values = jnp.zeros((N, d), dtype=V.dtype)
+    # values = jnp.reshape(values, (N//block_size, block_size, d))
+    # values = jax.lax.associative_scan(
+    #     jax.checkpoint(attn_fn), elems=(idx_blocks, Q, values)
+    # )
+    # print("near final values.shape", values.shape)
 
     if block_size is not None:
         values = jnp.reshape(values, (N, d))
 
     return values
+
+
+# @partial(jax.custom_vjp, nondiff_argnames=['is_causal', 'kernel_fn', 'mask_fn', 'block_size'])
+# def foo(
+#     Q: Array,
+#     K: Array,
+#     V: Array,
+#     is_causal: bool = False,
+#     kernel_fn: Callable[[Array, Array], float] = default_kernel,
+#     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
+#     block_size=None
+# ):
+#     return Q
+
+def _masked_attention_via_scan_fwd(
+    Q: Array,
+    K: Array,
+    V: Array,
+    is_causal: bool = False,
+    kernel_fn: Callable[[Array, Array], float] = default_kernel,
+    mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
+    block_size=None,
+) -> Array:
+
+    values = _masked_attention_via_scan(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size)
+    return values, (Q, K, V)
+
+def _masked_attention_via_scan_bwd(
+    is_causal: bool,
+    kernel_fn: Callable[[Array, Array], float],
+    mask_fn: Optional[Union[Callable[int, Array], Array]] ,
+    block_size,  
+    res,
+    upstream_grad, 
+):
+    Q, K, V = res
+    L, d = K.shape
+    N, dq = Q.shape
+    Lv, dv = V.shape
+
+    print("Q shape: ", Q.shape)
+    print("K shape: ", K.shape)
+    print("V shape: ", V.shape)
+    print("upstream_grad shape: ", upstream_grad.shape)
+
+    if block_size is None:
+        block_size = N
+
+    assert d == dq and Lv == L and dv == d, (
+        f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
+    )
+
+    assert block_size is None or N % block_size == 0, (
+        f"block_size must divide number of queries!"
+    )
+
+    is_full_mask = False
+    if is_causal and mask_fn is not None:
+        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
+    if is_causal:
+        base_range = jnp.arange(L)
+        mask_fn = lambda i: base_range <= i
+    if mask_fn is None:
+        is_full_mask = True
+        mask_fn = lambda i: jnp.full(L, True)
+
+    def attn_fn(dK_dV, idx_q_g):
+    # def attn_fn(idx_q_v):
+        idx, q, g = idx_q_g
+        dK_carry, dV_carry = dK_dV
+        print("idx.shape", idx.shape)
+        print("q.shape", q.shape)
+        print("g.shape", g.shape)
+        # idx = jnp.reshape(idx, (1, 1))
+        # q = jnp.reshape(q, (1, -1))
+        # q is [block_size, d]
+        # i is an integer or an array of integers
+        # g is [block_size, dv]
+        if block_size is not None:
+            mask = jax.vmap(mask_fn)(idx)  # [block_size, L]
+        else:
+            mask = mask_fn(idx)  # [L]
+
+        # q = rearrange(q, "Q d -> Q 1 d")
+        # Khat = rearrange(K, "L d -> L 1 d")
+        # Vhat = rearrange(V, "L d -> L 1 d")
+        mask = jnp.reshape(mask, (1, mask.shape[0], mask.shape[1]))
+        print("about to get values")
+        def get_values(q, Khat, Vhat):
+            q = rearrange(q, "Q d -> Q 1 d")
+            Khat = rearrange(Khat, "L d -> L 1 d")
+            Vhat = rearrange(Vhat, "L d -> L 1 d")
+            result = jax.nn.dot_product_attention(q, Khat, Vhat, mask=mask, implementation='cudnn')
+            return rearrange(result, "Q 1 d -> Q d")
+        _, vjp_fn = jax.vjp(get_values, q, K, V)
+        dq, qK, qV = vjp_fn(g)
+        dK_carry = dK_carry + qK
+        dV_carry = dV_carry + qV
+            # values = jax.nn.dot_product_attention(q, Khat, Vhat, mask=mask, implementation='cudnn')
+            # print("values.shape", values.shape)
+        # values = rearrange(values, "Q 1 d -> Q d")
+        # return jax.lax.stop_gradient(next_idx), values
+        print("dk_carry shape: ", dK_carry.shape)
+        print("dv_carry shape: ", dV_carry.shape)
+        print("dq shape: ", dq.shape)
+        return (dK_carry, dV_carry), dq
+
+
+    print("got here")
+    # g will have shape (N, d).
+    # break it up into blocks of size block_size
+    g_blocks = jnp.reshape(upstream_grad, (N // block_size, block_size, d))
+
+
+
+    if block_size is not None:
+        Q = jnp.reshape(Q, (N // block_size, block_size, d))
+    # print("Q.shape", Q.shape)
+    idx_blocks = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
+    # print("idx_blocks.shape", idx_blocks.shape)
+
+    # results = jax.lax.map(jax.checkpoint(attn_fn), (idx_blocks, Q, g_blocks))#, batch_size=block_size)
+    (k_grad, v_grad), q_grad = jax.lax.scan(
+        attn_fn, init=(jnp.zeros_like(K), jnp.zeros_like(V)), xs=(idx_blocks, Q, g_blocks)
+    )
+    # values = jnp.zeros((N, d), dtype=V.dtype)
+    # values = jnp.reshape(values, (N//block_size, block_size, d))
+    # values = jax.lax.associative_scan(
+    #     jax.checkpoint(attn_fn), elems=(idx_blocks, Q, values)
+    # )
+    # print("near final values.shape", values.shape)
+
+    if block_size is not None:
+        q_grad = jnp.reshape(q_grad, (N, dq))
+    print("q_grad shape: ", q_grad.shape)
+    print("k_grad shape: ", k_grad.shape)
+    print("v_grad shape: ", v_grad.shape)
+    return q_grad, k_grad, v_grad
+
+
+_masked_attention_via_scan.defvjp(_masked_attention_via_scan_fwd, _masked_attention_via_scan_bwd)
+
+def masked_attention_via_scan(
+    Q: Array,
+    K: Array,
+    V: Array,
+    *,
+    is_causal: bool = False,
+    kernel_fn: Callable[[Array, Array], float] = default_kernel,
+    mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
+    block_size=None,
+) -> Array:
+    return _masked_attention_via_scan(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size)
+
 
 
 def _flex_attention(
