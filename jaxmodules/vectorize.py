@@ -4,7 +4,7 @@ from typing import Callable, List, Tuple, Dict, Any, Union, Sequence, Optional
 from jaxtyping import Array, Float, Int, PyTree
 import numpy as np
 import einops
-
+import re
 
 def array_from_coords(shape: Tuple[int, ...], fn: Callable[..., Array]) -> Array:
     """Creates a new array by applying a function to each position's indices.
@@ -418,7 +418,58 @@ is also valid.
 The output pattern is then a space-separated list of names.
 The input string is a comma-separated list of patterns, which of which
 is a space-separated list of names.
+
+NEW:
+we'll also allow for putting dummy function and variable names with parentheses or square brackets, like so:
+
+out[i1, i2, i3] <- fn(A[i1, i2], B[i2, i3], C[i3, :, i1])
+
+This will be parsed as:
+
+i1 i2 i3 <- i1 i2, i2 i3, i3 : i1
+
+note that in this format, there are commas between dimension as well as between patterns.
+
+the actual names of the functions and variables are ignored.
 '''
+
+def _parse_format(fmt: str) -> str:
+    '''
+    converts a format string with dummy function and variable names into
+    a simpler format string that can be parsed by the rest of the code.
+    '''
+    if '<-' in fmt:
+        assert '->' not in fmt, "cannot have both '<-' and '->' in format string"
+        output_fmt, input_fmt = fmt.split('<-')
+    elif '->' in fmt:
+        input_fmt, output_fmt = fmt.split('->')
+    else:
+        raise ValueError(f"invalid format string: {fmt}")
+    
+    # clean up the output_fmt:
+    # it should match ^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$
+    output_fmt = re.match(r'^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$', output_fmt)
+
+
+def _parse_dummy_format(output_fmt: str, input_fmt: str) -> Tuple[str, str]:
+    # now output_fmt is the comma-separated list of axis names. Just replace the commas with spaces.
+    output_fmt = output_fmt.replace(',', ' ')
+
+    # now let's grab all the axis specifications:
+    in_axes = re.match(r'[\w\d]*\[([\w\d\s,:]*)\]', input_fmt)
+    if in_axes is None:
+        raise ValueError(f"invalid input format string: {input_fmt}")
+    in_axes = in_axes.group(1)
+
+    # now let's grab all the axis specifications:
+    in_axes = re.findall(r'[\w\d]*\[([\w\d\s,:]*)\]', input_fmt)
+    in_axes = [x.replace(',', ' ') for x in in_axes]
+    input_fmt = ', '.join(in_axes)
+
+    # now let's put it all together:
+    return output_fmt, input_fmt
+    
+
 def fancy_vmap(fn: Callable, fmt: str) -> Callable:
     """Vectorizes a function using a format string similar to einsum notation.
     
@@ -464,12 +515,21 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
     """
     # find the output specification
 
-    if '->' in fmt:
-        input_fmt, output_fmt = fmt.split('->')
-    elif '<-' in fmt:
+    if '<-' in fmt:
+        assert '->' not in fmt, "cannot have both '<-' and '->' in format string"
         output_fmt, input_fmt = fmt.split('<-')
+    elif '->' in fmt:
+        input_fmt, output_fmt = fmt.split('->')
     else:
         raise ValueError(f"invalid format string: {fmt}")
+    
+    # clean up the output_fmt:
+    # it should match ^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$
+    output_match = re.match(r'^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$', output_fmt)
+    input_match = re.match(r'^\s*[\w\d]*\(([\w\d\s,:\[\]]*)\)\s*$', input_fmt)
+    if output_match is not None and input_match is not None:
+        output_fmt, input_fmt = _parse_dummy_format(output_match.group(1), input_match.group(1))
+
 
     # parse the output
 

@@ -366,6 +366,31 @@ def test_fancy_vmap_complex_pattern():
     assert jnp.array_equal(result, expected)
 
 
+
+
+def test_fancy_vmap_complex_pattern_pretty_input():
+    """Test fancy_vmap with complex axis mapping patterns and pretty input format"""
+    def fn(x, y, z, w):
+        return x + y + z + w
+    
+    x = jnp.array([[1, 2], [3, 4]])  # Shape: (2, 2)
+    y = jnp.array([10, 20])          # Shape: (2,)
+    z = jnp.array([100])             # Shape: (1,)
+    w = jnp.array([[5, 6], [7, 8]])  # Shape: (2, 2)
+    
+    # Complex pattern: output[i, j] = fn(x[i, j], y[i], z[:], w[j, i])
+    vectorized_fn = fancy_vmap(fn, "out[i, j] <- fn(x[i, j], y[i], z[:], w[j, i])")
+    result = vectorized_fn(x, y, z, w)
+    
+    # Expected: for each i, j:
+    # result[i,j] = x[i,j] + y[i] + z[0] + w[j,i]
+    expected = jnp.array([
+        [[1+10+100+5], [2+10+100+7]],  # i=0: [x[0,0]+y[0]+z[0]+w[0,0], x[0,1]+y[0]+z[0]+w[1,0]]
+        [[3+20+100+6], [4+20+100+8]]   # i=1: [x[1,0]+y[1]+z[0]+w[0,1], x[1,1]+y[1]+z[0]+w[1,1]]
+    ])
+    assert jnp.array_equal(result, expected)
+
+
 def test_fancy_vmap_reverse_direction():
     """Test fancy_vmap with reverse direction syntax (<-)"""
     def fn(x, y):
