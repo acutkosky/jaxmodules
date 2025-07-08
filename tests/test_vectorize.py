@@ -1,7 +1,7 @@
 import pytest
 import jax
 import jax.numpy as jnp
-from jaxmodules.vectorize import array_from_coords, multi_vmap, nested_fori_loop
+from jaxmodules.vectorize import array_from_coords, multi_vmap, nested_fori_loop, fancy_vmap
 import numpy as np
 
 
@@ -293,3 +293,148 @@ def test_nested_fori_loop_empty_range():
         init_val=0,
     )
     assert result == 0  # No iterations performed
+
+
+def test_fancy_vmap_basic():
+    """Test basic functionality of fancy_vmap with simple mapping"""
+    def fn(x, y):
+        return x + y
+    
+    x = jnp.array([1, 2, 3])
+    y = jnp.array([4, 5, 6])
+    
+    # Test basic mapping: output[i] = fn(x[i], y[i])
+    vectorized_fn = fancy_vmap(fn, "i, i -> i")
+    result = vectorized_fn(x, y)
+    expected = jnp.array([5, 7, 9])
+    assert jnp.array_equal(result, expected)
+
+
+def test_fancy_vmap_broadcasting():
+    """Test fancy_vmap with broadcasting (using ':')"""
+    def fn(x, y, z):
+        return x + y + z
+    
+    x = jnp.array([1, 2, 3])
+    y = jnp.array([10, 20, 30])
+    z = jnp.array([100])  # Will be broadcasted
+    
+    # Test broadcasting: output[i] = fn(x[i], y[i], z[:])
+    vectorized_fn = fancy_vmap(fn, "i, i, : -> i")
+    result = vectorized_fn(x, y, z)
+    # there is a subtlety: the z argument to fn will be [100], so the output will be a 1, shape array
+    # rather than a 0 shape scalar. This means the final output will be a 3,1 shape array.
+    expected = jnp.array([[111], [122], [133]])  # [[1+10+100], [2+20+100], [3+30+100]]
+    assert jnp.array_equal(result, expected)
+
+
+def test_fancy_vmap_multiple_outputs():
+    """Test fancy_vmap with multiple output dimensions"""
+    def fn(x, y):
+        return x + y
+    
+    x = jnp.array([[1, 2], [3, 4]])
+    y = jnp.array([[5, 6], [7, 8]])
+    
+    # Test multiple outputs: output[i, j] = fn(x[i, j], y[i, j])
+    vectorized_fn = fancy_vmap(fn, "i j, i j -> i j")
+    result = vectorized_fn(x, y)
+    expected = jnp.array([[6, 8], [10, 12]])
+    assert jnp.array_equal(result, expected)
+
+
+def test_fancy_vmap_complex_pattern():
+    """Test fancy_vmap with complex axis mapping patterns"""
+    def fn(x, y, z, w):
+        return x + y + z + w
+    
+    x = jnp.array([[1, 2], [3, 4]])  # Shape: (2, 2)
+    y = jnp.array([10, 20])          # Shape: (2,)
+    z = jnp.array([100])             # Shape: (1,)
+    w = jnp.array([[5, 6], [7, 8]])  # Shape: (2, 2)
+    
+    # Complex pattern: output[i, j] = fn(x[i, j], y[i], z[:], w[j, i])
+    vectorized_fn = fancy_vmap(fn, "i j, i, :, j i -> i j")
+    result = vectorized_fn(x, y, z, w)
+    
+    # Expected: for each i, j:
+    # result[i,j] = x[i,j] + y[i] + z[0] + w[j,i]
+    expected = jnp.array([
+        [[1+10+100+5], [2+10+100+7]],  # i=0: [x[0,0]+y[0]+z[0]+w[0,0], x[0,1]+y[0]+z[0]+w[1,0]]
+        [[3+20+100+6], [4+20+100+8]]   # i=1: [x[1,0]+y[1]+z[0]+w[0,1], x[1,1]+y[1]+z[0]+w[1,1]]
+    ])
+    assert jnp.array_equal(result, expected)
+
+
+def test_fancy_vmap_reverse_direction():
+    """Test fancy_vmap with reverse direction syntax (<-)"""
+    def fn(x, y):
+        return x + y
+    
+    x = jnp.array([1, 2, 3])
+    y = jnp.array([4, 5, 6])
+    
+    # Test reverse direction: output[i] = fn(x[i], y[i])
+    vectorized_fn = fancy_vmap(fn, "i <- i, i")
+    result = vectorized_fn(x, y)
+    expected = jnp.array([5, 7, 9])
+    assert jnp.array_equal(result, expected)
+
+
+def test_fancy_vmap_matrix_output():
+    """Test fancy_vmap with matrix output from function"""
+    def fn(x, y):
+        # Returns a 2x2 matrix for each input pair
+        return jnp.array([[x, y], [x + y, x * y]])
+    
+    x = jnp.array([1, 2])
+    y = jnp.array([3, 4])
+    
+    # Test matrix output: output[i] = fn(x[i], y[i]) where fn returns a matrix
+    vectorized_fn = fancy_vmap(fn, "i, i -> i")
+    result = vectorized_fn(x, y)
+    
+    expected = jnp.array([
+        [[1, 3], [4, 3]],  # For x=1, y=3
+        [[2, 4], [6, 8]]   # For x=2, y=4
+    ])
+    assert jnp.array_equal(result, expected)
+
+
+def test_fancy_vmap_invalid_format():
+    """Test fancy_vmap with invalid format strings"""
+    def fn(x, y):
+        return x + y
+    
+    x = jnp.array([1, 2, 3])
+    y = jnp.array([4, 5, 6])
+    
+    # Test invalid format (no separator)
+    with pytest.raises(ValueError, match="invalid format string"):
+        fancy_vmap(fn, "i, i i")
+    
+    # Test ellipsis in output (not allowed)
+    with pytest.raises(ValueError, match="ellipsis not allowed in output format"):
+        fancy_vmap(fn, "i, i -> ...")
+    
+    # Test ellipsis in input (not allowed)
+    with pytest.raises(ValueError, match="ellipsis not allowed in input format"):
+        fancy_vmap(fn, "..., i -> i")
+
+
+def test_fancy_vmap_mixed_broadcasting():
+    """Test fancy_vmap with mixed broadcasting patterns"""
+    def fn(x, y, z):
+        return x + y + z
+    
+    x = jnp.array([1, 2, 3])
+    y = jnp.array([10, 20, 30])
+    z = jnp.array([100, 200, 300])
+    
+    # Test mixed broadcasting: output[i] = fn(x[i], y[i], z[:])
+    vectorized_fn = fancy_vmap(fn, "i, i, : -> i")
+    result = vectorized_fn(x, y, z)
+    
+    # Expected: for each i, z is broadcasted (only first element used)
+    expected = jnp.array([[111, 211, 311], [122, 222, 322], [133, 233, 333]])
+    assert jnp.array_equal(result, expected)

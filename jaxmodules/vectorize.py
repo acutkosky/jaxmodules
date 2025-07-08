@@ -1,6 +1,6 @@
 import jax
 from jax import numpy as jnp
-from typing import Callable, List, Tuple, Dict, Any, Union, Sequence
+from typing import Callable, List, Tuple, Dict, Any, Union, Sequence, Optional
 from jaxtyping import Array, Float, Int, PyTree
 import numpy as np
 import einops
@@ -36,7 +36,7 @@ def array_from_coords(shape: Tuple[int, ...], fn: Callable[..., Array]) -> Array
 def multi_vmap(
     fn: Callable[..., Array],
     in_axes: Sequence[Sequence[Union[int, None]]],
-    out_axes: Sequence[int],
+    out_axes: Optional[Sequence[int]]=None,
 ) -> Callable[..., Array]:
     """Vectorizes a function over multiple axes using JAX's vmap.
 
@@ -47,7 +47,7 @@ def multi_vmap(
     Args:
         fn: The function to vectorize. Should return an array.
         in_axes: List of tuples specifying which axes to map over for each input argument.
-            Each tuple should have length equal to the number of output axes.
+            Each tuple should have length equal to the number of inputs.
             Use None to indicate that an axis should not be mapped over.
         out_axes: Tuple specifying the order of axes in the output array.
 
@@ -59,6 +59,9 @@ def multi_vmap(
         If in_axes = ((0, None, 1), (1, 1, None)) and out_axes = (2, 0), then:
         output[i0, :, i2,...] = fn(A[i2, i0, ...], B[:, i0, ...], C[:, i2, ...])
     """
+
+    if out_axes is None:
+        out_axes = tuple(range(len(in_axes)))
 
     # need to sort out_axes
     out_axes_sorted_idx = np.argsort(out_axes)
@@ -113,7 +116,7 @@ def multi_vmap(
 def _multi_vmap_pre_sorted(
     fn: Callable[..., Array],
     in_axes: Sequence[Sequence[Union[int, None]]],
-    out_axes: Sequence[int],
+    out_axes: Optional[Sequence[int]]=None,
 ) -> Callable[..., Array]:
     if len(in_axes) == 1:
         return jax.vmap(fn, in_axes=in_axes[0], out_axes=out_axes[0])
@@ -126,7 +129,7 @@ def _multi_vmap_pre_sorted(
 def multi_vmap_transposed_in_axes(
     fn: Callable[..., Array],
     in_axes: Sequence[Sequence[Union[int, None]]],
-    out_axes: Sequence[int],
+    out_axes: Sequence[int] = None,
 ) -> Callable[..., Array]:
     """Vectorizes a function over multiple axes with transposed input axis specifications.
 
@@ -151,6 +154,9 @@ def multi_vmap_transposed_in_axes(
         If in_axes = ((0,1), (None,1), (1,None)) and out_axes = (1,0), then:
         output[i2, i1] = fn(A[i1, i2, ...], B[:, i2, ...], C[:, i1, ...])
     """
+    if out_axes is None:
+        out_axes = tuple(range(len(in_axes[0])))
+
     in_axes = [tuple([axis[i] for axis in in_axes]) for i in range(len(in_axes[0]))]
     return multi_vmap(fn, in_axes, out_axes)
 
@@ -373,3 +379,135 @@ def einsum(*args):
         in_axes=in_axes,
         out_axes=out_axes
     )(*args)
+
+
+def _split_string_no_whitespace(s: str) -> List[str]:
+    return [x for x in s.split(' ') if x != ""]
+
+'''
+A wrapper around multi_vmap that allows for specifying the in and out axes
+via format strings in a manner similar to einsum.
+
+Conceptually, I think about mapping as asking the question:
+"what is the value of output[i1, i2, ..., in]?"
+
+So, this function tries to encode this:
+
+i1 i2 : : i3 <- map_fn(A1[i1, :, i2], A2[:, i3], A3[i1], A4[i3, i2, :])
+
+should translate to axis tuples:
+
+out_axes = (0, 1, 24)
+
+in_axes = (
+(0, None, 0, None),
+(1, None, None, 1),
+(0, 1, None, 0),
+)
+
+So, this would be a string like:
+
+i1 i2 : : i3 <- i1 : i2, : i3, i1, i3 i2 :
+(the last : is optional)
+
+We'll allow parsing in two directions:
+i1 : i2, : i3, i1, i3 i2 : -> i1 i2 : : i3
+
+is also valid.
+
+The output pattern is then a space-separated list of names.
+The input string is a comma-separated list of patterns, which of which
+is a space-separated list of names.
+'''
+def fancy_vmap(fn: Callable, fmt: str) -> Callable:
+    """Vectorizes a function using a format string similar to einsum notation.
+    
+    A wrapper around multi_vmap that allows for specifying the in and out axes
+    via format strings in a manner similar to einsum. This provides a more intuitive
+    way to specify complex vectorization patterns.
+    
+    The format string uses a pattern where you specify how output indices map to
+    input indices. Conceptually, this answers the question: "what is the value of 
+    output[i1, i2, ..., in]?" by specifying which input indices contribute to each
+    output index.
+    
+    Args:
+        fn: The function to vectorize. Should take multiple array arguments and return an array.
+        fmt: A format string specifying the mapping between input and output axes.
+            Can use either '->' or '<-' as the separator between input and output patterns.
+            
+            Format: "input_patterns -> output_pattern" or "output_pattern <- input_patterns"
+            
+            - input_patterns: Comma-separated list of space-separated axis names for each input
+            - output_pattern: Space-separated list of axis names for the output
+            - Use ':' to indicate axes that should not be mapped over (these will appear in the input to fn)
+            - Axis names must match between input and output to establish the mapping
+            
+    Returns:
+        Callable: A vectorized version of the input function that can handle batched inputs
+        according to the specified format string.
+        
+    Raises:
+        ValueError: If the format string is invalid, contains ellipsis, or has mismatched patterns.
+        
+    Examples:
+        # Example 1: Basic mapping
+        # output[i1, i2, i3] = fn(A[i1, i2], B[i2, i3])
+        vectorized_fn = fancy_vmap(fn, "i1 i2, i2 i3 -> i1 i2 i3")
+
+        # Example 2: More complex mapping
+        # output[:, i1, i2] = fn(A[i1, :, i2], B[:, i2], C[i1], D[i2, i1, :])
+        vectorized_fn = fancy_vmap(fn, "i1 : i2, : i2, i1, i2 i1 : -> :i1 i2")
+        
+        # Example 3: Reverse direction (equivalent to above)
+        vectorized_fn = fancy_vmap(fn, ": i1 i2 <- i1 : i2, : i2, i1, i2 i1 :")
+    """
+    # find the output specification
+
+    if '->' in fmt:
+        input_fmt, output_fmt = fmt.split('->')
+    elif '<-' in fmt:
+        output_fmt, input_fmt = fmt.split('<-')
+    else:
+        raise ValueError(f"invalid format string: {fmt}")
+
+    # parse the output
+
+    output_fmt = _split_string_no_whitespace(output_fmt)
+    
+
+    out_name_to_idx = {}
+    out_idx_to_name = {}
+    out_axes_list = []
+    for idx, x in enumerate(output_fmt):
+        if x == '...':
+            raise ValueError("ellipsis not allowed in output format")
+        if x != ':':
+            out_name_to_idx[x] = idx
+            out_idx_to_name[idx] = x
+            out_axes_list.append(idx)
+
+    
+    # parse the input
+    input_fmt = [x for x in input_fmt.split(',')]
+    input_fmt = [_split_string_no_whitespace(in_pattern) for in_pattern in input_fmt]   
+
+    for in_pattern in input_fmt:
+        if '...' in in_pattern:
+            raise ValueError("ellipsis not allowed in input format")
+
+
+    def make_in_axes(out_idx):
+        in_axes = []
+        out_name = out_idx_to_name[out_idx]
+        for in_pattern in input_fmt:
+            if out_name not in in_pattern:
+                in_axes.append(None)
+            else:
+                in_axes.append(in_pattern.index(out_name))
+        return in_axes
+
+    in_axes = [make_in_axes(out_idx) for out_idx in out_axes_list]
+
+    return multi_vmap(fn, in_axes=in_axes, out_axes=out_axes_list)
+
