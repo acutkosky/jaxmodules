@@ -384,73 +384,6 @@ def einsum(*args):
 def _split_string_no_whitespace(s: str) -> List[str]:
     return [x for x in s.split(' ') if x != ""]
 
-'''
-A wrapper around multi_vmap that allows for specifying the in and out axes
-via format strings in a manner similar to einsum.
-
-Conceptually, I think about mapping as asking the question:
-"what is the value of output[i1, i2, ..., in]?"
-
-So, this function tries to encode this:
-
-i1 i2 : : i3 <- map_fn(A1[i1, :, i2], A2[:, i3], A3[i1], A4[i3, i2, :])
-
-should translate to axis tuples:
-
-out_axes = (0, 1, 24)
-
-in_axes = (
-(0, None, 0, None),
-(1, None, None, 1),
-(0, 1, None, 0),
-)
-
-So, this would be a string like:
-
-i1 i2 : : i3 <- i1 : i2, : i3, i1, i3 i2 :
-(the last : is optional)
-
-We'll allow parsing in two directions:
-i1 : i2, : i3, i1, i3 i2 : -> i1 i2 : : i3
-
-is also valid.
-
-The output pattern is then a space-separated list of names.
-The input string is a comma-separated list of patterns, which of which
-is a space-separated list of names.
-
-NEW:
-we'll also allow for putting dummy function and variable names with parentheses or square brackets, like so:
-
-out[i1, i2, i3] <- fn(A[i1, i2], B[i2, i3], C[i3, :, i1])
-
-This will be parsed as:
-
-i1 i2 i3 <- i1 i2, i2 i3, i3 : i1
-
-note that in this format, there are commas between dimension as well as between patterns.
-
-the actual names of the functions and variables are ignored.
-'''
-
-def _parse_format(fmt: str) -> str:
-    '''
-    converts a format string with dummy function and variable names into
-    a simpler format string that can be parsed by the rest of the code.
-    '''
-    if '<-' in fmt:
-        assert '->' not in fmt, "cannot have both '<-' and '->' in format string"
-        output_fmt, input_fmt = fmt.split('<-')
-    elif '->' in fmt:
-        input_fmt, output_fmt = fmt.split('->')
-    else:
-        raise ValueError(f"invalid format string: {fmt}")
-    
-    # clean up the output_fmt:
-    # it should match ^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$
-    output_fmt = re.match(r'^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$', output_fmt)
-
-
 def _parse_dummy_format(output_fmt: str, input_fmt: str) -> Tuple[str, str]:
     # now output_fmt is the comma-separated list of axis names. Just replace the commas with spaces.
     output_fmt = output_fmt.replace(',', ' ')
@@ -487,12 +420,20 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
         fmt: A format string specifying the mapping between input and output axes.
             Can use either '->' or '<-' as the separator between input and output patterns.
             
-            Format: "input_patterns -> output_pattern" or "output_pattern <- input_patterns"
+            Two format styles are supported:
             
-            - input_patterns: Comma-separated list of space-separated axis names for each input
-            - output_pattern: Space-separated list of axis names for the output
-            - Use ':' to indicate axes that should not be mapped over (these will appear in the input to fn)
-            - Axis names must match between input and output to establish the mapping
+            1. "einsum-like" format: "input_patterns -> output_pattern" or "output_pattern <- input_patterns"
+               - input_patterns: Comma-separated list of space-separated axis names for each input
+               - output_pattern: Space-separated list of axis names for the output
+               - Use ':' to indicate axes that should not be mapped over (these will appear in the input to fn)
+               - Axis names must match between input and output to establish the mapping
+            
+            2. Dummy function format: "output[axes] = fn(input1[axes], input2[axes], ...)" 
+               or "fn(input1[axes], input2[axes], ...) -> output[axes]"
+               - Allows using dummy function and variable names for readability
+               - The actual names are ignored; only the axis specifications matter
+               - Supports commas within dimension lists (e.g., "i, j" or "i j" both work)
+               - Examples: "out[i, j] = fn(A[i, j], B[i], C[:])" or "fn(x[i], y[i]) -> result[i]"
             
     Returns:
         Callable: A vectorized version of the input function that can handle batched inputs
@@ -502,24 +443,37 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
         ValueError: If the format string is invalid, contains ellipsis, or has mismatched patterns.
         
     Examples:
-        # Example 1: Basic mapping
+        # Example 1: Basic mapping 
         # output[i1, i2, i3] = fn(A[i1, i2], B[i2, i3])
         vectorized_fn = fancy_vmap(fn, "i1 i2, i2 i3 -> i1 i2 i3")
 
-        # Example 2: More complex mapping
+        # Example 2: More complex mapping 
         # output[:, i1, i2] = fn(A[i1, :, i2], B[:, i2], C[i1], D[i2, i1, :])
         vectorized_fn = fancy_vmap(fn, "i1 : i2, : i2, i1, i2 i1 : -> :i1 i2")
         
         # Example 3: Reverse direction (equivalent to above)
         vectorized_fn = fancy_vmap(fn, ": i1 i2 <- i1 : i2, : i2, i1, i2 i1 :")
+        
+        # Example 4: Dummy function format with readable names
+        # output[i, j] = fn(A[i, j], B[i], C[:], D[j, i])
+        vectorized_fn = fancy_vmap(fn, "out[:, i, j] = fn(A[i, j], B[i], C[:], D[j, i])")
+        (note only axis names i j here are important, the out, fn, A, B, D, D can be alphanumeric strings)
+
+        # Example 5: Dummy function format with forward direction
+        vectorized_fn = fancy_vmap(fn, "fn(x[i], y[i]) -> result[i]")
+        
     """
     # find the output specification
 
     if '<-' in fmt:
         assert '->' not in fmt, "cannot have both '<-' and '->' in format string"
+        assert '=' not in fmt, "cannot have both '<-' and '=' in format string"
         output_fmt, input_fmt = fmt.split('<-')
     elif '->' in fmt:
+        assert '=' not in fmt, "cannot have both '->' and '=' in format string"
         input_fmt, output_fmt = fmt.split('->')
+    elif '=' in fmt:
+        output_fmt, input_fmt = fmt.split('=')
     else:
         raise ValueError(f"invalid format string: {fmt}")
     

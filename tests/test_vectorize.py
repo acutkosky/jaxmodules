@@ -379,7 +379,7 @@ def test_fancy_vmap_complex_pattern_pretty_input():
     w = jnp.array([[5, 6], [7, 8]])  # Shape: (2, 2)
     
     # Complex pattern: output[i, j] = fn(x[i, j], y[i], z[:], w[j, i])
-    vectorized_fn = fancy_vmap(fn, "out[i, j] <- fn(x[i, j], y[i], z[:], w[j, i])")
+    vectorized_fn = fancy_vmap(fn, "out[i, j] = fn(x[i, j], y[i], z[:], w[j, i])")
     result = vectorized_fn(x, y, z, w)
     
     # Expected: for each i, j:
