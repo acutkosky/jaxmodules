@@ -50,13 +50,13 @@ def default_kernel(q, k):
     return jnp.exp(jnp.dot(q, k) / jnp.sqrt(k.shape[-1]))
 
 def _attn_kq_block_fn(
-    normalizer,
-    running_values,
-    q_idx,
-    k_idx,
-    q_block,
-    k_block,
-    v_block,
+    normalizer, # [Lq, Hq]
+    running_values, # [Lq, Hq, dv]
+    q_idx, # [Lq]
+    k_idx, # [Lk]
+    q_block, # [Lq, Hq, dq]
+    k_block, # [Lk, Hkv, dk]
+    v_block, # [Lk, Hkv, dv]
     mask_fn,
     kernel_fn,
 ):
@@ -64,11 +64,13 @@ def _attn_kq_block_fn(
     Lk, Hkv, _ = k_block.shape
     _, _, dv = v_block.shape
     MQA_factor = Hq // Hkv
+
+    q_block = rearrange(q_block, "Lq (Hkv MQA) dq -> Lq Hkv MQA dq", Hkv=Hkv)
+
     mask = fancy_vmap(
         mask_fn,
         "mask[q, h, k] = mask_fn(Hq[h], q_idx[q], k_idx[k])"
     )(jnp.arange(Hq), q_idx, k_idx)
-
 
     scores = fancy_vmap(
         kernel_fn,
@@ -78,29 +80,34 @@ def _attn_kq_block_fn(
     mask = rearrange(mask, "Lq (Hkv MQA) Lk -> Lq Hkv MQA Lk", Hkv=Hkv)
     scores = scores * mask
     
-    local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [Lq, Hq, MQA_factor, 1]
+    local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [Lq, Hkv, MQA_factor, 1]
 
-    scores = scores / local_normalizer
+    scores = scores
+    normalizer = rearrange(normalizer, "Lq (Hkv MQA)-> Lq Hkv MQA 1", Hkv=Hkv)
+    running_values = rearrange(running_values, "Lq (Hkv MQA) dv -> Lq Hkv MQA dv", Hkv=Hkv)
 
 
-    values = einsum(scores, v_block, "Lq Hkv MQA Lk, Lk Hkv d -> Lq Hkv MQA d")
-    values = rearrange(values, "Lq Hkv MQA d -> Lq (Hkv MQA) d")
+    unnormalized_values = einsum(scores, v_block, "Lq Hkv MQA Lk, Lk Hkv d -> Lq Hkv MQA d")
 
-    normalizer = normalizer + local_normalizer
-    running_values = running_values + (values - running_values) * local_normalizer/normalizer
+    new_normalizer = normalizer + local_normalizer
+    running_values = jnp.where(new_normalizer > 0, running_values + (unnormalized_values - running_values * local_normalizer)/new_normalizer, jnp.zeros_like(running_values))
+    normalizer = rearrange(new_normalizer, "Lq Hkv MQA 1 -> Lq (Hkv MQA)")
+    running_values = rearrange(running_values, "Lq Hkv MQA dv -> Lq (Hkv MQA) dv")
 
     return normalizer, running_values
 
 def _make_attention_kq_scanner(
     mask_fn,
     kernel_fn,
+    q_idx,
+    q_block,
 ):
     def scan_fn(
         carry,
-        blocks
+        blocks,
     ):
         normalizer, running_values = carry
-        q_idx, k_idx, q_block, k_block, v_block = blocks
+        k_idx, k_block, v_block = blocks
         normalizer, running_values = _attn_kq_block_fn(
             normalizer,
             running_values,
@@ -115,7 +122,9 @@ def _make_attention_kq_scanner(
     return scan_fn
 
 
-def _attn_block_fn(idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_causal):
+
+
+def _attn_block_fn(q_idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_causal):
     # idx is an array of integers
     # mask = jax.vmap(mask_fn)(idx)  # [block_size, L]
     Lq, Hq, dq = q_block.shape
@@ -123,10 +132,28 @@ def _attn_block_fn(idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_caus
     _, _, dv = V.shape
 
     MQA_factor = Hq // Hkv
+
+    k_block = rearrange(K, "(blocks block_size) Hkv d -> blocks block_size Hkv d", block_size=Lq)
+    v_block = rearrange(V, "(blocks block_size) Hkv d -> blocks block_size Hkv d", block_size=Lq)
+
+    k_indices = rearrange(jnp.arange(Lk), "(blocks block_size) -> blocks block_size", block_size=Lq)
+
+    kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
+    (normalizer, running_values), _ = jax.lax.scan(
+        kq_scanner,
+        init=(jnp.zeros((Lq, Hq)), jnp.zeros((Lq, Hq, dv))),
+        xs=(k_indices, k_block, v_block),
+    )
+
+    # values = running_values / rearrange(normalizer, "Lq Hq -> Lq Hq 1")
+
+    return running_values
+
+
     mask = fancy_vmap(
         mask_fn,
         "mask[q, h, k] <- mask_fn(Hq[h], idx[q], Lk[k])"
-    )(jnp.arange(Hq), idx, jnp.arange(Lk))
+    )(jnp.arange(Hq), q_idx, jnp.arange(Lk))
     if kernel_fn == default_kernel:
         mask = rearrange(mask, "Lq Hq Lk -> Hq Lq Lk")
         if is_full_mask:
