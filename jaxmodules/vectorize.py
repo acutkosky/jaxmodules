@@ -457,7 +457,7 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
         # Example 4: Dummy function format with readable names
         # output[i, j] = fn(A[i, j], B[i], C[:], D[j, i])
         vectorized_fn = fancy_vmap(fn, "out[:, i, j] = fn(A[i, j], B[i], C[:], D[j, i])")
-        (note only axis names i j here are important, the out, fn, A, B, D, D can be alphanumeric strings)
+        (note only axis names i j here are important: out, fn, A, B, C, D can be any alphanumeric strings)
 
         # Example 5: Dummy function format with forward direction
         vectorized_fn = fancy_vmap(fn, "fn(x[i], y[i]) -> result[i]")
