@@ -389,7 +389,7 @@ def _parse_dummy_format(output_fmt: str, input_fmt: str) -> Tuple[str, str]:
     output_fmt = output_fmt.replace(',', ' ')
 
     # now let's grab all the axis specifications:
-    in_axes = re.match(r'[\w\d]*\[([\w\d\s,:]*)\]', input_fmt)
+    in_axes = re.match(r'[\w\d_]*\[([\w\d\s_,:]*)\]', input_fmt)
     if in_axes is None:
         raise ValueError(f"invalid input format string: {input_fmt}")
     in_axes = in_axes.group(1)
@@ -457,7 +457,7 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
         # Example 4: Dummy function format with readable names
         # output[i, j] = fn(A[i, j], B[i], C[:], D[j, i])
         vectorized_fn = fancy_vmap(fn, "out[:, i, j] = fn(A[i, j], B[i], C[:], D[j, i])")
-        (note only axis names i j here are important: out, fn, A, B, C, D can be any alphanumeric strings)
+        (note only axis names i j here are important: out, fn, A, B, C, D can be any gialphanumeric strings)
 
         # Example 5: Dummy function format with forward direction
         vectorized_fn = fancy_vmap(fn, "fn(x[i], y[i]) -> result[i]")
@@ -478,9 +478,9 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
         raise ValueError(f"invalid format string: {fmt}")
     
     # clean up the output_fmt:
-    # it should match ^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$
-    output_match = re.match(r'^\s*[\w\d]*\[([\w\d\s,:]*)\]\s*$', output_fmt)
-    input_match = re.match(r'^\s*[\w\d]*\(([\w\d\s,:\[\]]*)\)\s*$', input_fmt)
+    # it should match ^\s*[\w\d]*\[([\w\d\s_,:]*)\]\s*$
+    output_match = re.match(r'^\s*[\w\d_]*\[([\w\d\s_,:]*)\]\s*$', output_fmt)
+    input_match = re.match(r'^\s*[\w\d_]*\(([\w\d\s_,:\[\]]*)\)\s*$', input_fmt)
     if output_match is not None and input_match is not None:
         output_fmt, input_fmt = _parse_dummy_format(output_match.group(1), input_match.group(1))
 
