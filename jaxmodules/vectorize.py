@@ -47,7 +47,8 @@ def multi_vmap(
     Args:
         fn: The function to vectorize. Should return an array.
         in_axes: List of tuples specifying which axes to map over for each input argument.
-            Each tuple should have length equal to the number of inputs.
+            Each tuple should have length equal to the number of inputs, and the number
+            of tuples is the number of mapped axes.
             Use None to indicate that an axis should not be mapped over.
         out_axes: Tuple specifying the order of axes in the output array.
 
@@ -457,7 +458,7 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
         # Example 4: Dummy function format with readable names
         # output[i, j] = fn(A[i, j], B[i], C[:], D[j, i])
         vectorized_fn = fancy_vmap(fn, "out[:, i, j] = fn(A[i, j], B[i], C[:], D[j, i])")
-        (note only axis names i j here are important: out, fn, A, B, C, D can be any gialphanumeric strings)
+        (note only axis names i j here are important: out, fn, A, B, C, D can be any alphanumeric strings)
 
         # Example 5: Dummy function format with forward direction
         vectorized_fn = fancy_vmap(fn, "fn(x[i], y[i]) -> result[i]")

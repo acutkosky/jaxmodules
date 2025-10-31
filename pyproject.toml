@@ -10,7 +10,7 @@ authors = [
 ]
 description = "some potentially useful jax functions"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -18,11 +18,12 @@ classifiers = [
 ]
 dependencies = [
   "einops",
-  "equinox"
+  "equinox",
+  "jax[cuda12]"
 ]
 
-[project.optional-dependencies]
-test = [
+[dependency-groups]
+dev = [
   "pytest",
   "torch",
   "numpy"
