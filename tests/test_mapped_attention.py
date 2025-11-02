@@ -150,6 +150,128 @@ def materialize_mask(mask_fn, Hq, N, L):
     return mask
 
 
+def materialize_mask_batch(mask_fn, B, Hq, N, L):
+    """
+    Materialize a batch-aware mask function into a boolean array using fancy_vmap.
+    
+    Args:
+        mask_fn: Function that takes (b, h, q, k) and returns boolean
+        B: Batch size
+        Hq: Number of query heads
+        N: Number of queries
+        L: Number of keys
+    
+    Returns:
+        Boolean array of shape [B, Hq, N, L] where mask[b, h, q, k] = mask_fn(b, h, q, k)
+    """
+    # Use fancy_vmap to efficiently vectorize mask_fn over all combinations of b, h, q, k
+    vectorized_mask_fn = fancy_vmap(
+        mask_fn,
+        "mask[b, h, q, k] = mask_fn(B[b], Hq[h], q_inds[q], k_inds[k])"
+    )
+    # Pass index arrays: batch indices, head indices, query indices, key indices
+    b_inds = jnp.arange(B, dtype=jnp.int32)
+    h_inds = jnp.arange(Hq, dtype=jnp.int32)
+    q_inds = jnp.arange(N, dtype=jnp.int32)
+    k_inds = jnp.arange(L, dtype=jnp.int32)
+    mask = vectorized_mask_fn(b_inds, h_inds, q_inds, k_inds)
+    return mask
+
+
+def pytorch_scaled_dot_product_attention_batch(Q, K, V, mask=None, is_causal=False, return_torch=False):
+    """
+    PyTorch scaled dot product attention for comparison with batch dimension.
+    
+    Args:
+        Q: Query tensor [B, N, Hq, d] (JAX array or PyTorch tensor)
+        K: Key tensor [B, L, Hkv, d] (JAX array or PyTorch tensor)
+        V: Value tensor [B, L, Hkv, d] (JAX array or PyTorch tensor)
+        mask: Optional attention mask [B, Hq, N, L] (boolean mask where True means attend)
+        is_causal: Whether to apply causal mask
+        return_torch: If True, return PyTorch tensor (for gradient computation); otherwise return JAX array
+    """
+    B, N, Hq, d = Q.shape
+    Bk, L, Hkv, d_k = K.shape
+    
+    # Reshape to PyTorch format: [batch, heads, seq_len, dim]
+    # PyTorch's scaled_dot_product_attention expects [B, H, N, d]
+    Q_t = jax_to_torch(Q)  # [B, N, Hq, d]
+    K_t = jax_to_torch(K)  # [B, L, Hkv, d]
+    V_t = jax_to_torch(V)  # [B, L, Hkv, d]
+    
+    # Reshape to [B, H, N, d] for PyTorch
+    Q_t = Q_t.permute(0, 2, 1, 3)  # [B, Hq, N, d]
+    K_t = K_t.permute(0, 2, 1, 3)  # [B, Hkv, L, d]
+    V_t = V_t.permute(0, 2, 1, 3)  # [B, Hkv, L, d]
+    
+    # Handle GQA if Hq != Hkv
+    if Hq == Hkv:
+        # Use PyTorch's built-in attention
+        attn_mask = None
+        if mask is not None:
+            # mask is [B, Hq, N, L] -> keep as [B, Hq, N, L] for PyTorch
+            # Our mask: True means attend, False means mask out
+            # PyTorch attn_mask: -inf means mask out, 0.0 or False means attend
+            mask_t = jax_to_torch(mask)  # [B, Hq, N, L]
+            # Convert: True -> 0.0 (attend), False -> -inf (mask out)
+            attn_mask = torch.where(
+                mask_t.bool(),
+                torch.zeros_like(mask_t, dtype=torch.float32),
+                torch.full_like(mask_t, float('-inf'), dtype=torch.float32)
+            )
+        
+        output = F.scaled_dot_product_attention(
+            Q_t, K_t, V_t,
+            attn_mask=attn_mask,
+            is_causal=is_causal
+        )
+        # Reshape back: [B, Hq, N, d] -> [B, N, Hq, d]
+        output = output.permute(0, 2, 1, 3)  # [B, N, Hq, d]
+    else:
+        # For GQA (Hq > Hkv), handle each kv head separately
+        GROUP_SIZE = Hq // Hkv
+        output = torch.zeros(B, Hq, N, d)
+        
+        for h in range(Hkv):
+            # Query heads for this kv head
+            h_start = h * GROUP_SIZE
+            h_end = (h + 1) * GROUP_SIZE
+            h_idx = slice(h_start, h_end)
+            
+            Q_h = Q_t[:, h_idx, :, :]  # [B, GROUP_SIZE, N, d]
+            K_h = K_t[:, h:h+1, :, :]  # [B, 1, L, d]
+            V_h = V_t[:, h:h+1, :, :]  # [B, 1, L, d]
+            
+            # Expand K and V for broadcasting across query heads
+            K_h = K_h.expand(B, GROUP_SIZE, L, d)
+            V_h = V_h.expand(B, GROUP_SIZE, L, d)
+            
+            attn_mask_h = None
+            if mask is not None:
+                # Extract mask for these query heads: [B, Hq, N, L] -> [B, GROUP_SIZE, N, L]
+                mask_h = mask[:, h_start:h_end]
+                mask_t = jax_to_torch(mask_h)  # [B, GROUP_SIZE, N, L]
+                # Convert: True -> 0.0 (attend), False -> -inf (mask out)
+                attn_mask_h = torch.where(
+                    mask_t.bool(),
+                    torch.zeros_like(mask_t, dtype=torch.float32),
+                    torch.full_like(mask_t, float('-inf'), dtype=torch.float32)
+                )
+            
+            output_h = F.scaled_dot_product_attention(
+                Q_h, K_h, V_h,
+                attn_mask=attn_mask_h,
+                is_causal=is_causal
+            )
+            output[:, h_idx, :, :] = output_h
+        
+        output = output.permute(0, 2, 1, 3)  # [B, N, Hq, d]
+    
+    if return_torch:
+        return output
+    return torch_to_jax(output)
+
+
 def assert_outputs_close(jax_output, torch_output, rtol=1e-3, atol=1e-3, test_name=""):
     """
     Compare JAX and PyTorch outputs with relaxed tolerance and diagnostic information.
@@ -973,4 +1095,358 @@ def test_masked_attention_large_scale():
     # Compare with smaller block size
     output_small_block = masked_attention_via_map(Q, K, V, is_causal=True, block_size=16)
     assert jnp.allclose(output, output_small_block, rtol=1e-4, atol=1e-4)
+
+
+# Batch dimension tests
+
+def test_masked_attention_batch_basic():
+    """Test basic functionality of masked_attention_via_map with batch dimension"""
+    B, N, Hq, d = 4, 8, 4, 16
+    L, Hkv = 8, 4
+    
+    key = jax.random.PRNGKey(0)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    # Test without mask
+    output = masked_attention_via_map(Q, K, V)
+    
+    # Check shape
+    assert output.shape == (B, N, Hq, d)
+    
+    # Compare with PyTorch (no mask)
+    output_torch = pytorch_scaled_dot_product_attention_batch(Q, K, V)
+    
+    # Check that outputs are close
+    assert_outputs_close(output, output_torch, test_name="batch_basic")
+
+
+def test_masked_attention_batch_causal():
+    """Test masked_attention_via_map with batch dimension and causal mask"""
+    B, N, Hq, d = 4, 8, 4, 16
+    L, Hkv = 8, 4
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    # Test with causal mask
+    output = masked_attention_via_map(Q, K, V, is_causal=True)
+    
+    # Compare with PyTorch causal attention
+    output_torch = pytorch_scaled_dot_product_attention_batch(Q, K, V, is_causal=True)
+    
+    assert output.shape == (B, N, Hq, d)
+    
+    # Check that outputs are close
+    assert_outputs_close(output, output_torch, test_name="batch_causal")
+
+
+def test_masked_attention_batch_custom_mask():
+    """Test masked_attention_via_map with batch dimension and batch-specific masking"""
+    B, N, Hq, d = 4, 8, 4, 16
+    L, Hkv = 8, 4
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    # Create batch-specific mask: different window size per batch
+    def batch_sliding_window_mask(b, h, q, k):
+        window_size = b + 1  # Different window size per batch
+        return abs(q - k) <= window_size
+    
+    # Materialize mask for PyTorch
+    mask = materialize_mask_batch(batch_sliding_window_mask, B, Hq, N, L)
+    
+    output = masked_attention_via_map(Q, K, V, mask_fn=batch_sliding_window_mask)
+    output_torch = pytorch_scaled_dot_product_attention_batch(Q, K, V, mask=mask)
+    
+    assert output.shape == (B, N, Hq, d)
+    
+    # Check that outputs are close
+    assert_outputs_close(output, output_torch, test_name="batch_custom_mask")
+
+
+def test_masked_attention_batch_complex_mask():
+    """Test masked_attention_via_map with batch dimension and complex batch-head-specific masking"""
+    B, N, Hq, d = 4, 8, 4, 16
+    L, Hkv = 8, 4
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    # Complex mask: different patterns for different batches and heads
+    def complex_batch_mask(b, h, q, k):
+        # Window size depends on both batch and head
+        window_size = ((b % 2) * 2) + ((h % 2) + 1)
+        window_ok = abs(q - k) <= window_size
+        # For odd batches and even heads, add additional constraint
+        is_odd_batch = (b % 2) == 1
+        is_even_head = (h % 2) == 0
+        alternating_ok = ((q + k) % 2) == 0
+        return jnp.where(is_odd_batch & is_even_head, window_ok & alternating_ok, window_ok)
+    
+    mask = materialize_mask_batch(complex_batch_mask, B, Hq, N, L)
+    
+    output = masked_attention_via_map(Q, K, V, mask_fn=complex_batch_mask)
+    output_torch = pytorch_scaled_dot_product_attention_batch(Q, K, V, mask=mask)
+    
+    assert output.shape == (B, N, Hq, d)
+    assert_outputs_close(output, output_torch, test_name="batch_complex_mask")
+
+
+def test_masked_attention_batch_gqa():
+    """Test masked_attention_via_map with batch dimension and GQA"""
+    B, N, Hq, d = 4, 8, 8, 16
+    L, Hkv = 8, 4  # Hq = 2 * Hkv
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    output = masked_attention_via_map(Q, K, V, is_causal=True)
+    
+    assert output.shape == (B, N, Hq, d)
+    
+    # Compare with PyTorch
+    output_torch = pytorch_scaled_dot_product_attention_batch(Q, K, V, is_causal=True)
+    assert_outputs_close(output, output_torch, test_name="batch_gqa")
+
+
+def test_masked_attention_batch_gradients():
+    """Test gradients with batch dimension"""
+    B, N, Hq, d = 4, 8, 4, 16
+    L, Hkv = 8, 4
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, is_causal=True)
+        return jnp.sum(output)
+    
+    # Compute gradients
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q, grad_K, grad_V = grad_fn(Q, K, V)
+    
+    # Check shapes
+    assert grad_Q.shape == Q.shape
+    assert grad_K.shape == K.shape
+    assert grad_V.shape == V.shape
+    
+    # Check that gradients are not all zeros
+    assert not jnp.allclose(grad_Q, 0.0)
+    assert not jnp.allclose(grad_K, 0.0)
+    assert not jnp.allclose(grad_V, 0.0)
+
+
+def test_masked_attention_batch_gradients_with_mask():
+    """Test gradients with batch dimension and custom mask"""
+    B, N, Hq, d = 4, 8, 4, 16
+    L, Hkv = 8, 4
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    def batch_sliding_window_mask(b, h, q, k):
+        window_size = (b % 3) + 2  # Different window size per batch
+        return abs(q - k) <= window_size
+    
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, mask_fn=batch_sliding_window_mask)
+        return jnp.sum(output ** 2)
+    
+    # Compute gradients
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q, grad_K, grad_V = grad_fn(Q, K, V)
+    
+    # Check shapes
+    assert grad_Q.shape == Q.shape
+    assert grad_K.shape == K.shape
+    assert grad_V.shape == V.shape
+    
+    # Check that gradients are not all zeros
+    assert not jnp.allclose(grad_Q, 0.0)
+    assert not jnp.allclose(grad_K, 0.0)
+    assert not jnp.allclose(grad_V, 0.0)
+
+
+def test_masked_attention_batch_gradients_pytorch_comparison():
+    """Compare batch gradients with PyTorch implementation"""
+    B = 4
+    N = 16
+    L = 16
+    Hq = 4
+    Hkv = 4
+    d = 32
+
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    # JAX gradients
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, is_causal=True)
+        return jnp.sum(output)
+    
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q_jax, grad_K_jax, grad_V_jax = grad_fn(Q, K, V)
+    
+    # PyTorch gradients
+    Q_t = jax_to_torch(Q).requires_grad_(True)
+    K_t = jax_to_torch(K).requires_grad_(True)
+    V_t = jax_to_torch(V).requires_grad_(True)
+    
+    output_t = pytorch_scaled_dot_product_attention_batch(Q_t, K_t, V_t, is_causal=True, return_torch=True)
+    loss_t = output_t.sum()
+    loss_t.backward()
+    
+    grad_Q_torch = torch_to_jax(Q_t.grad)
+    grad_K_torch = torch_to_jax(K_t.grad)
+    grad_V_torch = torch_to_jax(V_t.grad)
+    
+    # Compare gradients
+    assert_outputs_close(grad_Q_jax, grad_Q_torch, test_name="batch_grad_Q")
+    assert_outputs_close(grad_K_jax, grad_K_torch, test_name="batch_grad_K")
+    assert_outputs_close(grad_V_jax, grad_V_torch, test_name="batch_grad_V")
+
+
+def test_masked_attention_batch_gradients_pytorch_comparison_with_mask():
+    """Compare batch gradients with custom mask against PyTorch"""
+    B = 4
+    N = 16
+    L = 16
+    Hq = 4
+    Hkv = 4
+    d = 32
+
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    # Batch-specific mask
+    def batch_head_mask(b, h, q, k):
+        window_size = (b * 2) + (h % 2) + 1  # Different window per batch and head
+        return abs(q - k) <= window_size
+    
+    mask = materialize_mask_batch(batch_head_mask, B, Hq, N, L)
+    
+    # JAX gradients
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, mask_fn=batch_head_mask)
+        return jnp.sum(output)
+    
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q_jax, grad_K_jax, grad_V_jax = grad_fn(Q, K, V)
+    
+    # PyTorch gradients
+    Q_t = jax_to_torch(Q).requires_grad_(True)
+    K_t = jax_to_torch(K).requires_grad_(True)
+    V_t = jax_to_torch(V).requires_grad_(True)
+    
+    output_t = pytorch_scaled_dot_product_attention_batch(Q_t, K_t, V_t, mask=mask, return_torch=True)
+    loss_t = output_t.sum()
+    loss_t.backward()
+    
+    grad_Q_torch = torch_to_jax(Q_t.grad)
+    grad_K_torch = torch_to_jax(K_t.grad)
+    grad_V_torch = torch_to_jax(V_t.grad)
+    
+    # Compare gradients
+    assert_outputs_close(grad_Q_jax, grad_Q_torch, test_name="batch_grad_Q_mask")
+    assert_outputs_close(grad_K_jax, grad_K_torch, test_name="batch_grad_K_mask")
+    assert_outputs_close(grad_V_jax, grad_V_torch, test_name="batch_grad_V_mask")
+
+
+def test_masked_attention_batch_gradients_gqa():
+    """Test batch gradients with GQA"""
+    B, N, Hq, d = 4, 8, 8, 16
+    L, Hkv = 8, 4  # Hq = 2 * Hkv
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, is_causal=True)
+        return jnp.sum(output)
+    
+    # Compute gradients
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q, grad_K, grad_V = grad_fn(Q, K, V)
+    
+    # Check shapes
+    assert grad_Q.shape == Q.shape
+    assert grad_K.shape == K.shape
+    assert grad_V.shape == V.shape
+    
+    # Check that gradients are not all zeros
+    assert not jnp.allclose(grad_Q, 0.0)
+    assert not jnp.allclose(grad_K, 0.0)
+    assert not jnp.allclose(grad_V, 0.0)
+
+
+def test_masked_attention_batch_gradients_large():
+    """Test batch gradients with larger inputs"""
+    B, N, Hq, d = 8, 32, 8, 32
+    L, Hkv = 64, 8
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (B, N, Hq, d))
+    K = jax.random.normal(key2, (B, L, Hkv, d))
+    V = jax.random.normal(key3, (B, L, Hkv, d))
+    
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, is_causal=True)
+        return jnp.sum(output ** 2)
+    
+    # Compute gradients
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q, grad_K, grad_V = grad_fn(Q, K, V)
+    
+    # Check shapes
+    assert grad_Q.shape == Q.shape
+    assert grad_K.shape == K.shape
+    assert grad_V.shape == V.shape
+    
+    # Check that gradients are meaningful
+    assert not jnp.allclose(grad_Q, 0.0)
+    assert not jnp.allclose(grad_K, 0.0)
+    assert not jnp.allclose(grad_V, 0.0)
 

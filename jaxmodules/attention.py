@@ -50,48 +50,48 @@ def default_kernel(q, k):
     return jnp.exp(jnp.dot(q, k) / jnp.sqrt(k.shape[-1]))
 
 def _attn_kq_block_fn(
-    normalizer, # [Lq, Hq]
-    running_values, # [Lq, Hq, dv]
+    normalizer, # [B, Lq, Hq]
+    running_values, # [B, Lq, Hq, dv]
     q_idx, # [Lq]
     k_idx, # [Lk]
-    q_block, # [Lq, Hq, dq]
-    k_block, # [Lk, Hkv, dk]
-    v_block, # [Lk, Hkv, dv]
+    q_block, # [B, Lq, Hq, dq]
+    k_block, # [B, Lk, Hkv, dk]
+    v_block, # [B, Lk, Hkv, dv]
     mask_fn,
     kernel_fn,
 ):
-    Lq, Hq, dq = q_block.shape
-    Lk, Hkv, _ = k_block.shape
-    _, _, dv = v_block.shape
+    B, Lq, Hq, dq = q_block.shape
+    _, Lk, Hkv, _ = k_block.shape
+    _, _, _, dv = v_block.shape
     MQA_factor = Hq // Hkv
 
-    q_block = rearrange(q_block, "Lq (Hkv MQA) dq -> Lq Hkv MQA dq", Hkv=Hkv)
+    q_block = rearrange(q_block, "B Lq (Hkv MQA) dq -> B Lq Hkv MQA dq", Hkv=Hkv)
 
     mask = fancy_vmap(
         mask_fn,
-        "mask[q, h, k] = mask_fn(Hq[h], q_idx[q], k_idx[k])"
-    )(jnp.arange(Hq), q_idx, k_idx)
+        "mask[b, q, h, k] = mask_fn(B[b], Hq[h], q_idx[q], k_idx[k])"
+    )(jnp.arange(B), jnp.arange(Hq), q_idx, k_idx)
 
     scores = fancy_vmap(
         kernel_fn,
-        'scores[q, h, m, k] = kernel_fn(q_block[q, h, m, :], K[k, h, :])',
+        'scores[b, q, h, m, k] = kernel_fn(q_block[b, q, h, m, :], K[b, k, h, :])',
     )(q_block, k_block)
     
-    mask = rearrange(mask, "Lq (Hkv MQA) Lk -> Lq Hkv MQA Lk", Hkv=Hkv)
+    mask = rearrange(mask, "B Lq (Hkv MQA) Lk -> B Lq Hkv MQA Lk", Hkv=Hkv)
     scores = scores * mask
     
-    local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [Lq, Hkv, MQA_factor, 1]
+    local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [B, Lq, Hkv, MQA_factor, 1]
 
-    normalizer = rearrange(normalizer, "Lq (Hkv MQA)-> Lq Hkv MQA 1", Hkv=Hkv)
-    running_values = rearrange(running_values, "Lq (Hkv MQA) dv -> Lq Hkv MQA dv", Hkv=Hkv)
+    normalizer = rearrange(normalizer, "B Lq (Hkv MQA)-> B Lq Hkv MQA 1", Hkv=Hkv)
+    running_values = rearrange(running_values, "B Lq (Hkv MQA) dv -> B Lq Hkv MQA dv", Hkv=Hkv)
 
 
-    unnormalized_values = einsum(scores, v_block, "Lq Hkv MQA Lk, Lk Hkv d -> Lq Hkv MQA d")
+    unnormalized_values = einsum(scores, v_block, "B Lq Hkv MQA Lk, B Lk Hkv d -> B Lq Hkv MQA d")
 
     new_normalizer = normalizer + local_normalizer
     running_values = jnp.where(new_normalizer > 0, running_values + (unnormalized_values - running_values * local_normalizer)/new_normalizer, jnp.zeros_like(running_values))
-    normalizer = rearrange(new_normalizer, "Lq Hkv MQA 1 -> Lq (Hkv MQA)")
-    running_values = rearrange(running_values, "Lq Hkv MQA dv -> Lq (Hkv MQA) dv")
+    normalizer = rearrange(new_normalizer, "B Lq Hkv MQA 1 -> B Lq (Hkv MQA)")
+    running_values = rearrange(running_values, "B Lq Hkv MQA dv -> B Lq (Hkv MQA) dv")
 
     return normalizer, running_values
 
@@ -126,21 +126,24 @@ def _make_attention_kq_scanner(
 def _attn_block_fn(q_idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_causal):
     # idx is an array of integers
     # mask = jax.vmap(mask_fn)(idx)  # [block_size, L]
-    Lq, Hq, dq = q_block.shape
-    Lk, Hkv, _ = K.shape
-    _, _, dv = V.shape
+    B, Lq, Hq, dq = q_block.shape
+    _, Lk, Hkv, _ = K.shape
+    _, _, _, dv = V.shape
 
     MQA_factor = Hq // Hkv
 
-    k_block = rearrange(K, "(blocks block_size) Hkv d -> blocks block_size Hkv d", block_size=Lq)
-    v_block = rearrange(V, "(blocks block_size) Hkv d -> blocks block_size Hkv d", block_size=Lq)
+    k_block = rearrange(K, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
+    v_block = rearrange(V, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
 
     k_indices = rearrange(jnp.arange(Lk), "(blocks block_size) -> blocks block_size", block_size=Lq)
+    
+    # # repeat k_indices B times
+    # k_indices = repeat(k_indices, "blocks block_size -> blocks B block_size", B=B)
 
     kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
     (normalizer, running_values), _ = jax.lax.scan(
         kq_scanner,
-        init=(jnp.zeros((Lq, Hq)), jnp.zeros((Lq, Hq, dv))),
+        init=(jnp.zeros((B, Lq, Hq)), jnp.zeros((B, Lq, Hq, dv))),
         xs=(k_indices, k_block, v_block),
     )
 
@@ -161,9 +164,9 @@ def _masked_attention_via_map(
     Same functionality and memory cost as attention_via_map by default, but also
     allows for user-specified masking as well as alternative kernels.
 
-    K: array of key values, shape [L, Hkv, d]
-    Q: array of queries, shape [N, Hq, d]
-    V: array of values, shape [L, Hkv, d]
+    K: array of key values, shape [B, L, Hkv, d]
+    Q: array of queries, shape [B, N, Hq, d]
+    V: array of values, shape [B, L, Hkv, d]
     is_causal: if true, apply a causal mask
     kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
         default is q, k -> jnp.exp( <q, k> / sqrt(d) )
@@ -175,9 +178,11 @@ def _masked_attention_via_map(
     block_size: If specified, group the Q values into [block_size, d] sized blocks and
         perform attention on these blocks. Allows to trade-off the memory savings of scan.
     """
-    L, Hk, d = K.shape
-    N, Hq, dq = Q.shape
-    Lv, Hv, dv = V.shape
+
+
+    B, L, Hk, d = K.shape
+    B, N, Hq, dq = Q.shape
+    B, Lv, Hv, dv = V.shape
 
 
     if block_size is None:
@@ -200,23 +205,23 @@ def _masked_attention_via_map(
     if is_causal and mask_fn is not None:
         raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
     if is_causal:
-        # mask_fn signature: (h, q, k) -> bool
-        mask_fn = lambda h, q, k: q >= k
+        # mask_fn signature: (b, h, q, k) -> bool
+        mask_fn = lambda b, h, q, k: q >= k
     if mask_fn is None:
         is_full_mask = True
-        # mask_fn signature: (h, q, k) -> bool
-        mask_fn = lambda h, q, k: True
+        # mask_fn signature: (b, h, q, k) -> bool
+        mask_fn = lambda b, h, q, k: True
 
     def attn_fn(idx_q):
         idx, q = idx_q
         return _attn_block_fn(idx, q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal)
 
-    Q = rearrange(Q, "(blocks block_size) Hq d -> blocks block_size Hq d", block_size=block_size)
+    Q = rearrange(Q, "B (blocks block_size) Hq d -> blocks B block_size Hq d", block_size=block_size)
     idx_blocks = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
 
     values = jax.lax.map(jax.checkpoint(attn_fn), (idx_blocks, Q)) # [N//block_size, block_size, Hq, d]
 
-    values = rearrange(values, "blocks block_size Hq dv -> (blocks block_size) Hq dv")
+    values = rearrange(values, "blocks B block_size Hq dv -> B (blocks block_size) Hq dv")
 
     return values
 
@@ -243,9 +248,9 @@ def _masked_attention_via_map_bwd(
     upstream_grad, 
 ):
     Q, K, V = res
-    L, Hk, d = K.shape
-    N, Hq, dq = Q.shape
-    Lv, Hv, dv = V.shape
+    Bk, L, Hk, d = K.shape
+    Bq, N, Hq, dq = Q.shape
+    Bv, Lv, Hv, dv = V.shape
 
 
     if block_size is None:
@@ -254,6 +259,7 @@ def _masked_attention_via_map_bwd(
     assert d == dq and Lv == L and dv == d, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
     )
+    assert Bk == Bq == Bv, "Q, K, and V must have the same batch dimension"
 
     assert Hq % Hk == 0, "Hq must be divisible by Hk"
     assert Hv == Hk, "Hv must be equal to Hk"
@@ -267,12 +273,12 @@ def _masked_attention_via_map_bwd(
     if is_causal and mask_fn is not None:
         raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
     if is_causal:
-        # mask_fn signature: (h, q, k) -> bool
-        mask_fn = lambda h, q, k: q >= k
+        # mask_fn signature: (b, h, q, k) -> bool
+        mask_fn = lambda b, h, q, k: q >= k
     if mask_fn is None:
         is_full_mask = True
-        # mask_fn signature: (h, q, k) -> bool
-        mask_fn = lambda h, q, k: True
+        # mask_fn signature: (b, h, q, k) -> bool
+        mask_fn = lambda b, h, q, k: True
 
     def attn_fn(dK_dV, idx_q_g):
         idx, q, g = idx_q_g
@@ -290,18 +296,18 @@ def _masked_attention_via_map_bwd(
 
 
     # break it up into blocks of size block_size
-    g_blocks = rearrange(upstream_grad, "(blocks block_size) Hq dv -> blocks block_size Hq dv", block_size=block_size)
+    g_blocks = rearrange(upstream_grad, "B (blocks block_size) Hq dv -> blocks B block_size Hq dv", block_size=block_size)
 
 
 
-    Q = rearrange(Q, "(blocks block_size) Hq dq -> blocks block_size Hq dq", block_size=block_size)
+    Q = rearrange(Q, "B (blocks block_size) Hq dq -> blocks B block_size Hq dq", block_size=block_size)
 
     idx_blocks = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
     
     (k_grad, v_grad), q_grad = jax.lax.scan(
         attn_fn, init=(jnp.zeros_like(K), jnp.zeros_like(V)), xs=(idx_blocks, Q, g_blocks)
     )
-    q_grad = rearrange(q_grad, "blocks block_size Hq dq -> (blocks block_size) Hq dq")
+    q_grad = rearrange(q_grad, "blocks B block_size Hq dq -> B (blocks block_size) Hq dq")
     return q_grad, k_grad, v_grad
 
 
@@ -317,8 +323,35 @@ def masked_attention_via_map(
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size=None,
 ) -> Array:
-    return _masked_attention_via_map(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size)
 
+    if K.ndim not in [3, 4]:
+        raise ValueError("K must have 3 or 4 dimensions")
+    if Q.ndim not in [3, 4]:
+        raise ValueError("Q must have 3 or 4 dimensions")
+    if V.ndim not in [3, 4]:
+        raise ValueError("V must have 3 or 4 dimensions")
+    assert K.ndim == Q.ndim and V.ndim == Q.ndim, "Q, K, and V must have the same number of dimensions"
+
+    added_batch_dim = False
+    if Q.ndim == 3:
+        added_batch_dim = True
+        K = K[None, :, :, :]
+        Q = Q[None, :, :, :]
+        V = V[None, :, :, :]
+
+    # if mask_fn is not None and only takes 3 arguments, make it take 4 but ignore the first argument
+    if mask_fn is not None and mask_fn.__code__.co_argcount == 3:
+        old_mask_fn = mask_fn
+        mask_fn = lambda b, h, q, k: old_mask_fn(h, q, k)
+
+    assert K.shape[0] == Q.shape[0] == V.shape[0], "Q, K, and V must have the same batch dimension"
+
+    result = _masked_attention_via_map(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size)
+
+    if added_batch_dim:
+        result = result[0]
+
+    return result
 
 
 def _flex_attention(
