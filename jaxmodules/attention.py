@@ -121,9 +121,19 @@ def _make_attention_kq_scanner(
     return scan_fn
 
 
-
-
-def _attn_block_fn(q_idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_causal):
+def _attn_block_fn(
+    block_idx,
+    q_idx,
+    q_block,
+    K,
+    V,
+    mask_fn,
+    kernel_fn,
+    is_full_mask,
+    is_causal,
+    left_window_blocks,
+    right_window_blocks
+):
     # idx is an array of integers
     # mask = jax.vmap(mask_fn)(idx)  # [block_size, L]
     B, Lq, Hq, dq = q_block.shape
@@ -132,10 +142,22 @@ def _attn_block_fn(q_idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_ca
 
     MQA_factor = Hq // Hkv
 
+
     k_block = rearrange(K, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
     v_block = rearrange(V, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
 
     k_indices = rearrange(jnp.arange(Lk), "(blocks block_size) -> blocks block_size", block_size=Lq)
+
+    num_blocks = k_indices.shape[0]
+    if left_window_blocks is not None:
+        idx_start = jnp.maximum(0, block_idx - left_window_blocks)
+        total_blocks = left_window_blocks + right_window_blocks
+
+        k_indices = jax.lax.dynamic_slice_in_dim(k_indices, idx_start, total_blocks, axis=0)
+        k_block = jax.lax.dynamic_slice_in_dim(k_block, idx_start, total_blocks, axis=0)
+        v_block = jax.lax.dynamic_slice_in_dim(v_block, idx_start, total_blocks, axis=0)
+
+
     
     # # repeat k_indices B times
     # k_indices = repeat(k_indices, "blocks block_size -> blocks B block_size", B=B)
@@ -150,7 +172,7 @@ def _attn_block_fn(q_idx, q_block, K, V, mask_fn, kernel_fn, is_full_mask, is_ca
     return running_values
 
 
-@partial(jax.custom_vjp, nondiff_argnames=['is_causal', 'kernel_fn', 'mask_fn', 'block_size'])
+@partial(jax.custom_vjp, nondiff_argnames=['is_causal', 'kernel_fn', 'mask_fn', 'block_size', 'window_size'])
 def _masked_attention_via_map(
     Q: Array,
     K: Array,
@@ -159,6 +181,7 @@ def _masked_attention_via_map(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[Tuple[int,int,int], Array], Array]] = None,
     block_size=None,
+    window_size=None,
 ) -> Array:
     """
     Same functionality and memory cost as attention_via_map by default, but also
@@ -177,6 +200,14 @@ def _masked_attention_via_map(
         be used.
     block_size: If specified, group the Q values into [block_size, d] sized blocks and
         perform attention on these blocks. Allows to trade-off the memory savings of scan.
+    window_size: If specified, apply a sliding window mask to the attention.
+        window_size is the number of tokens to the left and right of the current block
+        that are allowed to attend to the current block.
+        NOTE: window_size is a *lower bound* on the enforced attention window: the true window size
+        will be larger than the window size: it will be rounded to a whole number of blocks, and also
+        will be even larger for keys or values near the edges of the sequence. This parameter is indended
+        to control performance rather than for exact masking.
+        Use the  mask_fn to explicitly enforce a constant window size if desired.
     """
 
 
@@ -184,9 +215,16 @@ def _masked_attention_via_map(
     B, N, Hq, dq = Q.shape
     B, Lv, Hv, dv = V.shape
 
-
     if block_size is None:
         block_size = N
+
+
+    if window_size is not None:
+        left_window, right_window = window_size
+        left_window_blocks = (left_window + block_size - 1)// block_size
+        right_window_blocks = 1 + (right_window + block_size - 1)// block_size
+    else:
+        left_window_blocks = right_window_blocks = None
 
     assert d == dq and Lv == L and dv == d, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
@@ -212,14 +250,15 @@ def _masked_attention_via_map(
         # mask_fn signature: (b, h, q, k) -> bool
         mask_fn = lambda b, h, q, k: True
 
-    def attn_fn(idx_q):
-        idx, q = idx_q
-        return _attn_block_fn(idx, q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal)
+    def attn_fn(block_idx_q_idx_Q):
+        block_idx, q_idx, Q = block_idx_q_idx_Q
+        return _attn_block_fn(block_idx, q_idx, Q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal, left_window_blocks, right_window_blocks)
 
     Q = rearrange(Q, "B (blocks block_size) Hq d -> blocks B block_size Hq d", block_size=block_size)
-    idx_blocks = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
+    q_idx = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
+    block_idx = jnp.arange(N//block_size)
 
-    values = jax.lax.map(jax.checkpoint(attn_fn), (idx_blocks, Q)) # [N//block_size, block_size, Hq, d]
+    values = jax.lax.map(jax.checkpoint(attn_fn), (block_idx, q_idx, Q)) # [N//block_size, block_size, Hq, d]
 
     values = rearrange(values, "blocks B block_size Hq dv -> B (blocks block_size) Hq dv")
 
@@ -234,16 +273,18 @@ def _masked_attention_via_map_fwd(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size=None,
+    window_size=None,
 ) -> Array:
 
-    values = _masked_attention_via_map(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size)
+    values = _masked_attention_via_map(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size, window_size=window_size)
     return values, (Q, K, V)
 
 def _masked_attention_via_map_bwd(
     is_causal: bool,
     kernel_fn: Callable[[Array, Array], float],
     mask_fn: Optional[Union[Callable[int, Array], Array]] ,
-    block_size,  
+    block_size,
+    window_size,
     res,
     upstream_grad, 
 ):
@@ -255,6 +296,13 @@ def _masked_attention_via_map_bwd(
 
     if block_size is None:
         block_size = N
+
+    if window_size is not None:
+        left_window, right_window = window_size
+        left_window_blocks = (left_window + block_size - 1) // block_size
+        right_window_blocks = 1 + (right_window + block_size - 1) // block_size
+    else:
+        left_window_blocks = right_window_blocks = None
 
     assert d == dq and Lv == L and dv == d, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
@@ -280,12 +328,12 @@ def _masked_attention_via_map_bwd(
         # mask_fn signature: (b, h, q, k) -> bool
         mask_fn = lambda b, h, q, k: True
 
-    def attn_fn(dK_dV, idx_q_g):
-        idx, q, g = idx_q_g
+    def attn_fn(dK_dV, block_idx_q_idx_q_g):
+        block_idx, q_idx, q, g = block_idx_q_idx_q_g
         dK_carry, dV_carry = dK_dV
 
         def get_values(q, K, V):
-            return _attn_block_fn(idx, q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal)
+            return _attn_block_fn(block_idx, q_idx, q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal, left_window_blocks, right_window_blocks)
         _, vjp_fn = jax.vjp(get_values, q, K, V)
         dq, qK, qV = vjp_fn(g)
 
@@ -302,10 +350,11 @@ def _masked_attention_via_map_bwd(
 
     Q = rearrange(Q, "B (blocks block_size) Hq dq -> blocks B block_size Hq dq", block_size=block_size)
 
-    idx_blocks = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
+    q_idx = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
+    block_idx = jnp.arange(N//block_size)
     
     (k_grad, v_grad), q_grad = jax.lax.scan(
-        attn_fn, init=(jnp.zeros_like(K), jnp.zeros_like(V)), xs=(idx_blocks, Q, g_blocks)
+        attn_fn, init=(jnp.zeros_like(K), jnp.zeros_like(V)), xs=(block_idx, q_idx, Q, g_blocks)
     )
     q_grad = rearrange(q_grad, "blocks B block_size Hq dq -> B (blocks block_size) Hq dq")
     return q_grad, k_grad, v_grad
@@ -322,6 +371,7 @@ def masked_attention_via_map(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size=None,
+    window_size=None,
 ) -> Array:
 
     if K.ndim not in [3, 4]:
@@ -346,7 +396,16 @@ def masked_attention_via_map(
 
     assert K.shape[0] == Q.shape[0] == V.shape[0], "Q, K, and V must have the same batch dimension"
 
-    result = _masked_attention_via_map(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size)
+    result = _masked_attention_via_map(
+        Q,
+        K,
+        V,
+        is_causal=is_causal,
+        kernel_fn=kernel_fn,
+        mask_fn=mask_fn,
+        block_size=block_size,
+        window_size=window_size,
+    )
 
     if added_batch_dim:
         result = result[0]
