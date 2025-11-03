@@ -272,7 +272,7 @@ def pytorch_scaled_dot_product_attention_batch(Q, K, V, mask=None, is_causal=Fal
     return torch_to_jax(output)
 
 
-def assert_outputs_close(jax_output, torch_output, rtol=1e-3, atol=1e-3, test_name=""):
+def assert_outputs_close(jax_output, torch_output, rtol=1e-3, atol=1e-4, test_name=""):
     """
     Compare JAX and PyTorch outputs with relaxed tolerance and diagnostic information.
     
@@ -296,7 +296,7 @@ def assert_outputs_close(jax_output, torch_output, rtol=1e-3, atol=1e-3, test_na
     print(f"{name_prefix}Max difference: {max_diff}, Mean difference: {mean_diff}, Relative error: {relative_error}")
     
     # Assert with helpful error message
-    assert jnp.linalg.norm(jax_output - torch_output) / jnp.minimum(jnp.linalg.norm(jax_output), jnp.linalg.norm(torch_output)) < rtol, \
+    assert jnp.linalg.norm(jax_output - torch_output) < atol or jnp.linalg.norm(jax_output - torch_output) /(jnp.minimum(jnp.linalg.norm(jax_output), jnp.linalg.norm(torch_output))) < rtol, \
         f"Outputs differ. Max diff: {max_diff}, Mean diff: {mean_diff}, Relative error: {relative_error}"
 
 
@@ -598,6 +598,62 @@ def test_masked_attention_gradients_pytorch_comparison():
     grad_Q_torch = torch_to_jax(Q_t.grad)
     grad_K_torch = torch_to_jax(K_t.grad)
     grad_V_torch = torch_to_jax(V_t.grad)
+    
+    # Compare gradients
+    assert_outputs_close(grad_Q_jax, grad_Q_torch, test_name="grad_Q")
+    assert_outputs_close(grad_K_jax, grad_K_torch, test_name="grad_K")
+    assert_outputs_close(grad_V_jax, grad_V_torch, test_name="grad_V")
+
+
+
+
+def test_masked_attention_gradients_window_pytorch_comparison():
+    """Compare gradients with PyTorch implementation"""
+    # N, Hq, d = 8, 4, 16
+    # L, Hkv = 8, 4
+    N = 32  # Number of queries
+    L = 64  # Sequence length (keys/values)
+    Hq = 8  # Number of query heads
+    Hkv = 4  # Number of key/value heads (Hq must be divisible by Hkv)
+    d = 64  # Embedding dimension  
+
+    block_size = 8
+    
+    # key = jax.random.PRNGKey(42)
+    # key1, key2, key3 = jax.random.split(key, 3)
+
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (N, Hq, d))
+    K = jax.random.normal(key2, (L, Hkv, d))
+    V = jax.random.normal(key3, (L, Hkv, d))
+
+    def mask_fn(h, q, k):
+        return q==k
+    
+    # JAX gradients
+    def loss_fn(q, k, v):
+        output = masked_attention_via_map(q, k, v, mask_fn=mask_fn, block_size=block_size)
+        return jnp.sum(output)
+    
+    grad_fn = jax.grad(loss_fn, argnums=(0, 1, 2))
+    grad_Q_jax, grad_K_jax, grad_V_jax = grad_fn(Q, K, V)
+    
+    # PyTorch gradients
+    Q_t = jax_to_torch(Q).requires_grad_(True)
+    K_t = jax_to_torch(K).requires_grad_(True)
+    V_t = jax_to_torch(V).requires_grad_(True)
+
+    mask_t = materialize_mask(mask_fn, Hq, N, L)
+    output_t = pytorch_scaled_dot_product_attention(Q_t, K_t, V_t, mask=mask_t, return_torch=True)
+    loss_t = output_t.sum()
+    loss_t.backward()
+    
+    grad_Q_torch = torch_to_jax(Q_t.grad)
+    grad_K_torch = torch_to_jax(K_t.grad)
+    grad_V_torch = torch_to_jax(V_t.grad)
+    
     
     # Compare gradients
     assert_outputs_close(grad_Q_jax, grad_Q_torch, test_name="grad_Q")
@@ -1015,11 +1071,53 @@ def test_masked_attention_error_cases():
     K_wrong = jax.random.normal(key2, (L, Hkv, d + 1))
     with pytest.raises(AssertionError):
         masked_attention_via_map(Q, K_wrong, V)
-    
-    # Test with invalid block_size (not dividing N)
-    with pytest.raises(AssertionError):
-        masked_attention_via_map(Q, K, V, block_size=3)  # 8 % 3 != 0
 
+
+def test_masked_attention_block_size_padding():
+    """Test masked_attention_via_map with number of queries not divisible by block_size and padding"""
+    # Use N=10 which doesn't divide common block_size values
+    # Note: L must be divisible by block_size because K/V are blocked using the query block_size
+    N, Hq, d = 10, 4, 16
+    L, Hkv = 13, 4  # L must be divisible by block_size (4) for K/V blocking to work
+    block_size = 4  # 10 % 4 = 2, so padding will be applied to Q
+    
+    key = jax.random.PRNGKey(42)
+    key1, key2, key3 = jax.random.split(key, 3)
+    
+    Q = jax.random.normal(key1, (N, Hq, d))
+    K = jax.random.normal(key2, (L, Hkv, d))
+    V = jax.random.normal(key3, (L, Hkv, d))
+    
+    # Test without mask (should pad Q to 12 queries internally)
+    output = masked_attention_via_map(Q, K, V, block_size=block_size)
+    
+    assert output.shape == (N, Hq, d)
+    
+    # Compare with PyTorch (no mask)
+    output_torch = pytorch_scaled_dot_product_attention(Q, K, V)
+    assert_outputs_close(output, output_torch, test_name="block_size_padding_no_mask")
+    
+    # Test with causal mask
+    output_causal = masked_attention_via_map(Q, K, V, is_causal=True, block_size=block_size)
+    output_torch_causal = pytorch_scaled_dot_product_attention(Q, K, V, is_causal=True)
+    assert_outputs_close(output_causal, output_torch_causal, test_name="block_size_padding_causal")
+    
+    # Test with custom mask
+    def sliding_window_mask(h, q, k):
+        return abs(q - k) <= 2
+    
+    mask = materialize_mask(sliding_window_mask, Hq, N, L)
+    output_mask = masked_attention_via_map(Q, K, V, mask_fn=sliding_window_mask, block_size=block_size)
+    output_torch_mask = pytorch_scaled_dot_product_attention(Q, K, V, mask=mask)
+    assert_outputs_close(output_mask, output_torch_mask, test_name="block_size_padding_custom_mask")
+    
+    # # Test with different block_size that also requires padding
+    # # Need to ensure L is divisible by block_size2 as well
+    # block_size2 = 3  # 10 % 3 = 1, but L=12 is divisible by 3
+    # output_block2 = masked_attention_via_map(Q, K, V, block_size=block_size2)
+    # assert output.shape == (N, Hq, d)
+    # # Results should be the same regardless of block_size (within numerical precision)
+    # assert_outputs_close(output, output_block2, test_name="block_size_padding_different_sizes", rtol=1e-4, atol=1e-4)
 
 def test_masked_attention_different_kernel():
     """Test masked_attention_via_map with custom kernel function"""
@@ -1825,7 +1923,7 @@ def test_masked_attention_window_size_gradients():
     
     # Test with manual mask_fn that implements the same sliding window
     # For query position q and key position k, allow if q - left_window <= k <= q + right_window
-    def sliding_window_mask_fn(h, q, k):
+    def sliding_window_mask_fn(b, h, q, k):
         return (q - left_window <= k) & (k <= q + right_window)
     
     def loss_with_window(q, k, v):

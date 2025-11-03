@@ -89,7 +89,16 @@ def _attn_kq_block_fn(
     unnormalized_values = einsum(scores, v_block, "B Lq Hkv MQA Lk, B Lk Hkv d -> B Lq Hkv MQA d")
 
     new_normalizer = normalizer + local_normalizer
-    running_values = jnp.where(new_normalizer > 0, running_values + (unnormalized_values - running_values * local_normalizer)/new_normalizer, jnp.zeros_like(running_values))
+    
+    # we want to divide by new_normalizer if it is nonzero, but it's not safe to do this via a single jnp.where
+    # because the backward pass will still pass through both branches and cause issues.
+    # Instead, we first make a (differentiable!) "safe" normalizer so that is used in the division.
+    # This way, there is no divide by zero in the backward pass, and the forward pass in unchanged because
+    # the safe normalize equals the original normalizer when it is nonzero.
+    # see https://github.com/jax-ml/jax/issues/1052 for more details.
+    safe_normalizer = jnp.where(new_normalizer > 0, new_normalizer, jnp.ones_like(new_normalizer))
+    running_values = jnp.where(new_normalizer > 0, running_values + (unnormalized_values - running_values * local_normalizer)/safe_normalizer, jnp.zeros_like(running_values))
+
     normalizer = rearrange(new_normalizer, "B Lq Hkv MQA 1 -> B Lq (Hkv MQA)")
     running_values = rearrange(running_values, "B Lq Hkv MQA dv -> B Lq (Hkv MQA) dv")
 
@@ -129,8 +138,8 @@ def _attn_block_fn(
     V,
     mask_fn,
     kernel_fn,
-    is_full_mask,
-    is_causal,
+    # is_full_mask,
+    # is_causal,
     left_window_blocks,
     right_window_blocks
 ):
@@ -172,44 +181,16 @@ def _attn_block_fn(
     return running_values
 
 
-@partial(jax.custom_vjp, nondiff_argnames=['is_causal', 'kernel_fn', 'mask_fn', 'block_size', 'window_size'])
+@partial(jax.custom_vjp, nondiff_argnames=['kernel_fn', 'mask_fn', 'block_size', 'window_size'])
 def _masked_attention_via_map(
     Q: Array,
     K: Array,
     V: Array,
-    is_causal: bool = False,
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[Tuple[int,int,int], Array], Array]] = None,
     block_size=None,
     window_size=None,
 ) -> Array:
-    """
-    Same functionality and memory cost as attention_via_map by default, but also
-    allows for user-specified masking as well as alternative kernels.
-
-    K: array of key values, shape [B, L, Hkv, d]
-    Q: array of queries, shape [B, N, Hq, d]
-    V: array of values, shape [B, L, Hkv, d]
-    is_causal: if true, apply a causal mask
-    kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
-        default is q, k -> jnp.exp( <q, k> / sqrt(d) )
-    mask_fn: takes integers h, q, k and returns a boolean specifying
-        the attention mask for the hth head and the qth query and kth key.
-        If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
-        If is_causal is False and mask_fn is None, then the default value of no masking will
-        be used.
-    block_size: If specified, group the Q values into [block_size, d] sized blocks and
-        perform attention on these blocks. Allows to trade-off the memory savings of scan.
-    window_size: If specified, apply a sliding window mask to the attention.
-        window_size is the number of tokens to the left and right of the current block
-        that are allowed to attend to the current block.
-        NOTE: window_size is a *lower bound* on the enforced attention window: the true window size
-        will be larger than the window size: it will be rounded to a whole number of blocks, and also
-        will be even larger for keys or values near the edges of the sequence. This parameter is indended
-        to control performance rather than for exact masking.
-        Use the  mask_fn to explicitly enforce a constant window size if desired.
-    """
-
 
     B, L, Hk, d = K.shape
     B, N, Hq, dq = Q.shape
@@ -239,20 +220,19 @@ def _masked_attention_via_map(
         f"block_size must divide number of queries!"
     )
 
-    is_full_mask = False
-    if is_causal and mask_fn is not None:
-        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
-    if is_causal:
-        # mask_fn signature: (b, h, q, k) -> bool
-        mask_fn = lambda b, h, q, k: q >= k
-    if mask_fn is None:
-        is_full_mask = True
-        # mask_fn signature: (b, h, q, k) -> bool
-        mask_fn = lambda b, h, q, k: True
-
     def attn_fn(block_idx_q_idx_Q):
         block_idx, q_idx, Q = block_idx_q_idx_Q
-        return _attn_block_fn(block_idx, q_idx, Q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal, left_window_blocks, right_window_blocks)
+        return _attn_block_fn(
+            block_idx,
+            q_idx,
+            Q,
+            K,
+            V,
+            mask_fn,
+            kernel_fn,
+            left_window_blocks,
+            right_window_blocks
+        )
 
     Q = rearrange(Q, "B (blocks block_size) Hq d -> blocks B block_size Hq d", block_size=block_size)
     q_idx = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
@@ -269,18 +249,25 @@ def _masked_attention_via_map_fwd(
     Q: Array,
     K: Array,
     V: Array,
-    is_causal: bool = False,
+    # is_causal: bool = False,
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size=None,
     window_size=None,
 ) -> Array:
 
-    values = _masked_attention_via_map(Q, K, V, is_causal=is_causal, kernel_fn=kernel_fn, mask_fn=mask_fn, block_size=block_size, window_size=window_size)
+    values = _masked_attention_via_map(
+        Q,
+        K,
+        V,
+        kernel_fn=kernel_fn,
+        mask_fn=mask_fn,
+        block_size=block_size,
+        window_size=window_size,
+    )
     return values, (Q, K, V)
 
 def _masked_attention_via_map_bwd(
-    is_causal: bool,
     kernel_fn: Callable[[Array, Array], float],
     mask_fn: Optional[Union[Callable[int, Array], Array]] ,
     block_size,
@@ -317,29 +304,28 @@ def _masked_attention_via_map_bwd(
     )
 
 
-    is_full_mask = False
-    if is_causal and mask_fn is not None:
-        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
-    if is_causal:
-        # mask_fn signature: (b, h, q, k) -> bool
-        mask_fn = lambda b, h, q, k: q >= k
-    if mask_fn is None:
-        is_full_mask = True
-        # mask_fn signature: (b, h, q, k) -> bool
-        mask_fn = lambda b, h, q, k: True
-
     def attn_fn(dK_dV, block_idx_q_idx_q_g):
         block_idx, q_idx, q, g = block_idx_q_idx_q_g
         dK_carry, dV_carry = dK_dV
 
         def get_values(q, K, V):
-            return _attn_block_fn(block_idx, q_idx, q, K, V, mask_fn, kernel_fn, is_full_mask, is_causal, left_window_blocks, right_window_blocks)
+            return _attn_block_fn(
+                block_idx,
+                q_idx,
+                q,
+                K,
+                V,
+                mask_fn,
+                kernel_fn,
+                left_window_blocks,
+                right_window_blocks
+            )
+        
         _, vjp_fn = jax.vjp(get_values, q, K, V)
-        dq, qK, qV = vjp_fn(g)
+        dq, dK, dV = vjp_fn(g)
 
-        dq, qK, qV = vjp_fn(g)
-        dK_carry = dK_carry + qK
-        dV_carry = dV_carry + qV
+        dK_carry = dK_carry + dK
+        dV_carry = dV_carry + dV
         return (dK_carry, dV_carry), dq
 
 
@@ -373,6 +359,32 @@ def masked_attention_via_map(
     block_size=None,
     window_size=None,
 ) -> Array:
+    """
+    attention implementation that uses jax.lax.map to perform attention in a memory-efficient way
+    analogous to flash attention, but written in pure jax, and with less tricks.
+
+    K: array of key values, shape [B, L, Hkv, d]
+    Q: array of queries, shape [B, N, Hq, d]
+    V: array of values, shape [B, L, Hkv, d]
+    is_causal: if true, apply a causal mask
+    kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
+        default is q, k -> jnp.exp( <q, k> / sqrt(d) )
+    mask_fn: takes integers h, q, k and returns a boolean specifying
+        the attention mask for the hth head and the qth query and kth key.
+        If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
+        If is_causal is False and mask_fn is None, then the default value of no masking will
+        be used.
+    block_size: If specified, group the Q values into [block_size, d] sized blocks and
+        perform attention on these blocks. Allows to trade-off the memory savings of scan.
+    window_size: If specified, apply a sliding window mask to the attention.
+        window_size is the number of tokens to the left and right of the current block
+        that are allowed to attend to the current block.
+        NOTE: window_size is a *lower bound* on the enforced attention window: the true window size
+        will be larger than the window size: it will be rounded to a whole number of blocks, and also
+        will be even larger for keys or values near the edges of the sequence. This parameter is indended
+        to control performance rather than for exact masking.
+        Use the  mask_fn to explicitly enforce a constant window size if desired.
+    """
 
     if K.ndim not in [3, 4]:
         raise ValueError("K must have 3 or 4 dimensions")
@@ -382,6 +394,7 @@ def masked_attention_via_map(
         raise ValueError("V must have 3 or 4 dimensions")
     assert K.ndim == Q.ndim and V.ndim == Q.ndim, "Q, K, and V must have the same number of dimensions"
 
+
     added_batch_dim = False
     if Q.ndim == 3:
         added_batch_dim = True
@@ -389,23 +402,56 @@ def masked_attention_via_map(
         Q = Q[None, :, :, :]
         V = V[None, :, :, :]
 
+    # canonicalize mask_fn to take 4 arguments and have the appropriate form with respect to 
+    # padding and causality.
+
     # if mask_fn is not None and only takes 3 arguments, make it take 4 but ignore the first argument
     if mask_fn is not None and mask_fn.__code__.co_argcount == 3:
-        old_mask_fn = mask_fn
-        mask_fn = lambda b, h, q, k: old_mask_fn(h, q, k)
+        three_arg_mask_fn = mask_fn
+        mask_fn = lambda b, h, q, k: three_arg_mask_fn(h, q, k)
+
+
+    if is_causal and mask_fn is not None:
+        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
+    if is_causal:
+        # mask_fn signature: (b, h, q, k) -> bool
+        mask_fn = lambda b, h, q, k: q >= k
+        is_causal = False
+
+    if mask_fn is None:
+        # mask_fn signature: (b, h, q, k) -> bool
+        mask_fn = lambda b, h, q, k: True
 
     assert K.shape[0] == Q.shape[0] == V.shape[0], "Q, K, and V must have the same batch dimension"
+
+    B, N, Hq, dq = Q.shape
+    L = K.shape[1]
+    padded_QKV = False
+    if block_size is not None and N % block_size != 0:
+        padded_QKV = True
+        # pad queries, and change mask_fn
+        padding_size_Q = block_size - (N % block_size)
+        Q = jnp.pad(Q, ((0, 0), (0, padding_size_Q), (0, 0), (0, 0)), mode='constant')
+
+        padding_size_KV = block_size - (L % block_size)
+        K = jnp.pad(K, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode='constant')
+        V = jnp.pad(V, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode='constant')
+
+        unpadded_mask_fn = mask_fn
+        mask_fn = lambda b, h, q, k: unpadded_mask_fn(b, h, q, k) & (q < N) & (k < L)
 
     result = _masked_attention_via_map(
         Q,
         K,
         V,
-        is_causal=is_causal,
         kernel_fn=kernel_fn,
         mask_fn=mask_fn,
         block_size=block_size,
         window_size=window_size,
     )
+
+    if padded_QKV:
+        result = result[:, :-padding_size_Q, :, :]
 
     if added_batch_dim:
         result = result[0]
