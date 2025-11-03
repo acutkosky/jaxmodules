@@ -356,27 +356,27 @@ def masked_attention_via_map(
     is_causal: bool = False,
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
-    block_size=None,
-    window_size=None,
+    block_size: Optional[int] = None,
+    window_size: Optional[Tuple[int, int]] = None,
 ) -> Array:
     """
     attention implementation that uses jax.lax.map to perform attention in a memory-efficient way
     analogous to flash attention, but written in pure jax, and with less tricks.
 
-    K: array of key values, shape [B, L, Hkv, d]
-    Q: array of queries, shape [B, N, Hq, d]
-    V: array of values, shape [B, L, Hkv, d]
+    K: array of key values, shape [B, L, Hkv, d] or [L, Hkv, d]
+    Q: array of queries, shape [B, N, Hq, d] or [N, Hq, d]
+    V: array of values, shape [B, L, Hkv, d] or [L, Hkv, d]
     is_causal: if true, apply a causal mask
     kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
         default is q, k -> jnp.exp( <q, k> / sqrt(d) )
-    mask_fn: takes integers h, q, k and returns a boolean specifying
-        the attention mask for the hth head and the qth query and kth key.
+    mask_fn: takes integers b, h, q, k or h, q, kand returns a boolean specifying
+        the attention mask for the bth item in batch, hth head and the qth query and kth key.
         If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
         If is_causal is False and mask_fn is None, then the default value of no masking will
-        be used.
-    block_size: If specified, group the Q values into [block_size, d] sized blocks and
+        be used (equivalent to mask_fn = lambda b, h, q, k: True).
+    block_size: If specified, group the Q, K, V values into [block_size, d] sized blocks and
         perform attention on these blocks. Allows to trade-off the memory savings of scan.
-    window_size: If specified, apply a sliding window mask to the attention.
+    window_size: Tuple (left, right) or None.If specified, apply a sliding window mask to the attention.
         window_size is the number of tokens to the left and right of the current block
         that are allowed to attend to the current block.
         NOTE: window_size is a *lower bound* on the enforced attention window: the true window size
