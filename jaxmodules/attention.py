@@ -167,10 +167,6 @@ def _attn_block_fn(
         v_block = jax.lax.dynamic_slice_in_dim(v_block, idx_start, total_blocks, axis=0)
 
 
-    
-    # # repeat k_indices B times
-    # k_indices = repeat(k_indices, "blocks block_size -> blocks B block_size", B=B)
-
     kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
     (normalizer, running_values), _ = jax.lax.scan(
         kq_scanner,
