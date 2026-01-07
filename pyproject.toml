@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "jaxmodules"
-version = "0.1.1"
+version = "0.1.2"
 authors = [
   { name="Ashok Cutkosky", email="ashok@cutkosky.com" },
 ]
@@ -19,7 +19,7 @@ classifiers = [
 dependencies = [
   "einops",
   "equinox",
-  "jax[cuda12]"
+  "jax"
 ]
 
 [dependency-groups]
