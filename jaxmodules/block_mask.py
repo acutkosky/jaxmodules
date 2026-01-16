@@ -336,7 +336,7 @@ class BlockMask(eqx.Module):
                     * KV_BLOCK_SIZE
                 )
             except jax.errors.ConcretizationTypeError:
-                raise (ValueError, "cannot jit from_kv_blocks if seq_lengths is None!")
+                raise ValueError("cannot jit from_kv_blocks if seq_lengths is None!")
         else:
             Q_LEN, KV_LEN = seq_lengths
 

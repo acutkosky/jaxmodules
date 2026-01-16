@@ -26,7 +26,8 @@ dependencies = [
 dev = [
   "pytest",
   "torch",
-  "numpy"
+  "numpy",
+  "ty>=0.0.11",
 ]
 
 [project.urls]

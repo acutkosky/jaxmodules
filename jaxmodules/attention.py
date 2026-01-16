@@ -138,26 +138,29 @@ def _attn_block_fn(
     V,
     mask_fn,
     kernel_fn,
-    # is_full_mask,
-    # is_causal,
     left_window_blocks,
-    right_window_blocks
+    right_window_blocks,
+    is_causal=False,
+    use_causal_block_skipping=True,
 ):
-    # idx is an array of integers
-    # mask = jax.vmap(mask_fn)(idx)  # [block_size, L]
+    """Compute attention for a single Q block against all K/V blocks.
+
+    Args:
+        use_causal_block_skipping: If True and is_causal=True, skip K/V blocks
+            that are entirely masked out. Set to False during backward pass
+            since fori_loop with dynamic bounds doesn't support reverse-mode AD.
+    """
     B, Lq, Hq, dq = q_block.shape
     _, Lk, Hkv, _ = K.shape
     _, _, _, dv = V.shape
 
-    MQA_factor = Hq // Hkv
-
-
     k_block = rearrange(K, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
     v_block = rearrange(V, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
-
     k_indices = rearrange(jnp.arange(Lk), "(blocks block_size) -> blocks block_size", block_size=Lq)
 
     num_blocks = k_indices.shape[0]
+
+    # Apply windowing if specified
     if left_window_blocks is not None:
         idx_start = jnp.maximum(0, block_idx - left_window_blocks)
         total_blocks = left_window_blocks + right_window_blocks
@@ -165,19 +168,48 @@ def _attn_block_fn(
         k_indices = jax.lax.dynamic_slice_in_dim(k_indices, idx_start, total_blocks, axis=0)
         k_block = jax.lax.dynamic_slice_in_dim(k_block, idx_start, total_blocks, axis=0)
         v_block = jax.lax.dynamic_slice_in_dim(v_block, idx_start, total_blocks, axis=0)
+        num_blocks = total_blocks
 
+    init_carry = (jnp.zeros((B, Lq, Hq)), jnp.zeros((B, Lq, Hq, dv)))
 
-    kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
-    (normalizer, running_values), _ = jax.lax.scan(
-        kq_scanner,
-        init=(jnp.zeros((B, Lq, Hq)), jnp.zeros((B, Lq, Hq, dv))),
-        xs=(k_indices, k_block, v_block),
-    )
+    if is_causal and use_causal_block_skipping and left_window_blocks is None:
+        # Causal optimization: only process blocks 0..block_idx (inclusive)
+        # Use fori_loop with dynamic upper bound instead of scan over all blocks
+        # Note: This optimization only works for forward pass; backward pass
+        # must use use_causal_block_skipping=False since fori_loop with dynamic
+        # bounds doesn't support reverse-mode differentiation.
+        def body_fn(i, carry):
+            normalizer, running_values = carry
+            normalizer, running_values = _attn_kq_block_fn(
+                normalizer,
+                running_values,
+                q_idx,
+                k_indices[i],
+                q_block,
+                k_block[i],
+                v_block[i],
+                mask_fn,
+                kernel_fn,
+            )
+            return (normalizer, running_values)
+
+        upper_bound = block_idx + 1
+        normalizer, running_values = jax.lax.fori_loop(
+            0, upper_bound, body_fn, init_carry
+        )
+    else:
+        # Standard scan over all K/V blocks
+        kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
+        (normalizer, running_values), _ = jax.lax.scan(
+            kq_scanner,
+            init=init_carry,
+            xs=(k_indices, k_block, v_block),
+        )
 
     return running_values
 
 
-@partial(jax.custom_vjp, nondiff_argnames=['kernel_fn', 'mask_fn', 'block_size', 'window_size'])
+@partial(jax.custom_vjp, nondiff_argnames=['kernel_fn', 'mask_fn', 'block_size', 'window_size', 'is_causal'])
 def _masked_attention_via_map(
     Q: Array,
     K: Array,
@@ -186,6 +218,7 @@ def _masked_attention_via_map(
     mask_fn: Optional[Union[Callable[Tuple[int,int,int], Array], Array]] = None,
     block_size=None,
     window_size=None,
+    is_causal=False,
 ) -> Array:
 
     B, L, Hk, d = K.shape
@@ -194,7 +227,6 @@ def _masked_attention_via_map(
 
     if block_size is None:
         block_size = N
-
 
     if window_size is not None:
         left_window, right_window = window_size
@@ -227,7 +259,8 @@ def _masked_attention_via_map(
             mask_fn,
             kernel_fn,
             left_window_blocks,
-            right_window_blocks
+            right_window_blocks,
+            is_causal=is_causal,
         )
 
     Q = rearrange(Q, "B (blocks block_size) Hq d -> blocks B block_size Hq d", block_size=block_size)
@@ -245,11 +278,11 @@ def _masked_attention_via_map_fwd(
     Q: Array,
     K: Array,
     V: Array,
-    # is_causal: bool = False,
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size=None,
     window_size=None,
+    is_causal=False,
 ) -> Array:
 
     values = _masked_attention_via_map(
@@ -260,22 +293,23 @@ def _masked_attention_via_map_fwd(
         mask_fn=mask_fn,
         block_size=block_size,
         window_size=window_size,
+        is_causal=is_causal,
     )
     return values, (Q, K, V)
 
 def _masked_attention_via_map_bwd(
     kernel_fn: Callable[[Array, Array], float],
-    mask_fn: Optional[Union[Callable[int, Array], Array]] ,
+    mask_fn: Optional[Union[Callable[int, Array], Array]],
     block_size,
     window_size,
+    is_causal,
     res,
-    upstream_grad, 
+    upstream_grad,
 ):
     Q, K, V = res
     Bk, L, Hk, d = K.shape
     Bq, N, Hq, dq = Q.shape
     Bv, Lv, Hv, dv = V.shape
-
 
     if block_size is None:
         block_size = N
@@ -299,7 +333,6 @@ def _masked_attention_via_map_bwd(
         f"block_size must divide number of queries!"
     )
 
-
     def attn_fn(dK_dV, block_idx_q_idx_q_g):
         block_idx, q_idx, q, g = block_idx_q_idx_q_g
         dK_carry, dV_carry = dK_dV
@@ -314,9 +347,13 @@ def _masked_attention_via_map_bwd(
                 mask_fn,
                 kernel_fn,
                 left_window_blocks,
-                right_window_blocks
+                right_window_blocks,
+                is_causal=is_causal,
+                # Disable block skipping in backward pass - fori_loop with
+                # dynamic bounds doesn't support reverse-mode differentiation
+                use_causal_block_skipping=False,
             )
-        
+
         _, vjp_fn = jax.vjp(get_values, q, K, V)
         dq, dK, dV = vjp_fn(g)
 
@@ -343,6 +380,52 @@ def _masked_attention_via_map_bwd(
 
 
 _masked_attention_via_map.defvjp(_masked_attention_via_map_fwd, _masked_attention_via_map_bwd)
+
+
+def _canonicalize_mask_fn(mask_fn, is_causal):
+    """Convert mask_fn to canonical 4-arg (b, h, q, k) form.
+
+    Handles:
+    - 3-arg mask functions (h, q, k) -> wrapped to ignore batch
+    - is_causal=True -> causal mask (q >= k)
+    - None -> no masking (always True)
+    """
+    if mask_fn is not None and mask_fn.__code__.co_argcount == 3:
+        three_arg_mask_fn = mask_fn
+        mask_fn = lambda b, h, q, k: three_arg_mask_fn(h, q, k)
+
+    if is_causal and mask_fn is not None:
+        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
+    if is_causal:
+        return lambda b, h, q, k: q >= k
+    if mask_fn is None:
+        return lambda b, h, q, k: True
+    return mask_fn
+
+
+def _pad_for_block_size(Q, K, V, block_size, mask_fn):
+    """Pad Q, K, V to be divisible by block_size, adjusting mask_fn.
+
+    Returns (Q, K, V, mask_fn, padding_size_Q) where padding_size_Q is 0 if no padding.
+    """
+    N = Q.shape[1]
+    L = K.shape[1]
+
+    if block_size is None or N % block_size == 0:
+        return Q, K, V, mask_fn, 0
+
+    padding_size_Q = block_size - (N % block_size)
+    Q = jnp.pad(Q, ((0, 0), (0, padding_size_Q), (0, 0), (0, 0)), mode="constant")
+
+    padding_size_KV = block_size - (L % block_size)
+    K = jnp.pad(K, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode="constant")
+    V = jnp.pad(V, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode="constant")
+
+    unpadded_mask_fn = mask_fn
+    mask_fn = lambda b, h, q, k: unpadded_mask_fn(b, h, q, k) & (q < N) & (k < L)
+
+    return Q, K, V, mask_fn, padding_size_Q
+
 
 def masked_attention_via_map(
     Q: Array,
@@ -382,15 +465,17 @@ def masked_attention_via_map(
         Use the  mask_fn to explicitly enforce a constant window size if desired.
     """
 
+    # Validate dimensions
     if K.ndim not in [3, 4]:
         raise ValueError("K must have 3 or 4 dimensions")
     if Q.ndim not in [3, 4]:
         raise ValueError("Q must have 3 or 4 dimensions")
     if V.ndim not in [3, 4]:
         raise ValueError("V must have 3 or 4 dimensions")
-    assert K.ndim == Q.ndim and V.ndim == Q.ndim, "Q, K, and V must have the same number of dimensions"
+    if not (K.ndim == Q.ndim == V.ndim):
+        raise ValueError("Q, K, and V must have the same number of dimensions")
 
-
+    # Handle optional batch dimension
     added_batch_dim = False
     if Q.ndim == 3:
         added_batch_dim = True
@@ -398,44 +483,17 @@ def masked_attention_via_map(
         Q = Q[None, :, :, :]
         V = V[None, :, :, :]
 
-    # canonicalize mask_fn to take 4 arguments and have the appropriate form with respect to 
-    # padding and causality.
+    if not (K.shape[0] == Q.shape[0] == V.shape[0]):
+        raise ValueError("Q, K, and V must have the same batch dimension")
 
-    # if mask_fn is not None and only takes 3 arguments, make it take 4 but ignore the first argument
-    if mask_fn is not None and mask_fn.__code__.co_argcount == 3:
-        three_arg_mask_fn = mask_fn
-        mask_fn = lambda b, h, q, k: three_arg_mask_fn(h, q, k)
+    # Canonicalize mask_fn to 4-arg form
+    mask_fn = _canonicalize_mask_fn(mask_fn, is_causal)
 
+    # Pad for block_size if needed
+    N = Q.shape[1]
+    Q, K, V, mask_fn, padding_size = _pad_for_block_size(Q, K, V, block_size, mask_fn)
 
-    if is_causal and mask_fn is not None:
-        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
-    if is_causal:
-        # mask_fn signature: (b, h, q, k) -> bool
-        mask_fn = lambda b, h, q, k: q >= k
-        is_causal = False
-
-    if mask_fn is None:
-        # mask_fn signature: (b, h, q, k) -> bool
-        mask_fn = lambda b, h, q, k: True
-
-    assert K.shape[0] == Q.shape[0] == V.shape[0], "Q, K, and V must have the same batch dimension"
-
-    B, N, Hq, dq = Q.shape
-    L = K.shape[1]
-    padded_QKV = False
-    if block_size is not None and N % block_size != 0:
-        padded_QKV = True
-        # pad queries, and change mask_fn
-        padding_size_Q = block_size - (N % block_size)
-        Q = jnp.pad(Q, ((0, 0), (0, padding_size_Q), (0, 0), (0, 0)), mode='constant')
-
-        padding_size_KV = block_size - (L % block_size)
-        K = jnp.pad(K, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode='constant')
-        V = jnp.pad(V, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode='constant')
-
-        unpadded_mask_fn = mask_fn
-        mask_fn = lambda b, h, q, k: unpadded_mask_fn(b, h, q, k) & (q < N) & (k < L)
-
+    # Core computation
     result = _masked_attention_via_map(
         Q,
         K,
@@ -444,11 +502,12 @@ def masked_attention_via_map(
         mask_fn=mask_fn,
         block_size=block_size,
         window_size=window_size,
+        is_causal=is_causal,
     )
 
-    if padded_QKV:
-        result = result[:, :-padding_size_Q, :, :]
-
+    # Remove padding and batch dimension
+    if padding_size:
+        result = result[:, :N, :, :]
     if added_batch_dim:
         result = result[0]
 
