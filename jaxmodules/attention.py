@@ -164,6 +164,7 @@ def _attn_block_fn(
     if left_window_blocks is not None:
         idx_start = jnp.maximum(0, block_idx - left_window_blocks)
         total_blocks = left_window_blocks + right_window_blocks
+        total_blocks = min(total_blocks, num_blocks)
 
         k_indices = jax.lax.dynamic_slice_in_dim(k_indices, idx_start, total_blocks, axis=0)
         k_block = jax.lax.dynamic_slice_in_dim(k_block, idx_start, total_blocks, axis=0)
