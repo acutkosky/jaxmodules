@@ -452,6 +452,132 @@ def test_masked_attention_block_size():
         assert jnp.allclose(output, output_default, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize(
+    ("query_block_size", "kv_block_size"),
+    [(4, 3), (6, 4), (8, 16)],
+)
+def test_masked_attention_independent_tile_sizes(
+    query_block_size,
+    kv_block_size,
+):
+    """Query and K/V tile sizes can be tuned independently."""
+    length, heads, dim = 13, 2, 8
+    query, key, value = (
+        jax.random.normal(random_key, (length, heads, dim))
+        for random_key in jax.random.split(jax.random.PRNGKey(30), 3)
+    )
+
+    output = masked_attention_via_map(
+        query,
+        key,
+        value,
+        block_size=query_block_size,
+        kv_block_size=kv_block_size,
+        is_causal=True,
+    )
+    expected = jax.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        is_causal=True,
+        implementation="xla",
+    )
+
+    assert_outputs_close(
+        output,
+        expected,
+        test_name=f"independent_tiles_{query_block_size}_{kv_block_size}",
+    )
+
+
+def test_masked_attention_independent_tile_gradients():
+    """The explicit VJP supports different query and K/V tile sizes."""
+    query_length, kv_length, heads, dim = 9, 11, 2, 8
+    query, key, value, cotangent = (
+        jax.random.normal(random_key, shape)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(31), 4),
+            (
+                (query_length, heads, dim),
+                (kv_length, heads, dim),
+                (kv_length, heads, dim),
+                (query_length, heads, dim),
+            ),
+        )
+    )
+
+    def mapped_loss(q, k, v):
+        output = masked_attention_via_map(
+            q,
+            k,
+            v,
+            block_size=4,
+            kv_block_size=6,
+        )
+        return jnp.vdot(output, cotangent)
+
+    def equal_tile_loss(q, k, v):
+        output = masked_attention_via_map(
+            q,
+            k,
+            v,
+            block_size=4,
+            kv_block_size=4,
+        )
+        return jnp.vdot(output, cotangent)
+
+    mapped_gradients = jax.grad(mapped_loss, argnums=(0, 1, 2))(query, key, value)
+    expected_gradients = jax.grad(equal_tile_loss, argnums=(0, 1, 2))(
+        query,
+        key,
+        value,
+    )
+
+    for mapped_gradient, expected_gradient in zip(
+        mapped_gradients,
+        expected_gradients,
+    ):
+        assert jnp.allclose(
+            mapped_gradient,
+            expected_gradient,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+def test_masked_attention_window_with_independent_tile_sizes():
+    """Window block selection remains correct with asymmetric tiles."""
+    length, heads, dim = 13, 2, 8
+    query, key, value = (
+        jax.random.normal(random_key, (length, heads, dim))
+        for random_key in jax.random.split(jax.random.PRNGKey(32), 3)
+    )
+
+    def sliding_window_mask(h, q, k):
+        del h
+        return abs(q - k) <= 2
+
+    expected = masked_attention_via_map(
+        query,
+        key,
+        value,
+        block_size=4,
+        kv_block_size=6,
+        mask_fn=sliding_window_mask,
+    )
+    output = masked_attention_via_map(
+        query,
+        key,
+        value,
+        block_size=4,
+        kv_block_size=6,
+        mask_fn=sliding_window_mask,
+        window_size=(2, 2),
+    )
+
+    assert jnp.allclose(output, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_masked_attention_gqa():
     """Test masked_attention_via_map with grouped query attention (GQA)"""
     N, Hq, d = 8, 8, 16

@@ -1,5 +1,6 @@
 import jax
 from jax import numpy as jnp
+import math
 from typing import Callable, Union, Optional, Dict, Any, NamedTuple, Tuple
 from jaxtyping import Array, Float, UInt
 import equinox as eqx
@@ -222,10 +223,11 @@ def _attn_block_fn(
     q_block,
     K,
     V,
+    kv_block_size,
     mask_fn,
     kernel_fn,
-    left_window_blocks,
-    right_window_blocks,
+    window_left,
+    window_num_blocks,
     is_causal=False,
     use_causal_block_skipping=True,
 ):
@@ -240,22 +242,49 @@ def _attn_block_fn(
     _, Lk, Hkv, _ = K.shape
     _, _, _, dv = V.shape
 
-    k_block = rearrange(K, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
-    v_block = rearrange(V, "B (blocks block_size) Hkv d -> blocks B block_size Hkv d", block_size=Lq)
-    k_indices = rearrange(jnp.arange(Lk), "(blocks block_size) -> blocks block_size", block_size=Lq)
+    k_block = rearrange(
+        K,
+        "B (blocks block_size) Hkv d -> blocks B block_size Hkv d",
+        block_size=kv_block_size,
+    )
+    v_block = rearrange(
+        V,
+        "B (blocks block_size) Hkv d -> blocks B block_size Hkv d",
+        block_size=kv_block_size,
+    )
+    k_indices = rearrange(
+        jnp.arange(Lk),
+        "(blocks block_size) -> blocks block_size",
+        block_size=kv_block_size,
+    )
 
     num_blocks = k_indices.shape[0]
 
     # Apply windowing if specified
-    if left_window_blocks is not None:
-        idx_start = jnp.maximum(0, block_idx - left_window_blocks)
-        total_blocks = left_window_blocks + right_window_blocks
-        total_blocks = min(total_blocks, num_blocks)
-
-        k_indices = jax.lax.dynamic_slice_in_dim(k_indices, idx_start, total_blocks, axis=0)
-        k_block = jax.lax.dynamic_slice_in_dim(k_block, idx_start, total_blocks, axis=0)
-        v_block = jax.lax.dynamic_slice_in_dim(v_block, idx_start, total_blocks, axis=0)
-        num_blocks = total_blocks
+    if window_left is not None:
+        idx_start = jnp.maximum(
+            0,
+            jnp.floor_divide(q_idx[0] - window_left, kv_block_size),
+        )
+        k_indices = jax.lax.dynamic_slice_in_dim(
+            k_indices,
+            idx_start,
+            window_num_blocks,
+            axis=0,
+        )
+        k_block = jax.lax.dynamic_slice_in_dim(
+            k_block,
+            idx_start,
+            window_num_blocks,
+            axis=0,
+        )
+        v_block = jax.lax.dynamic_slice_in_dim(
+            v_block,
+            idx_start,
+            window_num_blocks,
+            axis=0,
+        )
+        num_blocks = window_num_blocks
 
     accumulator_dtype = jnp.result_type(
         q_block.dtype,
@@ -269,8 +298,9 @@ def _attn_block_fn(
         jnp.zeros((B, Lq, Hq, dv), dtype=accumulator_dtype),
     )
 
-    if is_causal and use_causal_block_skipping and left_window_blocks is None:
-        # Causal optimization: only process blocks 0..block_idx (inclusive)
+    if is_causal and use_causal_block_skipping and window_left is None:
+        # Causal optimization: only process blocks containing keys no later
+        # than the final query in this tile.
         # Use fori_loop with dynamic upper bound instead of scan over all blocks
         # Note: This optimization only works for forward pass; backward pass
         # must use use_causal_block_skipping=False since fori_loop with dynamic
@@ -294,7 +324,10 @@ def _attn_block_fn(
         # Cross-attention may contain more query blocks than key/value blocks.
         # Clamp the bound instead of relying on JAX's clipped out-of-bounds
         # indexing, which would process the final K/V block repeatedly.
-        upper_bound = jnp.minimum(block_idx + 1, num_blocks)
+        upper_bound = jnp.minimum(
+            jnp.floor_divide(q_idx[-1], kv_block_size) + 1,
+            num_blocks,
+        )
         max_score, normalizer, numerator = jax.lax.fori_loop(
             0, upper_bound, body_fn, init_carry
         )
@@ -325,6 +358,32 @@ def _attn_block_fn(
     return output, log_normalizer
 
 
+def _window_block_config(
+    window_size,
+    query_block_size,
+    kv_block_size,
+    num_kv_blocks,
+):
+    """Return a fixed-size K/V slice covering every query tile's window."""
+    if window_size is None:
+        return None, None
+
+    left, right = window_size
+    period = kv_block_size // math.gcd(query_block_size, kv_block_size)
+    span = left + query_block_size + right
+    window_num_blocks = max(
+        (
+            ((query_index * query_block_size - left) % kv_block_size)
+            + span
+            + kv_block_size
+            - 1
+        )
+        // kv_block_size
+        for query_index in range(period)
+    )
+    return left, min(window_num_blocks, num_kv_blocks)
+
+
 def _masked_attention_via_map_impl(
     Q: Array,
     K: Array,
@@ -332,6 +391,7 @@ def _masked_attention_via_map_impl(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[Tuple[int,int,int], Array], Array]] = None,
     block_size=None,
+    kv_block_size=None,
     window_size=None,
     is_causal=False,
 ) -> Array:
@@ -342,13 +402,15 @@ def _masked_attention_via_map_impl(
 
     if block_size is None:
         block_size = N
+    if kv_block_size is None:
+        kv_block_size = block_size
 
-    if window_size is not None:
-        left_window, right_window = window_size
-        left_window_blocks = (left_window + block_size - 1)// block_size
-        right_window_blocks = 1 + (right_window + block_size - 1)// block_size
-    else:
-        left_window_blocks = right_window_blocks = None
+    window_left, window_num_blocks = _window_block_config(
+        window_size,
+        block_size,
+        kv_block_size,
+        L // kv_block_size,
+    )
 
     assert d == dq and Lv == L, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
@@ -362,6 +424,9 @@ def _masked_attention_via_map_impl(
     assert block_size is None or N % block_size == 0, (
         f"block_size must divide number of queries!"
     )
+    assert L % kv_block_size == 0, (
+        "kv_block_size must divide the number of keys and values!"
+    )
 
     def attn_fn(block_idx_q_idx_Q):
         block_idx, q_idx, Q = block_idx_q_idx_Q
@@ -371,10 +436,11 @@ def _masked_attention_via_map_impl(
             Q,
             K,
             V,
+            kv_block_size,
             mask_fn,
             kernel_fn,
-            left_window_blocks,
-            right_window_blocks,
+            window_left,
+            window_num_blocks,
             is_causal=is_causal,
         )
 
@@ -402,6 +468,7 @@ def _masked_attention_via_map_impl(
         "kernel_fn",
         "mask_fn",
         "block_size",
+        "kv_block_size",
         "window_size",
         "is_causal",
     ],
@@ -413,6 +480,7 @@ def _masked_attention_via_map(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[Tuple[int, int, int], Array], Array]] = None,
     block_size=None,
+    kv_block_size=None,
     window_size=None,
     is_causal=False,
 ) -> Array:
@@ -423,6 +491,7 @@ def _masked_attention_via_map(
         kernel_fn=kernel_fn,
         mask_fn=mask_fn,
         block_size=block_size,
+        kv_block_size=kv_block_size,
         window_size=window_size,
         is_causal=is_causal,
     )
@@ -436,6 +505,7 @@ def _masked_attention_via_map_fwd(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size=None,
+    kv_block_size=None,
     window_size=None,
     is_causal=False,
 ) -> Tuple[Array, Tuple[Array, Array, Array, Array, Array]]:
@@ -447,6 +517,7 @@ def _masked_attention_via_map_fwd(
         kernel_fn=kernel_fn,
         mask_fn=mask_fn,
         block_size=block_size,
+        kv_block_size=kv_block_size,
         window_size=window_size,
         is_causal=is_causal,
     )
@@ -462,6 +533,7 @@ def _standard_attention_backward(
     upstream_grad,
     mask_fn,
     block_size,
+    kv_block_size,
     window_size,
     is_causal,
 ):
@@ -506,126 +578,115 @@ def _standard_attention_backward(
     k_blocks = rearrange(
         K,
         "B (K Kb) Hkv d -> K B Kb Hkv d",
-        Kb=block_size,
+        Kb=kv_block_size,
     )
     v_blocks = rearrange(
         V,
         "B (K Kb) Hkv dv -> K B Kb Hkv dv",
-        Kb=block_size,
+        Kb=kv_block_size,
     )
 
     num_q_blocks = q_blocks.shape[0]
     num_kv_blocks = k_blocks.shape[0]
     q_indices = jnp.reshape(jnp.arange(N), (num_q_blocks, block_size))
-    k_indices = jnp.reshape(jnp.arange(L), (num_kv_blocks, block_size))
-    q_block_indices = jnp.arange(num_q_blocks)
+    k_indices = jnp.reshape(jnp.arange(L), (num_kv_blocks, kv_block_size))
 
-    if window_size is not None:
-        left_window, right_window = window_size
-        left_window_blocks = (left_window + block_size - 1) // block_size
-        right_window_blocks = 1 + (right_window + block_size - 1) // block_size
-        total_window_blocks = min(
-            left_window_blocks + right_window_blocks,
-            num_kv_blocks,
-        )
-    else:
-        left_window_blocks = None
-        total_window_blocks = None
+    window_left, total_window_blocks = _window_block_config(
+        window_size,
+        block_size,
+        kv_block_size,
+        num_kv_blocks,
+    )
 
     dK_init = jnp.zeros(k_blocks.shape, dtype=accumulator_dtype)
     dV_init = jnp.zeros(v_blocks.shape, dtype=accumulator_dtype)
 
     def query_block_backward(dK_dV, query_data):
         dK, dV = dK_dV
-        q_block_idx, q_idx, q_block, out_block, grad_block, lse_block = query_data
+        q_idx, q_block, out_block, grad_block, lse_block = query_data
         delta = jnp.sum(grad_block * out_block, axis=-1, keepdims=True)
         dQ = jnp.zeros(q_block.shape, dtype=accumulator_dtype)
 
-        if left_window_blocks is not None:
-            window_start = jnp.maximum(0, q_block_idx - left_window_blocks)
-            window_start = jnp.minimum(
-                window_start,
+        if window_left is not None:
+            kv_start = jnp.maximum(
+                0,
+                jnp.floor_divide(q_idx[0] - window_left, kv_block_size),
+            )
+            kv_start = jnp.minimum(
+                kv_start,
                 num_kv_blocks - total_window_blocks,
             )
+            kv_stop = kv_start + total_window_blocks
+        else:
+            kv_start = 0
+            kv_stop = num_kv_blocks
+
+        if is_causal:
+            causal_stop = jnp.minimum(
+                jnp.floor_divide(q_idx[-1], kv_block_size) + 1,
+                num_kv_blocks,
+            )
+            kv_stop = jnp.minimum(kv_stop, causal_stop)
 
         def kv_block_backward(kv_block_idx, state):
-            dQ_carry, dK_carry, dV_carry = state
-
-            if left_window_blocks is not None:
-                process_block = (kv_block_idx >= window_start) & (
-                    kv_block_idx < window_start + total_window_blocks
-                )
-            elif is_causal:
-                process_block = kv_block_idx <= q_block_idx
-            else:
-                process_block = True
-
-            def accumulate(block_state):
-                dQ_acc, dK_acc, dV_acc = block_state
-                k_block = k_blocks[kv_block_idx]
-                v_block = v_blocks[kv_block_idx]
-                mask = _materialize_mask(
-                    mask_fn,
-                    B,
-                    Hq,
-                    Hkv,
-                    q_idx,
-                    k_indices[kv_block_idx],
-                )
-                scores = jnp.einsum(
-                    "bqhgd,bkhd->bqhgk",
-                    q_block,
-                    k_block,
-                    precision=jax.lax.Precision.HIGHEST,
-                    preferred_element_type=accumulator_dtype,
-                )
-                scores = jnp.where(mask, scores * scale, -jnp.inf)
-                probabilities = jnp.exp(scores - lse_block)
-
-                dP = jnp.einsum(
-                    "bqhge,bkhe->bqhgk",
-                    grad_block,
-                    v_block,
-                    precision=jax.lax.Precision.HIGHEST,
-                    preferred_element_type=accumulator_dtype,
-                )
-                dS = probabilities * (dP - delta)
-
-                dQ_acc = dQ_acc + scale * jnp.einsum(
-                    "bqhgk,bkhd->bqhgd",
-                    dS,
-                    k_block,
-                    precision=jax.lax.Precision.HIGHEST,
-                    preferred_element_type=accumulator_dtype,
-                )
-                dK_block = scale * jnp.einsum(
-                    "bqhgk,bqhgd->bkhd",
-                    dS,
-                    q_block,
-                    precision=jax.lax.Precision.HIGHEST,
-                    preferred_element_type=accumulator_dtype,
-                )
-                dV_block = jnp.einsum(
-                    "bqhgk,bqhge->bkhe",
-                    probabilities,
-                    grad_block,
-                    precision=jax.lax.Precision.HIGHEST,
-                    preferred_element_type=accumulator_dtype,
-                )
-                dK_acc = dK_acc.at[kv_block_idx].add(dK_block)
-                dV_acc = dV_acc.at[kv_block_idx].add(dV_block)
-                return dQ_acc, dK_acc, dV_acc
-
-            return jax.lax.cond(
-                process_block,
-                accumulate,
-                lambda block_state: block_state,
-                (dQ_carry, dK_carry, dV_carry),
+            dQ_acc, dK_acc, dV_acc = state
+            k_block = k_blocks[kv_block_idx]
+            v_block = v_blocks[kv_block_idx]
+            mask = _materialize_mask(
+                mask_fn,
+                B,
+                Hq,
+                Hkv,
+                q_idx,
+                k_indices[kv_block_idx],
             )
+            scores = jnp.einsum(
+                "bqhgd,bkhd->bqhgk",
+                q_block,
+                k_block,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=accumulator_dtype,
+            )
+            scores = jnp.where(mask, scores * scale, -jnp.inf)
+            probabilities = jnp.exp(scores - lse_block)
+
+            dP = jnp.einsum(
+                "bqhge,bkhe->bqhgk",
+                grad_block,
+                v_block,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=accumulator_dtype,
+            )
+            dS = probabilities * (dP - delta)
+
+            dQ_acc = dQ_acc + scale * jnp.einsum(
+                "bqhgk,bkhd->bqhgd",
+                dS,
+                k_block,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=accumulator_dtype,
+            )
+            dK_block = scale * jnp.einsum(
+                "bqhgk,bqhgd->bkhd",
+                dS,
+                q_block,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=accumulator_dtype,
+            )
+            dV_block = jnp.einsum(
+                "bqhgk,bqhge->bkhe",
+                probabilities,
+                grad_block,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=accumulator_dtype,
+            )
+            dK_acc = dK_acc.at[kv_block_idx].add(dK_block)
+            dV_acc = dV_acc.at[kv_block_idx].add(dV_block)
+            return dQ_acc, dK_acc, dV_acc
 
         dQ, dK, dV = jax.lax.fori_loop(
-            0,
-            num_kv_blocks,
+            kv_start,
+            kv_stop,
             kv_block_backward,
             (dQ, dK, dV),
         )
@@ -635,7 +696,6 @@ def _standard_attention_backward(
         query_block_backward,
         init=(dK_init, dV_init),
         xs=(
-            q_block_indices,
             q_indices,
             q_blocks,
             output_blocks,
@@ -654,6 +714,7 @@ def _masked_attention_via_map_bwd(
     kernel_fn: Callable[[Array, Array], float],
     mask_fn: Optional[Union[Callable[int, Array], Array]],
     block_size,
+    kv_block_size,
     window_size,
     is_causal,
     res,
@@ -666,13 +727,15 @@ def _masked_attention_via_map_bwd(
 
     if block_size is None:
         block_size = N
+    if kv_block_size is None:
+        kv_block_size = block_size
 
-    if window_size is not None:
-        left_window, right_window = window_size
-        left_window_blocks = (left_window + block_size - 1) // block_size
-        right_window_blocks = 1 + (right_window + block_size - 1) // block_size
-    else:
-        left_window_blocks = right_window_blocks = None
+    window_left, window_num_blocks = _window_block_config(
+        window_size,
+        block_size,
+        kv_block_size,
+        L // kv_block_size,
+    )
 
     assert d == dq and Lv == L, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
@@ -685,6 +748,9 @@ def _masked_attention_via_map_bwd(
     assert block_size is None or N % block_size == 0, (
         f"block_size must divide number of queries!"
     )
+    assert L % kv_block_size == 0, (
+        "kv_block_size must divide the number of keys and values!"
+    )
 
     if kernel_fn is default_kernel:
         return _standard_attention_backward(
@@ -696,6 +762,7 @@ def _masked_attention_via_map_bwd(
             upstream_grad,
             mask_fn,
             block_size,
+            kv_block_size,
             window_size,
             is_causal,
         )
@@ -711,10 +778,11 @@ def _masked_attention_via_map_bwd(
                 q,
                 K,
                 V,
+                kv_block_size,
                 mask_fn,
                 kernel_fn,
-                left_window_blocks,
-                right_window_blocks,
+                window_left,
+                window_num_blocks,
                 is_causal=is_causal,
                 # Disable block skipping in backward pass - fori_loop with
                 # dynamic bounds doesn't support reverse-mode differentiation
@@ -771,19 +839,23 @@ def _canonicalize_mask_fn(mask_fn, is_causal):
     return mask_fn
 
 
-def _pad_for_block_size(Q, K, V, block_size, mask_fn):
-    """Pad Q, K, V to be divisible by block_size, adjusting mask_fn.
+def _pad_for_block_sizes(
+    Q,
+    K,
+    V,
+    query_block_size,
+    kv_block_size,
+    mask_fn,
+):
+    """Pad Q and K/V independently to their tile sizes, adjusting mask_fn.
 
     Returns (Q, K, V, mask_fn, padding_size_Q) where padding_size_Q is 0 if no padding.
     """
     N = Q.shape[1]
     L = K.shape[1]
 
-    if block_size is None:
-        block_size = N
-
-    padding_size_Q = (-N) % block_size
-    padding_size_KV = (-L) % block_size
+    padding_size_Q = (-N) % query_block_size
+    padding_size_KV = (-L) % kv_block_size
     if padding_size_Q == 0 and padding_size_KV == 0:
         return Q, K, V, mask_fn, 0
 
@@ -820,6 +892,7 @@ def masked_attention_via_map(
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size: Optional[int] = None,
+    kv_block_size: Optional[int] = None,
     window_size: Optional[Tuple[int, int]] = None,
 ) -> Array:
     """
@@ -838,7 +911,10 @@ def masked_attention_via_map(
         If is_causal is False and mask_fn is None, then the default value of no masking will
         be used (equivalent to mask_fn = lambda b, h, q, k: True).
     block_size: If specified, group the Q, K, V values into [block_size, d] sized blocks and
-        perform attention on these blocks. Allows to trade-off the memory savings of scan.
+        perform attention on these blocks. This controls the query tile size and,
+        unless kv_block_size is specified, the K/V tile size.
+    kv_block_size: Optional independent K/V tile size. This makes it possible
+        to tune the score-tile shape without changing the query tile size.
     window_size: Tuple (left, right) or None.If specified, apply a sliding window mask to the attention.
         window_size is the number of tokens to the left and right of the current block
         that are allowed to attend to the current block.
@@ -877,6 +953,8 @@ def masked_attention_via_map(
         raise ValueError("Q and K must have the same feature dimension")
     if block_size is not None and block_size <= 0:
         raise ValueError("block_size must be positive")
+    if kv_block_size is not None and kv_block_size <= 0:
+        raise ValueError("kv_block_size must be positive")
 
     # Canonicalize mask_fn to 4-arg form
     mask_fn = _canonicalize_mask_fn(mask_fn, is_causal)
@@ -884,11 +962,15 @@ def masked_attention_via_map(
     # Pad for block_size if needed
     N = Q.shape[1]
     effective_block_size = Q.shape[1] if block_size is None else block_size
-    Q, K, V, mask_fn, padding_size = _pad_for_block_size(
+    effective_kv_block_size = (
+        effective_block_size if kv_block_size is None else kv_block_size
+    )
+    Q, K, V, mask_fn, padding_size = _pad_for_block_sizes(
         Q,
         K,
         V,
         effective_block_size,
+        effective_kv_block_size,
         mask_fn,
     )
 
@@ -900,6 +982,7 @@ def masked_attention_via_map(
         kernel_fn=kernel_fn,
         mask_fn=mask_fn,
         block_size=effective_block_size,
+        kv_block_size=effective_kv_block_size,
         window_size=window_size,
         is_causal=is_causal,
     )

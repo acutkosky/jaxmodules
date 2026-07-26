@@ -29,6 +29,7 @@ class Case:
     mode: str
     seq_len: int
     block_size: int
+    kv_block_size: int
     batch_size: int
     query_heads: int
     kv_heads: int
@@ -53,6 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=MODES, action="append")
     parser.add_argument("--seq-len", type=_positive_int, nargs="+", default=[512])
     parser.add_argument("--block-size", type=_positive_int, nargs="+", default=[64])
+    parser.add_argument("--kv-block-size", type=_positive_int, nargs="+")
     parser.add_argument("--batch-size", type=_positive_int, default=1)
     parser.add_argument("--query-heads", type=_positive_int, default=4)
     parser.add_argument("--kv-heads", type=_positive_int, default=4)
@@ -133,6 +135,7 @@ def _make_function(case: Case) -> Any:
                 key,
                 value,
                 block_size=case.block_size,
+                kv_block_size=case.kv_block_size,
                 is_causal=case.causal,
             )
 
@@ -270,8 +273,8 @@ def _format_bytes(value: int | None) -> str:
 
 def _print_results(results: list[dict[str, Any]]) -> None:
     heading = (
-        "seq | block | mode | implementation | median | tokens/s | device peak* | "
-        "compiler temp | status"
+        "seq | qblk | kvblk | mode | implementation | median | tokens/s | "
+        "device peak* | compiler temp | status"
     )
     print(heading)
     print("-" * len(heading))
@@ -289,7 +292,8 @@ def _print_results(results: list[dict[str, Any]]) -> None:
             latency = throughput = peak = temporary = "-"
             status = f"{result.get('error_type')}: {result.get('error')}"
         print(
-            f"{case['seq_len']:>3} | {case['block_size']:>5} | {case['mode']:<8} | "
+            f"{case['seq_len']:>3} | {case['block_size']:>4} | "
+            f"{case['kv_block_size']:>5} | {case['mode']:<8} | "
             f"{case['implementation']:<14} | {latency:>9} | "
             f"{throughput:>9} | {peak:>12} | {temporary:>13} | {status}"
         )
@@ -305,12 +309,22 @@ def main() -> int:
 
     implementations = args.implementation or list(IMPLEMENTATIONS)
     modes = args.mode or list(MODES)
+    tile_sizes = (
+        [(block_size, block_size) for block_size in args.block_size]
+        if args.kv_block_size is None
+        else [
+            (block_size, kv_block_size)
+            for block_size in args.block_size
+            for kv_block_size in args.kv_block_size
+        ]
+    )
     cases = [
         Case(
             implementation=implementation,
             mode=mode,
             seq_len=seq_len,
             block_size=block_size,
+            kv_block_size=kv_block_size,
             batch_size=args.batch_size,
             query_heads=args.query_heads,
             kv_heads=args.kv_heads,
@@ -322,7 +336,7 @@ def main() -> int:
             seed=args.seed,
         )
         for seq_len in args.seq_len
-        for block_size in args.block_size
+        for block_size, kv_block_size in tile_sizes
         for mode in modes
         for implementation in implementations
     ]

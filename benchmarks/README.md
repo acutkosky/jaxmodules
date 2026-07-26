@@ -49,6 +49,20 @@ each workload rather than compared against XLA and cuDNN at an arbitrary tile
 size. The block-size field is ignored by XLA and cuDNN, but those cases are
 still repeated to keep each result independently isolated.
 
+By default, each `--block-size` is used for both query and K/V tiles. Pass one
+or more `--kv-block-size` values to benchmark the Cartesian product of query
+and K/V tile sizes:
+
+```bash
+uv run python benchmarks/benchmark_mapped_attention.py \
+  --implementation mapped \
+  --seq-len 8192 \
+  --block-size 256 512 1024 \
+  --kv-block-size 128 256 512 \
+  --warmup 3 \
+  --iterations 10
+```
+
 cuDNN results are reported as unavailable when the current backend or input
 configuration does not support cuDNN attention. The XLA and mapped
 implementations remain usable on CPU.
