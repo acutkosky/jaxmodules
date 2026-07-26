@@ -1493,8 +1493,11 @@ def masked_attention_via_map(
     backward_strategy: ``"auto"`` uses a one-pass backward and carries whichever
         full-precision gradient set is smaller. ``"minimal"`` recomputes score
         tiles in separate Q and K/V passes so no sequence-sized FP32 gradient
-        is carried, trading additional compute for lower peak memory. Neither
-        strategy changes contraction or accumulation precision.
+        is carried. This trades additional compute for less gradient-carry
+        memory, although other live buffers can dominate the total peak.
+        Neither strategy changes contraction or accumulation precision. The
+        strategy applies to the optimized default kernel; custom kernels retain
+        their generic custom-VJP path.
     """
 
     # Validate dimensions
