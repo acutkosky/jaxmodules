@@ -1383,16 +1383,24 @@ def _masked_attention_via_mosaic_bwd(
     res,
     upstream_grad,
 ):
-    return _masked_attention_via_map_bwd(
-        default_kernel,
-        mask_fn,
+    del (
         block_size,
         kv_block_size,
         window_size,
         is_causal,
         backward_strategy,
-        res,
+    )
+    Q, K, V, output, log_normalizer = res
+    from jaxmodules._mosaic_attention import mosaic_attention_backward
+
+    return mosaic_attention_backward(
+        Q,
+        K,
+        V,
+        output,
+        log_normalizer,
         upstream_grad,
+        mask_fn,
     )
 
 
@@ -1586,7 +1594,9 @@ def masked_attention_via_map(
         memory, although other live buffers can dominate the total peak.
         Neither strategy changes contraction or accumulation precision. The
         strategy applies to the optimized default kernel; custom kernels retain
-        their generic custom-VJP path.
+        their generic custom-VJP path. Calls eligible for the Mosaic GPU fast
+        path use its fixed two-pass, linear-memory backward and therefore do
+        not use this fallback tuning option.
     """
 
     # Validate dimensions

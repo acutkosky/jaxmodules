@@ -9,6 +9,7 @@ import pytest
 
 from jaxmodules._mosaic_attention import (
     mask_is_mosaic_compatible,
+    mosaic_attention_backward,
     mosaic_attention_forward,
 )
 from jaxmodules.attention import (
@@ -132,15 +133,69 @@ def test_mosaic_forward_composes_with_jit_and_vmap():
         atol=2e-3,
     )
 
+    def loss(q, k, v):
+        result = _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=_complex_mask,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=False,
+            backward_strategy="auto",
+        )
+        return jnp.mean(result**2)
+
+    vmapped_gradients = jax.jit(
+        jax.vmap(jax.grad(loss, argnums=(0, 1, 2)))
+    )(query, key, value)
+    expected_gradients = tuple(
+        jnp.stack(
+            [
+                jax.grad(loss, argnums=(0, 1, 2))(
+                    query[i],
+                    key[i],
+                    value[i],
+                )[gradient_index]
+                for i in range(query.shape[0])
+            ]
+        )
+        for gradient_index in range(3)
+    )
+    for vmapped_gradient, expected_gradient in zip(
+        vmapped_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(vmapped_gradient),
+            np.asarray(expected_gradient),
+            rtol=3e-3,
+            atol=3e-3,
+        )
+
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
-def test_mosaic_custom_vjp_matches_existing_tiled_backward():
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [
+        (jnp.float16, 3e-3),
+        (jnp.bfloat16, 2e-2),
+    ],
+)
+def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
     keys = jax.random.split(jax.random.key(19), 4)
-    shape = (1, 128, 2, 64)
-    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
-    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
-    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
-    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+    query_shape = (1, 128, 4, 64)
+    kv_shape = (1, 128, 2, 64)
+    query = jax.random.normal(keys[0], query_shape, dtype=dtype)
+    key = jax.random.normal(keys[1], kv_shape, dtype=dtype)
+    value = jax.random.normal(keys[2], kv_shape, dtype=dtype)
+    cotangent = jax.random.normal(
+        keys[3],
+        query_shape,
+        dtype=jnp.float32,
+    )
 
     def mosaic_loss(q, k, v):
         output = _masked_attention_via_mosaic(
@@ -192,6 +247,35 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward():
         np.testing.assert_allclose(
             np.asarray(mosaic_gradient),
             np.asarray(mapped_gradient),
-            rtol=3e-3,
-            atol=3e-3,
+            rtol=tolerance,
+            atol=tolerance,
+        )
+
+    mosaic_output, mosaic_lse = mosaic_attention_forward(
+        query,
+        key,
+        value,
+        _complex_mask,
+    )
+    direct_gradients = jax.jit(
+        lambda q, k, v, output, lse, gradient: mosaic_attention_backward(
+            q,
+            k,
+            v,
+            output,
+            lse,
+            gradient,
+            _complex_mask,
+        )
+    )(query, key, value, mosaic_output, mosaic_lse, cotangent)
+    for direct_gradient, mapped_gradient in zip(
+        direct_gradients,
+        mapped_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(direct_gradient),
+            np.asarray(mapped_gradient),
+            rtol=tolerance,
+            atol=tolerance,
         )

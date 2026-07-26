@@ -51,9 +51,9 @@ Both forward and forward-plus-backward modes are measured by default. Pass
 
 `--block-size` accepts multiple values so that mapped attention is tuned at
 each workload rather than compared against XLA and cuDNN at an arbitrary tile
-size. Mosaic forward currently uses an internal 64x64 tile; the requested
-block sizes still tune its established mapped backward. The block-size field
-is ignored by XLA and cuDNN, but those cases are still repeated to keep each
+size. Mosaic forward and backward currently use internal 64x64 tiles, so the
+requested block sizes do not change Mosaic. The block-size field is also
+ignored by XLA and cuDNN, but those cases are still repeated to keep each
 result independently isolated.
 
 By default, each `--block-size` is used for both query and K/V tiles. Pass one
