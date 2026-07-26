@@ -4,6 +4,9 @@
 mapped implementation, and JAX's XLA and cuDNN scaled-dot-product attention
 implementations.
 
+The checked-in [RTX 5090 general-mask results](results/rtx5090_general_attention_2026-07-26.md)
+show the benchmark format and the large-context crossover.
+
 Run the smoke suite while iterating:
 
 ```bash
