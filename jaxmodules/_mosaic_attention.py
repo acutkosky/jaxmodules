@@ -201,6 +201,8 @@ def mosaic_attention_forward(
     key: jax.Array,
     value: jax.Array,
     mask_fn: Callable[..., Any],
+    *,
+    is_causal: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute standard attention and its natural-log normalizer on Mosaic GPU."""
 
@@ -381,9 +383,15 @@ def mosaic_attention_forward(
 
             return output_accumulator, row_max, row_sum
 
+        kv_stop = num_kv_tiles
+        if is_causal:
+            kv_stop = jnp.minimum(
+                (query_base + block_q + block_kv - 1) // block_kv,
+                num_kv_tiles,
+            )
         output_accumulator, row_max, row_sum = lax.fori_loop(
             0,
-            num_kv_tiles,
+            kv_stop,
             kv_body,
             (output_accumulator, row_max, row_sum),
         )
@@ -532,6 +540,8 @@ def mosaic_attention_backward(
     log_normalizer: jax.Array,
     upstream_gradient: jax.Array,
     mask_fn: Callable[..., Any],
+    *,
+    is_causal: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Memory-efficient general-mask backward using warp-level Mosaic MMA."""
 
@@ -741,9 +751,15 @@ def mosaic_attention_backward(
                 ds_residual -= ds_component.astype(jnp.float32)
             return query_gradient
 
+        kv_stop = num_kv_tiles
+        if is_causal:
+            kv_stop = jnp.minimum(
+                (query_base + block_q + block_kv - 1) // block_kv,
+                num_kv_tiles,
+            )
         query_gradient = lax.fori_loop(
             0,
-            num_kv_tiles,
+            kv_stop,
             kv_body,
             query_gradient,
         )
@@ -992,8 +1008,14 @@ def mosaic_attention_backward(
 
                 return key_gradient, value_gradient
 
+            query_start = 0
+            if is_causal:
+                query_start = jnp.minimum(
+                    kv_base // block_q,
+                    num_query_tiles,
+                )
             key_gradient, value_gradient = lax.fori_loop(
-                0,
+                query_start,
                 num_query_tiles,
                 query_body,
                 (key_gradient, value_gradient),

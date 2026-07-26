@@ -550,10 +550,16 @@ def _masked_attention_via_mosaic(
     backward_strategy,
 ) -> Array:
     """Mosaic forward paired with the established tiled custom backward."""
-    del block_size, kv_block_size, window_size, is_causal, backward_strategy
+    del block_size, kv_block_size, window_size, backward_strategy
     from jaxmodules._mosaic_attention import mosaic_attention_forward
 
-    values, _ = mosaic_attention_forward(Q, K, V, mask_fn)
+    values, _ = mosaic_attention_forward(
+        Q,
+        K,
+        V,
+        mask_fn,
+        is_causal=is_causal,
+    )
     return values
 
 
@@ -568,10 +574,16 @@ def _masked_attention_via_mosaic_fwd(
     is_causal,
     backward_strategy,
 ):
-    del block_size, kv_block_size, window_size, is_causal, backward_strategy
+    del block_size, kv_block_size, window_size, backward_strategy
     from jaxmodules._mosaic_attention import mosaic_attention_forward
 
-    values, log_normalizer = mosaic_attention_forward(Q, K, V, mask_fn)
+    values, log_normalizer = mosaic_attention_forward(
+        Q,
+        K,
+        V,
+        mask_fn,
+        is_causal=is_causal,
+    )
     return values, (Q, K, V, values, log_normalizer)
 
 
@@ -1387,7 +1399,6 @@ def _masked_attention_via_mosaic_bwd(
         block_size,
         kv_block_size,
         window_size,
-        is_causal,
         backward_strategy,
     )
     Q, K, V, output, log_normalizer = res
@@ -1401,6 +1412,7 @@ def _masked_attention_via_mosaic_bwd(
         log_normalizer,
         upstream_grad,
         mask_fn,
+        is_causal=is_causal,
     )
 
 

@@ -32,6 +32,11 @@ def _partly_fully_masked(batch, head, query_index, key_index):
     return (query_index % 7 != 0) & (key_index <= query_index)
 
 
+def _causal_mask(batch, head, query_index, key_index):
+    del batch, head
+    return query_index >= key_index
+
+
 def test_mask_compatibility_is_conservative():
     assert mask_is_mosaic_compatible(_complex_mask)
     assert mask_is_mosaic_compatible(
@@ -278,4 +283,59 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
             np.asarray(mapped_gradient),
             rtol=tolerance,
             atol=tolerance,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_causal_block_pruning_matches_the_general_engine():
+    keys = jax.random.split(jax.random.key(23), 4)
+    shape = (1, 128, 2, 64)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    def loss(q, k, v, *, prune):
+        result = _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=_causal_mask,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=prune,
+            backward_strategy="auto",
+        )
+        return jnp.sum(result * cotangent)
+
+    pruned_value, pruned_gradients = jax.jit(
+        jax.value_and_grad(
+            lambda q, k, v: loss(q, k, v, prune=True),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, value)
+    general_value, general_gradients = jax.jit(
+        jax.value_and_grad(
+            lambda q, k, v: loss(q, k, v, prune=False),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, value)
+
+    np.testing.assert_allclose(
+        np.asarray(pruned_value),
+        np.asarray(general_value),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+    for pruned_gradient, general_gradient in zip(
+        pruned_gradients,
+        general_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(pruned_gradient),
+            np.asarray(general_gradient),
+            rtol=3e-3,
+            atol=3e-3,
         )
