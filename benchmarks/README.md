@@ -18,7 +18,7 @@ Run a larger causal sweep:
 ```bash
 uv run python benchmarks/benchmark_mapped_attention.py \
   --seq-len 1024 2048 4096 \
-  --block-size 128 \
+  --block-size 128 256 512 \
   --batch-size 2 \
   --query-heads 8 \
   --kv-heads 8 \
@@ -44,7 +44,11 @@ statistics. The benchmark reports:
 Both forward and forward-plus-backward modes are measured by default. Pass
 `--mode forward` or `--mode backward` to select one.
 
+`--block-size` accepts multiple values so that mapped attention is tuned at
+each workload rather than compared against XLA and cuDNN at an arbitrary tile
+size. The block-size field is ignored by XLA and cuDNN, but those cases are
+still repeated to keep each result independently isolated.
+
 cuDNN results are reported as unavailable when the current backend or input
 configuration does not support cuDNN attention. The XLA and mapped
 implementations remain usable on CPU.
-
