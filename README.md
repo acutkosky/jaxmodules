@@ -45,14 +45,25 @@ result = vectorized(A, B, C)  # shape: (5, 3, 4) - 5 comes from unmapped dimensi
 
 ## masked_attention_via_map
 
-`masked_attention_via_map` is a memory-efficient attention implementation written in pure JAX, similar to Flash Attention. It uses `jax.lax.map` to process attention in blocks, enabling efficient computation for long sequences while supporting flexible masking patterns.
+`masked_attention_via_map` is a JAX-native memory-efficient attention
+implementation, similar to Flash Attention. It processes attention in blocks,
+enabling efficient computation for long sequences while supporting flexible
+masking patterns.
+
+On supported NVIDIA GPUs, standard float16/bfloat16 attention with 64-wide
+heads and coordinate-only callable masks automatically uses a Mosaic GPU
+forward and custom backward kernel. The callable API is unchanged. Unsupported
+callables, shapes, dtypes, custom score kernels, and explicit windowing
+conservatively retain the `jax.lax.map` implementation.
 
 Key features:
 - Memory-efficient block-wise processing using `jax.lax.map`
+- Automatic linear-memory Mosaic GPU forward and backward fast path
 - Customizable attention masks via `mask_fn`
 - Support for causal masking
 - Optional windowing for local attention patterns
 - Configurable block sizes for memory/performance trade-offs
+- Compatible with `jax.jit`, `jax.vmap`, and the existing custom VJP
 
 ### Examples
 
