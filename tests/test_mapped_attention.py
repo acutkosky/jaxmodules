@@ -1069,7 +1069,7 @@ def test_masked_attention_error_cases():
     
     # Test with mismatched dimensions
     K_wrong = jax.random.normal(key2, (L, Hkv, d + 1))
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         masked_attention_via_map(Q, K_wrong, V)
 
 
@@ -1119,6 +1119,85 @@ def test_masked_attention_block_size_padding():
     # # Results should be the same regardless of block_size (within numerical precision)
     # assert_outputs_close(output, output_block2, test_name="block_size_padding_different_sizes", rtol=1e-4, atol=1e-4)
 
+
+def test_masked_attention_pads_kv_when_query_needs_no_padding():
+    """K/V padding is independent of whether the query needs padding."""
+    N, L, heads, dim = 8, 10, 2, 8
+    query, key, value = (
+        jax.random.normal(random_key, shape)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(27), 3),
+            (
+                (N, heads, dim),
+                (L, heads, dim),
+                (L, heads, dim),
+            ),
+        )
+    )
+
+    output = masked_attention_via_map(query, key, value, block_size=4)
+    expected = jax.nn.dot_product_attention(query, key, value, implementation="xla")
+
+    assert_outputs_close(output, expected, test_name="independent_kv_padding")
+
+
+def test_masked_attention_causal_more_queries_than_keys():
+    """Causal block skipping does not revisit the final K/V block."""
+    N, L, heads, dim = 8, 4, 2, 8
+    query, key, value = (
+        jax.random.normal(random_key, shape)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(28), 3),
+            (
+                (N, heads, dim),
+                (L, heads, dim),
+                (L, heads, dim),
+            ),
+        )
+    )
+
+    output = masked_attention_via_map(
+        query,
+        key,
+        value,
+        block_size=2,
+        is_causal=True,
+    )
+    expected = jax.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        is_causal=True,
+        implementation="xla",
+    )
+
+    assert_outputs_close(output, expected, test_name="causal_more_queries")
+
+
+def test_masked_attention_supports_different_value_dimension():
+    """The value feature dimension need not match the Q/K feature dimension."""
+    N, L, heads, query_dim, value_dim = 8, 10, 2, 8, 5
+    query, key, value = (
+        jax.random.normal(random_key, shape)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(29), 3),
+            (
+                (N, heads, query_dim),
+                (L, heads, query_dim),
+                (L, heads, value_dim),
+            ),
+        )
+    )
+
+    output = masked_attention_via_map(query, key, value, block_size=4)
+    scores = jnp.einsum("nhd,lhd->hnl", query, key) / jnp.sqrt(query_dim)
+    probabilities = jax.nn.softmax(scores, axis=-1)
+    expected = jnp.einsum("hnl,lhe->nhe", probabilities, value)
+
+    assert output.shape == (N, heads, value_dim)
+    assert_outputs_close(output, expected, test_name="different_value_dimension")
+
+
 def test_masked_attention_different_kernel():
     """Test masked_attention_via_map with custom kernel function"""
     N, Hq, d = 8, 4, 16
@@ -1155,22 +1234,11 @@ def test_masked_attention_different_lengths(N, L):
     K = jax.random.normal(key2, (L, Hkv, d))
     V = jax.random.normal(key3, (L, Hkv, d))
     
-    # The current implementation requires that when block_size is set to N,
-    # K and V must be long enough to be divided into blocks of size Lq.
-    # For N > L, we need to use a smaller block_size that divides both N and works with L.
-    # Skip the problematic case for now (when N > L and block_size would be N).
-    # This is a limitation of the current implementation.
-    if N > L:
-        # Use a smaller block_size that works with both N and L
-        block_size = min(N, L) if L > 0 else N
-        # Ensure block_size divides N
-        while N % block_size != 0 and block_size > 1:
-            block_size -= 1
-        output = masked_attention_via_map(Q, K, V, is_causal=False, block_size=block_size)
-    else:
-        output = masked_attention_via_map(Q, K, V, is_causal=False)
+    output = masked_attention_via_map(Q, K, V, is_causal=False)
+    expected = jax.nn.dot_product_attention(Q, K, V, implementation="xla")
     
     assert output.shape == (N, Hq, d)
+    assert_outputs_close(output, expected, test_name=f"different_lengths_{N}_{L}")
 
 
 def test_masked_attention_large_scale():
@@ -1903,4 +1971,3 @@ def test_masked_attention_window_size_gradients_with_mask():
     if has_valid_V:
         valid_V_grads = grad_V_jax[~jnp.isnan(grad_V_jax)]
         assert not jnp.allclose(valid_V_grads, 0.0), "At least some V gradients should be non-zero"
-

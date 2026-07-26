@@ -78,7 +78,9 @@ def _attn_kq_block_fn(
     )(q_block, k_block)
     
     mask = rearrange(mask, "B Lq (Hkv MQA) Lk -> B Lq Hkv MQA Lk", Hkv=Hkv)
-    scores = scores * mask
+    # Multiplication is unsafe when a custom kernel overflows: inf * 0 is NaN.
+    # Masked positions have zero unnormalised weight.
+    scores = jnp.where(mask, scores, jnp.zeros_like(scores))
     
     local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [B, Lq, Hkv, MQA_factor, 1]
 
@@ -194,7 +196,10 @@ def _attn_block_fn(
             )
             return (normalizer, running_values)
 
-        upper_bound = block_idx + 1
+        # Cross-attention may contain more query blocks than key/value blocks.
+        # Clamp the bound instead of relying on JAX's clipped out-of-bounds
+        # indexing, which would process the final K/V block repeatedly.
+        upper_bound = jnp.minimum(block_idx + 1, num_blocks)
         normalizer, running_values = jax.lax.fori_loop(
             0, upper_bound, body_fn, init_carry
         )
@@ -236,7 +241,7 @@ def _masked_attention_via_map(
     else:
         left_window_blocks = right_window_blocks = None
 
-    assert d == dq and Lv == L and dv == d, (
+    assert d == dq and Lv == L, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
     )
 
@@ -322,7 +327,7 @@ def _masked_attention_via_map_bwd(
     else:
         left_window_blocks = right_window_blocks = None
 
-    assert d == dq and Lv == L and dv == d, (
+    assert d == dq and Lv == L, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
     )
     assert Bk == Bq == Bv, "Q, K, and V must have the same batch dimension"
@@ -412,15 +417,31 @@ def _pad_for_block_size(Q, K, V, block_size, mask_fn):
     N = Q.shape[1]
     L = K.shape[1]
 
-    if block_size is None or N % block_size == 0:
+    if block_size is None:
+        block_size = N
+
+    padding_size_Q = (-N) % block_size
+    padding_size_KV = (-L) % block_size
+    if padding_size_Q == 0 and padding_size_KV == 0:
         return Q, K, V, mask_fn, 0
 
-    padding_size_Q = block_size - (N % block_size)
-    Q = jnp.pad(Q, ((0, 0), (0, padding_size_Q), (0, 0), (0, 0)), mode="constant")
-
-    padding_size_KV = block_size - (L % block_size)
-    K = jnp.pad(K, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode="constant")
-    V = jnp.pad(V, ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)), mode="constant")
+    if padding_size_Q:
+        Q = jnp.pad(
+            Q,
+            ((0, 0), (0, padding_size_Q), (0, 0), (0, 0)),
+            mode="constant",
+        )
+    if padding_size_KV:
+        K = jnp.pad(
+            K,
+            ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)),
+            mode="constant",
+        )
+        V = jnp.pad(
+            V,
+            ((0, 0), (0, padding_size_KV), (0, 0), (0, 0)),
+            mode="constant",
+        )
 
     unpadded_mask_fn = mask_fn
     mask_fn = lambda b, h, q, k: unpadded_mask_fn(b, h, q, k) & (q < N) & (k < L)
@@ -486,13 +507,28 @@ def masked_attention_via_map(
 
     if not (K.shape[0] == Q.shape[0] == V.shape[0]):
         raise ValueError("Q, K, and V must have the same batch dimension")
+    if K.shape[1] != V.shape[1]:
+        raise ValueError("K and V must have the same sequence length")
+    if K.shape[2] != V.shape[2]:
+        raise ValueError("K and V must have the same number of heads")
+    if K.shape[3] != Q.shape[3]:
+        raise ValueError("Q and K must have the same feature dimension")
+    if block_size is not None and block_size <= 0:
+        raise ValueError("block_size must be positive")
 
     # Canonicalize mask_fn to 4-arg form
     mask_fn = _canonicalize_mask_fn(mask_fn, is_causal)
 
     # Pad for block_size if needed
     N = Q.shape[1]
-    Q, K, V, mask_fn, padding_size = _pad_for_block_size(Q, K, V, block_size, mask_fn)
+    effective_block_size = Q.shape[1] if block_size is None else block_size
+    Q, K, V, mask_fn, padding_size = _pad_for_block_size(
+        Q,
+        K,
+        V,
+        effective_block_size,
+        mask_fn,
+    )
 
     # Core computation
     result = _masked_attention_via_map(
@@ -501,7 +537,7 @@ def masked_attention_via_map(
         V,
         kernel_fn=kernel_fn,
         mask_fn=mask_fn,
-        block_size=block_size,
+        block_size=effective_block_size,
         window_size=window_size,
         is_causal=is_causal,
     )
