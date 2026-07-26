@@ -81,13 +81,6 @@ def _materialize_mask(mask_fn, B, Hq, Hkv, q_idx, k_idx):
     )
 
 
-def _attention_dot_precision(dtype):
-    """Use tensor-core operand precision for low-precision attention inputs."""
-    if jnp.dtype(dtype).itemsize < jnp.dtype(jnp.float32).itemsize:
-        return jax.lax.Precision.DEFAULT
-    return jax.lax.Precision.HIGHEST
-
-
 def _attn_kq_block_fn(
     max_score,  # [B, Lq, Hq]
     normalizer,  # [B, Lq, Hq]
@@ -110,8 +103,6 @@ def _attn_kq_block_fn(
         v_block.dtype,
         jnp.float32,
     )
-    dot_precision = _attention_dot_precision(q_block.dtype)
-
     q_block = rearrange(q_block, "B Lq (Hkv MQA) dq -> B Lq Hkv MQA dq", Hkv=Hkv)
 
     mask = _materialize_mask(mask_fn, B, Hq, Hkv, q_idx, k_idx)
@@ -136,7 +127,7 @@ def _attn_kq_block_fn(
             "bqhmd,bkhd->bqhmk",
             q_block,
             k_block,
-            precision=dot_precision,
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=accumulator_dtype,
         )
         scores = scores / jnp.sqrt(jnp.asarray(dq, dtype=accumulator_dtype))
@@ -162,7 +153,7 @@ def _attn_kq_block_fn(
             "bqhmk,bkhe->bqhme",
             probabilities,
             v_block,
-            precision=dot_precision,
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=accumulator_dtype,
         )
 
@@ -457,7 +448,7 @@ def _masked_attention_via_map_impl(
     block_idx = jnp.arange(N//block_size)
 
     values, log_normalizer = jax.lax.map(
-        jax.checkpoint(attn_fn),
+        attn_fn,
         (block_idx, q_idx, Q),
     )
 
@@ -479,6 +470,7 @@ def _masked_attention_via_map_impl(
         "kv_block_size",
         "window_size",
         "is_causal",
+        "backward_strategy",
     ],
 )
 def _masked_attention_via_map(
@@ -491,7 +483,9 @@ def _masked_attention_via_map(
     kv_block_size=None,
     window_size=None,
     is_causal=False,
+    backward_strategy="auto",
 ) -> Array:
+    del backward_strategy
     values, _ = _masked_attention_via_map_impl(
         Q,
         K,
@@ -516,8 +510,8 @@ def _masked_attention_via_map_fwd(
     kv_block_size=None,
     window_size=None,
     is_causal=False,
+    backward_strategy="auto",
 ) -> Tuple[Array, Tuple[Array, Array, Array, Array, Array]]:
-
     values, log_normalizer = _masked_attention_via_map_impl(
         Q,
         K,
@@ -529,6 +523,7 @@ def _masked_attention_via_map_fwd(
         window_size=window_size,
         is_causal=is_causal,
     )
+    del backward_strategy
     return values, (Q, K, V, values, log_normalizer)
 
 
@@ -627,7 +622,7 @@ def _standard_attention_backward_query_major(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = _attention_dot_precision(Q.dtype)
+    dot_precision = jax.lax.Precision.HIGHEST
 
     q_blocks = rearrange(
         Q,
@@ -654,7 +649,8 @@ def _standard_attention_backward_query_major(
         Hkv=Hkv,
     )
     delta_blocks = jnp.sum(
-        grad_blocks * output_blocks,
+        grad_blocks.astype(accumulator_dtype)
+        * output_blocks.astype(accumulator_dtype),
         axis=-1,
         keepdims=True,
     )
@@ -754,7 +750,7 @@ def _standard_attention_backward_query_major(
             kv_block_backward,
             (dQ, dK, dV),
         )
-        return (dK, dV), dQ
+        return (dK, dV), dQ.astype(Q.dtype)
 
     (dK, dV), dQ = jax.lax.scan(
         query_block_backward,
@@ -799,7 +795,7 @@ def _standard_attention_backward_key_major(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = _attention_dot_precision(Q.dtype)
+    dot_precision = jax.lax.Precision.HIGHEST
 
     q_blocks = rearrange(
         Q,
@@ -826,7 +822,8 @@ def _standard_attention_backward_key_major(
         Hkv=Hkv,
     )
     delta_blocks = jnp.sum(
-        grad_blocks * output_blocks,
+        grad_blocks.astype(accumulator_dtype)
+        * output_blocks.astype(accumulator_dtype),
         axis=-1,
         keepdims=True,
     )
@@ -950,7 +947,7 @@ def _standard_attention_backward_key_major(
     return dQ.astype(Q.dtype), dK, dV
 
 
-def _standard_attention_backward(
+def _standard_attention_backward_two_pass(
     Q,
     K,
     V,
@@ -963,7 +960,242 @@ def _standard_attention_backward(
     window_size,
     is_causal,
 ):
+    """Minimize memory by completing Q and K/V gradients in separate passes."""
+    B, N, Hq, d = Q.shape
+    _, L, Hkv, _ = K.shape
+    accumulator_dtype = jnp.result_type(
+        Q.dtype,
+        K.dtype,
+        V.dtype,
+        upstream_grad.dtype,
+        jnp.float32,
+    )
+    scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
+    dot_precision = jax.lax.Precision.HIGHEST
+
+    q_blocks = rearrange(
+        Q,
+        "B (Q Qb) (Hkv G) d -> Q B Qb Hkv G d",
+        Qb=block_size,
+        Hkv=Hkv,
+    )
+    output_blocks = rearrange(
+        output,
+        "B (Q Qb) (Hkv G) dv -> Q B Qb Hkv G dv",
+        Qb=block_size,
+        Hkv=Hkv,
+    )
+    grad_blocks = rearrange(
+        upstream_grad,
+        "B (Q Qb) (Hkv G) dv -> Q B Qb Hkv G dv",
+        Qb=block_size,
+        Hkv=Hkv,
+    )
+    log_normalizer_blocks = rearrange(
+        log_normalizer,
+        "B (Q Qb) (Hkv G) -> Q B Qb Hkv G 1",
+        Qb=block_size,
+        Hkv=Hkv,
+    )
+    delta_blocks = jnp.sum(
+        grad_blocks.astype(accumulator_dtype)
+        * output_blocks.astype(accumulator_dtype),
+        axis=-1,
+        keepdims=True,
+    )
+    k_blocks = rearrange(
+        K,
+        "B (K Kb) Hkv d -> K B Kb Hkv d",
+        Kb=kv_block_size,
+    )
+    v_blocks = rearrange(
+        V,
+        "B (K Kb) Hkv dv -> K B Kb Hkv dv",
+        Kb=kv_block_size,
+    )
+
+    num_q_blocks = q_blocks.shape[0]
+    num_kv_blocks = k_blocks.shape[0]
+    q_indices = jnp.reshape(jnp.arange(N), (num_q_blocks, block_size))
+    k_indices = jnp.reshape(jnp.arange(L), (num_kv_blocks, kv_block_size))
+    kv_block_indices = jnp.arange(num_kv_blocks)
+    window_left, total_window_blocks = _window_block_config(
+        window_size,
+        block_size,
+        kv_block_size,
+        num_kv_blocks,
+    )
+
+    def query_gradient(query_data):
+        q_idx, q_block, grad_block, delta_block, lse_block = query_data
+        dQ = jnp.zeros(q_block.shape, dtype=accumulator_dtype)
+
+        if window_left is not None:
+            kv_start = jnp.maximum(
+                0,
+                jnp.floor_divide(q_idx[0] - window_left, kv_block_size),
+            )
+            kv_start = jnp.minimum(
+                kv_start,
+                num_kv_blocks - total_window_blocks,
+            )
+            kv_stop = kv_start + total_window_blocks
+        else:
+            kv_start = 0
+            kv_stop = num_kv_blocks
+
+        if is_causal:
+            causal_stop = jnp.minimum(
+                jnp.floor_divide(q_idx[-1], kv_block_size) + 1,
+                num_kv_blocks,
+            )
+            kv_stop = jnp.minimum(kv_stop, causal_stop)
+
+        def accumulate(kv_block_idx, dQ_acc):
+            dQ_block, _, _ = _standard_attention_tile_backward(
+                q_block,
+                k_blocks[kv_block_idx],
+                v_blocks[kv_block_idx],
+                grad_block,
+                delta_block,
+                lse_block,
+                q_idx,
+                k_indices[kv_block_idx],
+                mask_fn,
+                B,
+                Hq,
+                Hkv,
+                scale,
+                accumulator_dtype,
+                dot_precision,
+            )
+            return dQ_acc + dQ_block
+
+        dQ = jax.lax.fori_loop(kv_start, kv_stop, accumulate, dQ)
+        return dQ.astype(Q.dtype)
+
+    dQ = jax.lax.map(
+        query_gradient,
+        (
+            q_indices,
+            q_blocks,
+            grad_blocks,
+            delta_blocks,
+            log_normalizer_blocks,
+        ),
+    )
+
+    def kv_gradients(key_data):
+        kv_block_idx, k_idx, k_block, v_block = key_data
+        dK = jnp.zeros(k_block.shape, dtype=accumulator_dtype)
+        dV = jnp.zeros(v_block.shape, dtype=accumulator_dtype)
+
+        if is_causal:
+            q_start = jnp.minimum(
+                jnp.floor_divide(k_idx[0], block_size),
+                num_q_blocks,
+            )
+        else:
+            q_start = 0
+
+        def accumulate(query_block_idx, dK_dV):
+            dK_acc, dV_acc = dK_dV
+            q_idx = q_indices[query_block_idx]
+
+            def update(block_state):
+                dK_carry, dV_carry = block_state
+                _, dK_block, dV_block = _standard_attention_tile_backward(
+                    q_blocks[query_block_idx],
+                    k_block,
+                    v_block,
+                    grad_blocks[query_block_idx],
+                    delta_blocks[query_block_idx],
+                    log_normalizer_blocks[query_block_idx],
+                    q_idx,
+                    k_idx,
+                    mask_fn,
+                    B,
+                    Hq,
+                    Hkv,
+                    scale,
+                    accumulator_dtype,
+                    dot_precision,
+                )
+                return dK_carry + dK_block, dV_carry + dV_block
+
+            if window_left is not None:
+                window_start = jnp.maximum(
+                    0,
+                    jnp.floor_divide(
+                        q_idx[0] - window_left,
+                        kv_block_size,
+                    ),
+                )
+                window_start = jnp.minimum(
+                    window_start,
+                    num_kv_blocks - total_window_blocks,
+                )
+                process_block = (kv_block_idx >= window_start) & (
+                    kv_block_idx < window_start + total_window_blocks
+                )
+                return jax.lax.cond(
+                    process_block,
+                    update,
+                    lambda block_state: block_state,
+                    (dK_acc, dV_acc),
+                )
+
+            return update((dK_acc, dV_acc))
+
+        dK, dV = jax.lax.fori_loop(
+            q_start,
+            num_q_blocks,
+            accumulate,
+            (dK, dV),
+        )
+        return dK.astype(K.dtype), dV.astype(V.dtype)
+
+    dK, dV = jax.lax.map(
+        kv_gradients,
+        (kv_block_indices, k_indices, k_blocks, v_blocks),
+    )
+
+    dQ = rearrange(dQ, "Q B Qb Hkv G d -> B (Q Qb) (Hkv G) d")
+    dK = rearrange(dK, "K B Kb Hkv d -> B (K Kb) Hkv d")
+    dV = rearrange(dV, "K B Kb Hkv dv -> B (K Kb) Hkv dv")
+    return dQ, dK, dV
+
+
+def _standard_attention_backward(
+    Q,
+    K,
+    V,
+    output,
+    log_normalizer,
+    upstream_grad,
+    mask_fn,
+    block_size,
+    kv_block_size,
+    window_size,
+    is_causal,
+    backward_strategy,
+):
     """Choose the traversal with the smaller full-precision gradient carry."""
+    if backward_strategy == "minimal":
+        return _standard_attention_backward_two_pass(
+            Q,
+            K,
+            V,
+            output,
+            log_normalizer,
+            upstream_grad,
+            mask_fn,
+            block_size,
+            kv_block_size,
+            window_size,
+            is_causal,
+        )
+
     query_carry_size = math.prod(Q.shape)
     kv_carry_size = math.prod(K.shape) + math.prod(V.shape)
     implementation = (
@@ -993,6 +1225,7 @@ def _masked_attention_via_map_bwd(
     kv_block_size,
     window_size,
     is_causal,
+    backward_strategy,
     res,
     upstream_grad,
 ):
@@ -1041,6 +1274,7 @@ def _masked_attention_via_map_bwd(
             kv_block_size,
             window_size,
             is_causal,
+            backward_strategy,
         )
 
     def attn_fn(dK_dV, block_idx_q_idx_q_g):
@@ -1162,9 +1396,7 @@ def _pad_for_block_sizes(
 def _default_attention_block_sizes(Q, K, V, kv_block_size):
     """Choose tiles that keep the FP32 score tile near 32 MiB."""
     batch_size, query_length, query_heads, _ = Q.shape
-    kv_length = K.shape[1]
-    if kv_block_size is None:
-        kv_block_size = min(kv_length, 1024)
+    _, kv_length, kv_heads, _ = K.shape
 
     accumulator_dtype = jnp.result_type(
         Q.dtype,
@@ -1174,19 +1406,44 @@ def _default_attention_block_sizes(Q, K, V, kv_block_size):
     )
     score_element_bytes = jnp.dtype(accumulator_dtype).itemsize
     target_score_tile_bytes = 32 * 1024 * 1024
-    query_capacity = max(
+    tile_element_capacity = max(
         1,
         target_score_tile_bytes
-        // (
-            batch_size
-            * query_heads
-            * kv_block_size
-            * score_element_bytes
-        ),
+        // (batch_size * query_heads * score_element_bytes),
     )
-    query_block_size = 1 << (query_capacity.bit_length() - 1)
-    query_block_size = min(2048, max(64, query_block_size))
+
+    def bounded_power_of_two(capacity, upper_bound):
+        block_size = 1 << (max(1, capacity).bit_length() - 1)
+        return min(upper_bound, max(64, block_size))
+
+    if kv_block_size is not None:
+        query_capacity = tile_element_capacity // kv_block_size
+        query_block_size = bounded_power_of_two(query_capacity, 2048)
+        return min(query_length, query_block_size), kv_block_size
+
+    query_carry_size = query_length * query_heads * Q.shape[-1]
+    kv_carry_size = kv_length * kv_heads * (K.shape[-1] + V.shape[-1])
+    if query_carry_size > kv_carry_size:
+        # Query-major backward benefits from a balanced score tile.
+        query_block_size = bounded_power_of_two(
+            math.isqrt(tile_element_capacity),
+            2048,
+        )
+        kv_capacity = tile_element_capacity // query_block_size
+        kv_block_size = bounded_power_of_two(kv_capacity, 1024)
+    else:
+        # Key-major backward favors a wider query tile on the tested GPU.
+        kv_block_size = min(kv_length, 1024)
+        query_capacity = tile_element_capacity // kv_block_size
+        query_block_size = bounded_power_of_two(query_capacity, 2048)
+        if query_block_size < kv_block_size:
+            query_block_size, kv_block_size = (
+                kv_block_size,
+                query_block_size,
+            )
+
     query_block_size = min(query_length, query_block_size)
+    kv_block_size = min(kv_length, kv_block_size)
     return query_block_size, kv_block_size
 
 
@@ -1201,6 +1458,7 @@ def masked_attention_via_map(
     block_size: Optional[int] = None,
     kv_block_size: Optional[int] = None,
     window_size: Optional[Tuple[int, int]] = None,
+    backward_strategy: str = "auto",
 ) -> Array:
     """
     attention implementation that uses jax.lax.map to perform attention in a memory-efficient way
@@ -1212,6 +1470,8 @@ def masked_attention_via_map(
     is_causal: if true, apply a causal mask
     kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
         default is q, k -> jnp.exp( <q, k> / sqrt(d) )
+        The default kernel uses ``jax.lax.Precision.HIGHEST`` contractions and
+        accumulates low-precision inputs in at least FP32 in both passes.
     mask_fn: takes integers b, h, q, k or h, q, kand returns a boolean specifying
         the attention mask for the bth item in batch, hth head and the qth query and kth key.
         If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
@@ -1230,6 +1490,11 @@ def masked_attention_via_map(
         will be even larger for keys or values near the edges of the sequence. This parameter is indended
         to control performance rather than for exact masking.
         Use the  mask_fn to explicitly enforce a constant window size if desired.
+    backward_strategy: ``"auto"`` uses a one-pass backward and carries whichever
+        full-precision gradient set is smaller. ``"minimal"`` recomputes score
+        tiles in separate Q and K/V passes so no sequence-sized FP32 gradient
+        is carried, trading additional compute for lower peak memory. Neither
+        strategy changes contraction or accumulation precision.
     """
 
     # Validate dimensions
@@ -1262,6 +1527,8 @@ def masked_attention_via_map(
         raise ValueError("block_size must be positive")
     if kv_block_size is not None and kv_block_size <= 0:
         raise ValueError("kv_block_size must be positive")
+    if backward_strategy not in ("auto", "minimal"):
+        raise ValueError("backward_strategy must be 'auto' or 'minimal'")
 
     # Canonicalize mask_fn to 4-arg form
     mask_fn = _canonicalize_mask_fn(mask_fn, is_causal)
@@ -1302,6 +1569,7 @@ def masked_attention_via_map(
         kv_block_size=effective_kv_block_size,
         window_size=window_size,
         is_causal=is_causal,
+        backward_strategy=backward_strategy,
     )
 
     # Remove padding and batch dimension

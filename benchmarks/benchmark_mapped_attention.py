@@ -36,6 +36,7 @@ class Case:
     head_dim: int
     dtype: str
     causal: bool
+    mapped_backward_strategy: str
     warmup: int
     iterations: int
     seed: int
@@ -68,6 +69,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-dim", type=_positive_int, default=64)
     parser.add_argument("--dtype", choices=DTYPES, default="float16")
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--mapped-backward-strategy",
+        choices=("auto", "minimal"),
+        default="auto",
+    )
     parser.add_argument("--warmup", type=_positive_int, default=2)
     parser.add_argument("--iterations", type=_positive_int, default=5)
     parser.add_argument("--case-timeout-seconds", type=_positive_float, default=300)
@@ -145,6 +151,7 @@ def _make_function(case: Case) -> Any:
                 block_size=case.block_size,
                 kv_block_size=case.kv_block_size,
                 is_causal=case.causal,
+                backward_strategy=case.mapped_backward_strategy,
             )
 
     else:
@@ -290,8 +297,8 @@ def _format_bytes(value: int | None) -> str:
 
 def _print_results(results: list[dict[str, Any]]) -> None:
     heading = (
-        "seq | qblk | kvblk | mode | implementation | median | tokens/s | "
-        "device peak* | compiler temp | status"
+        "seq | qblk | kvblk | strategy | mode | implementation | median | "
+        "tokens/s | device peak* | compiler temp | status"
     )
     print(heading)
     print("-" * len(heading))
@@ -310,7 +317,8 @@ def _print_results(results: list[dict[str, Any]]) -> None:
             status = f"{result.get('error_type')}: {result.get('error')}"
         print(
             f"{case['seq_len']:>3} | {case['block_size']:>4} | "
-            f"{case['kv_block_size']:>5} | {case['mode']:<8} | "
+            f"{case['kv_block_size']:>5} | "
+            f"{case['mapped_backward_strategy']:<8} | {case['mode']:<8} | "
             f"{case['implementation']:<14} | {latency:>9} | "
             f"{throughput:>9} | {peak:>12} | {temporary:>13} | {status}"
         )
@@ -348,6 +356,7 @@ def main() -> int:
             head_dim=args.head_dim,
             dtype=args.dtype,
             causal=args.causal,
+            mapped_backward_strategy=args.mapped_backward_strategy,
             warmup=args.warmup,
             iterations=args.iterations,
             seed=args.seed,

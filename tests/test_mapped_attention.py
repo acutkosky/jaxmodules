@@ -494,18 +494,32 @@ def test_masked_attention_default_tiles_bound_score_memory():
     """The automatic policy does not use a full long-context score tile."""
     from jaxmodules.attention import _default_attention_block_sizes
 
-    query = jax.ShapeDtypeStruct((2, 32768, 8, 64), jnp.float16)
-    key = jax.ShapeDtypeStruct((2, 32768, 8, 64), jnp.float16)
-    value = jax.ShapeDtypeStruct((2, 32768, 8, 64), jnp.float16)
-
-    query_block_size, kv_block_size = _default_attention_block_sizes(
-        query,
-        key,
-        value,
-        None,
+    shapes_and_expected_tiles = (
+        ((2, 32768, 8, 8), (1024, 512)),
+        ((1, 32768, 32, 8), (512, 512)),
+        ((1, 8192, 4, 4), (2048, 1024)),
     )
+    for shape_spec, expected_tiles in shapes_and_expected_tiles:
+        batch_size, length, query_heads, kv_heads = shape_spec
+        query = jax.ShapeDtypeStruct(
+            (batch_size, length, query_heads, 64),
+            jnp.float16,
+        )
+        key = jax.ShapeDtypeStruct(
+            (batch_size, length, kv_heads, 64),
+            jnp.float16,
+        )
+        value = jax.ShapeDtypeStruct(
+            (batch_size, length, kv_heads, 64),
+            jnp.float16,
+        )
 
-    assert (query_block_size, kv_block_size) == (512, 1024)
+        assert _default_attention_block_sizes(
+            query,
+            key,
+            value,
+            None,
+        ) == expected_tiles
 
 
 def test_masked_attention_independent_tile_gradients():
@@ -558,6 +572,69 @@ def test_masked_attention_independent_tile_gradients():
         assert jnp.allclose(
             mapped_gradient,
             expected_gradient,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize("use_window", [False, True])
+def test_masked_attention_minimal_backward_matches_auto(use_window):
+    """Two-pass backward preserves the one-pass FP32 accumulation result."""
+    length, query_heads, kv_heads, dim = 9, 4, 2, 8
+    query, key, value, cotangent = (
+        jax.random.normal(random_key, shape)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(34), 4),
+            (
+                (length, query_heads, dim),
+                (length, kv_heads, dim),
+                (length, kv_heads, dim),
+                (length, query_heads, dim),
+            ),
+        )
+    )
+
+    def sliding_window_mask(head, q, k):
+        del head
+        return abs(q - k) <= 2
+
+    attention_kwargs = (
+        {
+            "mask_fn": sliding_window_mask,
+            "window_size": (2, 2),
+        }
+        if use_window
+        else {"is_causal": True}
+    )
+
+    def loss(q, k, v, strategy):
+        output = masked_attention_via_map(
+            q,
+            k,
+            v,
+            block_size=4,
+            kv_block_size=6,
+            backward_strategy=strategy,
+            **attention_kwargs,
+        )
+        return jnp.vdot(output, cotangent)
+
+    auto_gradients = jax.grad(
+        lambda q, k, v: loss(q, k, v, "auto"),
+        argnums=(0, 1, 2),
+    )(query, key, value)
+    minimal_gradients = jax.grad(
+        lambda q, k, v: loss(q, k, v, "minimal"),
+        argnums=(0, 1, 2),
+    )(query, key, value)
+
+    for auto_gradient, minimal_gradient in zip(
+        auto_gradients,
+        minimal_gradients,
+    ):
+        assert jnp.allclose(
+            minimal_gradient,
+            auto_gradient,
             rtol=1e-5,
             atol=1e-6,
         )

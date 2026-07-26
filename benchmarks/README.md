@@ -67,6 +67,14 @@ uv run python benchmarks/benchmark_mapped_attention.py \
   --iterations 10
 ```
 
+Mapped backward uses the faster one-pass strategy by default. To benchmark the
+two-pass variant that eliminates sequence-sized FP32 gradient carries, pass
+`--mapped-backward-strategy minimal`.
+
+The mapped standard-attention path always uses
+`jax.lax.Precision.HIGHEST` contractions and at least FP32 accumulation.
+Tile and backward-strategy sweeps do not relax that precision policy.
+
 cuDNN results are reported as unavailable when the current backend or input
 configuration does not support cuDNN attention. The XLA and mapped
 implementations remain usable on CPU.
