@@ -10,7 +10,6 @@ def test_einsum_basic_operations():
     """Test basic einsum operations comparing jaxmodules.einsum to einops.einsum"""
     # Set JAX to use CPU with 64-bit precision
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     
     # Test cases with different einsum patterns
@@ -123,7 +122,6 @@ def test_einsum_basic_operations():
 def test_einsum_edge_cases():
     """Test edge cases and special patterns"""
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     
     # Test with single element
@@ -150,7 +148,6 @@ def test_einsum_edge_cases():
 def test_einsum_numerical_stability():
     """Test numerical stability with various input ranges"""
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     
     # Test with very small values
@@ -176,7 +173,6 @@ def test_einsum_numerical_stability():
 def test_einsum_complex_patterns():
     """Test more complex einsum patterns"""
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     
     # Test with multiple contractions
@@ -200,7 +196,6 @@ def test_einsum_complex_patterns():
 def test_einsum_error_cases():
     """Test that appropriate errors are raised for invalid patterns"""
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     
     a = jax.random.normal(jax.random.PRNGKey(0), (2, 4))
@@ -219,7 +214,6 @@ def test_einsum_error_cases():
 def test_einsum_performance_comparison():
     """Test performance comparison between the two implementations"""
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     # Use larger tensors to see performance differences
     a = jax.random.normal(jax.random.PRNGKey(0), (10, 10, 10))
@@ -259,7 +253,6 @@ def test_einsum_performance_comparison():
 def test_einsum_accuracy_comparison():
     """Test accuracy comparison between the two implementations"""
     jax.config.update('jax_platform_name', 'cpu')
-    jax.config.update('jax_default_dtype_bits', '64')
     jax.config.update('jax_enable_x64', True)
     # Use larger tensors to see performance differences
     a = jax.random.normal(jax.random.PRNGKey(0), (10, 10, 10))
@@ -274,7 +267,6 @@ def test_einsum_accuracy_comparison():
     result_einops = jeein(a, b, 'i j k, j k l -> i l')
 
     jax.config.update('jax_platform_name', 'cuda')
-    jax.config.update('jax_default_dtype_bits', '32')
     jax.config.update('jax_enable_x64', False)
     gpus = jax.devices("gpu")
 
@@ -291,5 +283,4 @@ def test_einsum_accuracy_comparison():
     result_jaxmodules_32 = jmein(a, b, 'i j k, j k l -> i l')
     result_einops_32 = jeein(a, b, 'i j k, j k l -> i l')
     assert jnp.sum((result_jaxmodules_32 - result_einops)**2) < jnp.sum((result_einops_32 - result_einops)**2)
-
 

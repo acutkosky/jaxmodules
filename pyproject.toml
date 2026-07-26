@@ -10,7 +10,7 @@ authors = [
 ]
 description = "some potentially useful jax functions"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -18,8 +18,13 @@ classifiers = [
 ]
 dependencies = [
   "einops",
-  "equinox",
-  "jax"
+  "equinox>=0.13.8",
+  "jax>=0.11,<0.12"
+]
+
+[project.optional-dependencies]
+cuda12 = [
+  "jax[cuda12]>=0.11,<0.12",
 ]
 
 [dependency-groups]
@@ -68,8 +73,8 @@ line-length = 88
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
-# Assume Python 3.8
-target-version = "py38"
+# Match the project's minimum supported Python version.
+target-version = "py312"
 
 [tool.ruff.format]
 # Use double quotes for strings.
