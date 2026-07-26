@@ -49,9 +49,21 @@ def default_kernel(q, k):
     """
     return jnp.exp(jnp.dot(q, k) / jnp.sqrt(k.shape[-1]))
 
+
+def _unmasked(b, h, q, k):
+    del b, h, q, k
+    return True
+
+
+def _causal_mask(b, h, q, k):
+    del b, h
+    return q >= k
+
+
 def _attn_kq_block_fn(
-    normalizer, # [B, Lq, Hq]
-    running_values, # [B, Lq, Hq, dv]
+    max_score,  # [B, Lq, Hq]
+    normalizer,  # [B, Lq, Hq]
+    numerator,  # [B, Lq, Hq, dv]
     q_idx, # [Lq]
     k_idx, # [Lk]
     q_block, # [B, Lq, Hq, dq]
@@ -64,47 +76,111 @@ def _attn_kq_block_fn(
     _, Lk, Hkv, _ = k_block.shape
     _, _, _, dv = v_block.shape
     MQA_factor = Hq // Hkv
+    accumulator_dtype = jnp.result_type(
+        q_block.dtype,
+        k_block.dtype,
+        v_block.dtype,
+        jnp.float32,
+    )
 
     q_block = rearrange(q_block, "B Lq (Hkv MQA) dq -> B Lq Hkv MQA dq", Hkv=Hkv)
 
-    mask = fancy_vmap(
-        mask_fn,
-        "mask[b, q, h, k] = mask_fn(B[b], Hq[h], q_idx[q], k_idx[k])"
-    )(jnp.arange(B), jnp.arange(Hq), q_idx, k_idx)
+    if mask_fn is _unmasked:
+        mask = True
+    elif mask_fn is _causal_mask:
+        mask = q_idx[None, :, None, None, None] >= k_idx[None, None, None, None, :]
+    else:
+        mask = fancy_vmap(
+            mask_fn,
+            "mask[b, q, h, k] = mask_fn(B[b], Hq[h], q_idx[q], k_idx[k])"
+        )(jnp.arange(B), jnp.arange(Hq), q_idx, k_idx)
+        mask = rearrange(
+            mask,
+            "B Lq (Hkv MQA) Lk -> B Lq Hkv MQA Lk",
+            Hkv=Hkv,
+        )
 
-    scores = fancy_vmap(
-        kernel_fn,
-        'scores[b, q, h, m, k] = kernel_fn(q_block[b, q, h, m, :], K[b, k, h, :])',
-    )(q_block, k_block)
-    
-    mask = rearrange(mask, "B Lq (Hkv MQA) Lk -> B Lq Hkv MQA Lk", Hkv=Hkv)
-    # Multiplication is unsafe when a custom kernel overflows: inf * 0 is NaN.
-    # Masked positions have zero unnormalised weight.
-    scores = jnp.where(mask, scores, jnp.zeros_like(scores))
-    
-    local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)  # [B, Lq, Hkv, MQA_factor, 1]
-
+    max_score = rearrange(
+        max_score,
+        "B Lq (Hkv MQA) -> B Lq Hkv MQA 1",
+        Hkv=Hkv,
+    )
     normalizer = rearrange(normalizer, "B Lq (Hkv MQA)-> B Lq Hkv MQA 1", Hkv=Hkv)
-    running_values = rearrange(running_values, "B Lq (Hkv MQA) dv -> B Lq Hkv MQA dv", Hkv=Hkv)
+    numerator = rearrange(
+        numerator,
+        "B Lq (Hkv MQA) dv -> B Lq Hkv MQA dv",
+        Hkv=Hkv,
+    )
 
+    if kernel_fn is default_kernel:
+        # Compute score tiles directly so XLA can lower the contraction as a
+        # batched matrix multiplication. Accumulate low-precision inputs in
+        # FP32, matching the usual scaled-dot-product attention policy.
+        scores = jnp.einsum(
+            "bqhmd,bkhd->bqhmk",
+            q_block,
+            k_block,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=accumulator_dtype,
+        )
+        scores = scores / jnp.sqrt(jnp.asarray(dq, dtype=accumulator_dtype))
+        scores = jnp.where(mask, scores, -jnp.inf)
 
-    unnormalized_values = einsum(scores, v_block, "B Lq Hkv MQA Lk, B Lk Hkv d -> B Lq Hkv MQA d")
+        local_max = jnp.max(scores, axis=-1, keepdims=True)
+        new_max_score = jnp.maximum(max_score, local_max)
+        # A fully masked prefix has max=-inf. Shift it by zero so that
+        # (-inf)-(-inf) cannot introduce NaNs.
+        safe_new_max = jnp.where(
+            jnp.isfinite(new_max_score),
+            new_max_score,
+            jnp.zeros_like(new_max_score),
+        )
+        previous_scale = jnp.where(
+            jnp.isfinite(max_score),
+            jnp.exp(max_score - safe_new_max),
+            jnp.zeros_like(max_score),
+        )
+        probabilities = jnp.exp(scores - safe_new_max)
+        local_normalizer = jnp.sum(probabilities, axis=-1, keepdims=True)
+        local_numerator = jnp.einsum(
+            "bqhmk,bkhe->bqhme",
+            probabilities,
+            v_block,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=accumulator_dtype,
+        )
 
-    new_normalizer = normalizer + local_normalizer
-    
-    # we want to divide by new_normalizer if it is nonzero, but it's not safe to do this via a single jnp.where
-    # because the backward pass will still pass through both branches and cause issues.
-    # Instead, we first make a (differentiable!) "safe" normalizer so that is used in the division.
-    # This way, there is no divide by zero in the backward pass, and the forward pass in unchanged because
-    # the safe normalize equals the original normalizer when it is nonzero.
-    # see https://github.com/jax-ml/jax/issues/1052 for more details.
-    safe_normalizer = jnp.where(new_normalizer > 0, new_normalizer, jnp.ones_like(new_normalizer))
-    running_values = jnp.where(new_normalizer > 0, running_values + (unnormalized_values - running_values * local_normalizer)/safe_normalizer, jnp.zeros_like(running_values))
+        new_normalizer = previous_scale * normalizer + local_normalizer
+        numerator = previous_scale * numerator + local_numerator
+        max_score = new_max_score
+    else:
+        # Compatibility path for arbitrary positive kernels. Such kernels
+        # expose weights rather than logits, so max-shifting is not generally
+        # available without changing their API.
+        scores = fancy_vmap(
+            kernel_fn,
+            (
+                "scores[b, q, h, m, k] = "
+                "kernel_fn(q_block[b, q, h, m, :], K[b, k, h, :])"
+            ),
+        )(q_block, k_block)
+        scores = jnp.asarray(scores, dtype=accumulator_dtype)
+        scores = jnp.where(mask, scores, jnp.zeros_like(scores))
 
+        local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)
+        local_numerator = einsum(
+            scores,
+            v_block,
+            "B Lq Hkv MQA Lk, B Lk Hkv d -> B Lq Hkv MQA d",
+        )
+        new_normalizer = normalizer + local_normalizer
+        numerator = numerator + local_numerator
+
+    max_score = rearrange(max_score, "B Lq Hkv MQA 1 -> B Lq (Hkv MQA)")
     normalizer = rearrange(new_normalizer, "B Lq Hkv MQA 1 -> B Lq (Hkv MQA)")
-    running_values = rearrange(running_values, "B Lq Hkv MQA dv -> B Lq (Hkv MQA) dv")
+    numerator = rearrange(numerator, "B Lq Hkv MQA dv -> B Lq (Hkv MQA) dv")
 
-    return normalizer, running_values
+    return max_score, normalizer, numerator
 
 def _make_attention_kq_scanner(
     mask_fn,
@@ -116,11 +192,12 @@ def _make_attention_kq_scanner(
         carry,
         blocks,
     ):
-        normalizer, running_values = carry
+        max_score, normalizer, numerator = carry
         k_idx, k_block, v_block = blocks
-        normalizer, running_values = _attn_kq_block_fn(
+        max_score, normalizer, numerator = _attn_kq_block_fn(
+            max_score,
             normalizer,
-            running_values,
+            numerator,
             q_idx,
             k_idx,
             q_block,
@@ -128,7 +205,7 @@ def _make_attention_kq_scanner(
             v_block,
             mask_fn,
             kernel_fn)
-        return (normalizer, running_values), None
+        return (max_score, normalizer, numerator), None
     return scan_fn
 
 
@@ -173,7 +250,17 @@ def _attn_block_fn(
         v_block = jax.lax.dynamic_slice_in_dim(v_block, idx_start, total_blocks, axis=0)
         num_blocks = total_blocks
 
-    init_carry = (jnp.zeros((B, Lq, Hq)), jnp.zeros((B, Lq, Hq, dv)))
+    accumulator_dtype = jnp.result_type(
+        q_block.dtype,
+        K.dtype,
+        V.dtype,
+        jnp.float32,
+    )
+    init_carry = (
+        jnp.full((B, Lq, Hq), -jnp.inf, dtype=accumulator_dtype),
+        jnp.zeros((B, Lq, Hq), dtype=accumulator_dtype),
+        jnp.zeros((B, Lq, Hq, dv), dtype=accumulator_dtype),
+    )
 
     if is_causal and use_causal_block_skipping and left_window_blocks is None:
         # Causal optimization: only process blocks 0..block_idx (inclusive)
@@ -182,10 +269,11 @@ def _attn_block_fn(
         # must use use_causal_block_skipping=False since fori_loop with dynamic
         # bounds doesn't support reverse-mode differentiation.
         def body_fn(i, carry):
-            normalizer, running_values = carry
-            normalizer, running_values = _attn_kq_block_fn(
+            max_score, normalizer, numerator = carry
+            max_score, normalizer, numerator = _attn_kq_block_fn(
+                max_score,
                 normalizer,
-                running_values,
+                numerator,
                 q_idx,
                 k_indices[i],
                 q_block,
@@ -194,25 +282,34 @@ def _attn_block_fn(
                 mask_fn,
                 kernel_fn,
             )
-            return (normalizer, running_values)
+            return (max_score, normalizer, numerator)
 
         # Cross-attention may contain more query blocks than key/value blocks.
         # Clamp the bound instead of relying on JAX's clipped out-of-bounds
         # indexing, which would process the final K/V block repeatedly.
         upper_bound = jnp.minimum(block_idx + 1, num_blocks)
-        normalizer, running_values = jax.lax.fori_loop(
+        max_score, normalizer, numerator = jax.lax.fori_loop(
             0, upper_bound, body_fn, init_carry
         )
     else:
         # Standard scan over all K/V blocks
         kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
-        (normalizer, running_values), _ = jax.lax.scan(
+        (max_score, normalizer, numerator), _ = jax.lax.scan(
             kq_scanner,
             init=init_carry,
             xs=(k_indices, k_block, v_block),
         )
 
-    return running_values
+    safe_normalizer = jnp.where(
+        normalizer > 0,
+        normalizer,
+        jnp.ones_like(normalizer),
+    )
+    return jnp.where(
+        normalizer[..., None] > 0,
+        numerator / safe_normalizer[..., None],
+        jnp.zeros_like(numerator),
+    )
 
 
 @partial(jax.custom_vjp, nondiff_argnames=['kernel_fn', 'mask_fn', 'block_size', 'window_size', 'is_causal'])
@@ -403,9 +500,9 @@ def _canonicalize_mask_fn(mask_fn, is_causal):
     if is_causal and mask_fn is not None:
         raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
     if is_causal:
-        return lambda b, h, q, k: q >= k
+        return _causal_mask
     if mask_fn is None:
-        return lambda b, h, q, k: True
+        return _unmasked
     return mask_fn
 
 

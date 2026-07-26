@@ -1045,7 +1045,51 @@ def test_masked_attention_edge_cases():
     
     output = masked_attention_via_map(Q, K, V)
     assert output.shape == (N, Hq, d)
-    # Should not crash and produce valid output
+    expected = jax.nn.dot_product_attention(Q, K, V, implementation="xla")
+    assert jnp.all(jnp.isfinite(output))
+    assert_outputs_close(
+        output,
+        expected,
+        test_name="large_logits",
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_masked_attention_fully_masked_rows_are_finite():
+    """Fully masked rows produce defined zero outputs and gradients."""
+    query, key, value = (
+        jax.random.normal(random_key, (6, 2, 8))
+        for random_key in jax.random.split(jax.random.PRNGKey(26), 3)
+    )
+
+    def no_attention(head, query_index, key_index):
+        del head, query_index, key_index
+        return False
+
+    def loss(q, k, v):
+        return jnp.sum(
+            masked_attention_via_map(
+                q,
+                k,
+                v,
+                mask_fn=no_attention,
+                block_size=2,
+            )
+        )
+
+    output = masked_attention_via_map(
+        query,
+        key,
+        value,
+        mask_fn=no_attention,
+        block_size=2,
+    )
+    gradients = jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
+
+    assert jnp.array_equal(output, jnp.zeros_like(output))
+    assert all(jnp.all(jnp.isfinite(gradient)) for gradient in gradients)
+    assert all(jnp.array_equal(gradient, jnp.zeros_like(gradient)) for gradient in gradients)
 
 
 def test_masked_attention_error_cases():
