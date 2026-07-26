@@ -48,6 +48,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--implementation", choices=IMPLEMENTATIONS, action="append")
@@ -63,6 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", type=_positive_int, default=2)
     parser.add_argument("--iterations", type=_positive_int, default=5)
+    parser.add_argument("--case-timeout-seconds", type=_positive_float, default=300)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--worker-case", help=argparse.SUPPRESS)
@@ -232,14 +240,23 @@ def _worker_command(case: Case) -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), "--worker-case", payload]
 
 
-def _run_isolated(case: Case) -> dict[str, Any]:
-    completed = subprocess.run(  # noqa: S603 - command is constructed locally.
-        _worker_command(case),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=os.environ | {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"},
-    )
+def _run_isolated(case: Case, timeout_seconds: float) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(  # noqa: S603 - command is constructed locally.
+            _worker_command(case),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=os.environ | {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"},
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "case": asdict(case),
+            "status": "error",
+            "error_type": "WorkerTimeout",
+            "error": f"case exceeded {timeout_seconds:g} seconds",
+        }
     if completed.returncode:
         return {
             "case": asdict(case),
@@ -348,7 +365,7 @@ def main() -> int:
             f"(sequence length {case.seq_len})...",
             flush=True,
         )
-        results.append(_run_isolated(case))
+        results.append(_run_isolated(case, args.case_timeout_seconds))
 
     print()
     _print_results(results)

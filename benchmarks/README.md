@@ -41,6 +41,10 @@ statistics. The benchmark reports:
 - input-buffer baseline and peak allocation above that baseline;
 - compiler-estimated argument, output, temporary, and aliased bytes.
 
+Each worker is terminated after five minutes by default so a pathological
+compile or allocation does not prevent later implementations from running.
+Use `--case-timeout-seconds` to change that limit.
+
 Both forward and forward-plus-backward modes are measured by default. Pass
 `--mode forward` or `--mode backward` to select one.
 

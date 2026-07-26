@@ -490,6 +490,24 @@ def test_masked_attention_independent_tile_sizes(
     )
 
 
+def test_masked_attention_default_tiles_bound_score_memory():
+    """The automatic policy does not use a full long-context score tile."""
+    from jaxmodules.attention import _default_attention_block_sizes
+
+    query = jax.ShapeDtypeStruct((2, 32768, 8, 64), jnp.float16)
+    key = jax.ShapeDtypeStruct((2, 32768, 8, 64), jnp.float16)
+    value = jax.ShapeDtypeStruct((2, 32768, 8, 64), jnp.float16)
+
+    query_block_size, kv_block_size = _default_attention_block_sizes(
+        query,
+        key,
+        value,
+        None,
+    )
+
+    assert (query_block_size, kv_block_size) == (512, 1024)
+
+
 def test_masked_attention_independent_tile_gradients():
     """The explicit VJP supports different query and K/V tile sizes."""
     query_length, kv_length, heads, dim = 9, 11, 2, 8
