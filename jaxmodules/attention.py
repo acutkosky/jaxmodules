@@ -527,6 +527,54 @@ def _masked_attention_via_map_fwd(
     return values, (Q, K, V, values, log_normalizer)
 
 
+@partial(
+    jax.custom_vjp,
+    nondiff_argnames=[
+        "mask_fn",
+        "block_size",
+        "kv_block_size",
+        "window_size",
+        "is_causal",
+        "backward_strategy",
+    ],
+)
+def _masked_attention_via_mosaic(
+    Q: Array,
+    K: Array,
+    V: Array,
+    mask_fn,
+    block_size,
+    kv_block_size,
+    window_size,
+    is_causal,
+    backward_strategy,
+) -> Array:
+    """Mosaic forward paired with the established tiled custom backward."""
+    del block_size, kv_block_size, window_size, is_causal, backward_strategy
+    from jaxmodules._mosaic_attention import mosaic_attention_forward
+
+    values, _ = mosaic_attention_forward(Q, K, V, mask_fn)
+    return values
+
+
+def _masked_attention_via_mosaic_fwd(
+    Q,
+    K,
+    V,
+    mask_fn,
+    block_size,
+    kv_block_size,
+    window_size,
+    is_causal,
+    backward_strategy,
+):
+    del block_size, kv_block_size, window_size, is_causal, backward_strategy
+    from jaxmodules._mosaic_attention import mosaic_attention_forward
+
+    values, log_normalizer = mosaic_attention_forward(Q, K, V, mask_fn)
+    return values, (Q, K, V, values, log_normalizer)
+
+
 def _standard_attention_tile_backward(
     q_block,
     k_block,
@@ -1325,7 +1373,34 @@ def _masked_attention_via_map_bwd(
     return q_grad, k_grad, v_grad
 
 
+def _masked_attention_via_mosaic_bwd(
+    mask_fn,
+    block_size,
+    kv_block_size,
+    window_size,
+    is_causal,
+    backward_strategy,
+    res,
+    upstream_grad,
+):
+    return _masked_attention_via_map_bwd(
+        default_kernel,
+        mask_fn,
+        block_size,
+        kv_block_size,
+        window_size,
+        is_causal,
+        backward_strategy,
+        res,
+        upstream_grad,
+    )
+
+
 _masked_attention_via_map.defvjp(_masked_attention_via_map_fwd, _masked_attention_via_map_bwd)
+_masked_attention_via_mosaic.defvjp(
+    _masked_attention_via_mosaic_fwd,
+    _masked_attention_via_mosaic_bwd,
+)
 
 
 def _canonicalize_mask_fn(mask_fn, is_causal):
@@ -1447,6 +1522,20 @@ def _default_attention_block_sizes(Q, K, V, kv_block_size):
     return query_block_size, kv_block_size
 
 
+def _can_use_mosaic_attention(Q, K, V, kernel_fn, mask_fn, window_size):
+    """Return whether this call can use the conservative Mosaic fast path."""
+    if (
+        jax.default_backend() != "gpu"
+        or kernel_fn is not default_kernel
+        or window_size is not None
+    ):
+        return False
+
+    from jaxmodules._mosaic_attention import supports_mosaic_attention
+
+    return supports_mosaic_attention(Q, K, V, mask_fn)
+
+
 def masked_attention_via_map(
     Q: Array,
     K: Array,
@@ -1561,19 +1650,41 @@ def masked_attention_via_map(
         mask_fn,
     )
 
-    # Core computation
-    result = _masked_attention_via_map(
+    # Core computation. The callable mask API is unchanged: supported
+    # coordinate-only JAX expressions use Mosaic GPU, while every other case
+    # retains the established mapped implementation.
+    if _can_use_mosaic_attention(
         Q,
         K,
         V,
-        kernel_fn=kernel_fn,
-        mask_fn=mask_fn,
-        block_size=effective_block_size,
-        kv_block_size=effective_kv_block_size,
-        window_size=window_size,
-        is_causal=is_causal,
-        backward_strategy=backward_strategy,
-    )
+        kernel_fn,
+        mask_fn,
+        window_size,
+    ):
+        result = _masked_attention_via_mosaic(
+            Q,
+            K,
+            V,
+            mask_fn=mask_fn,
+            block_size=effective_block_size,
+            kv_block_size=effective_kv_block_size,
+            window_size=window_size,
+            is_causal=is_causal,
+            backward_strategy=backward_strategy,
+        )
+    else:
+        result = _masked_attention_via_map(
+            Q,
+            K,
+            V,
+            kernel_fn=kernel_fn,
+            mask_fn=mask_fn,
+            block_size=effective_block_size,
+            kv_block_size=effective_kv_block_size,
+            window_size=window_size,
+            is_causal=is_causal,
+            backward_strategy=backward_strategy,
+        )
 
     # Remove padding and batch dimension
     if padding_size:

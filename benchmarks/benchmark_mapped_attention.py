@@ -1,4 +1,4 @@
-"""Benchmark mapped attention against JAX XLA and cuDNN attention.
+"""Benchmark Mosaic and mapped attention against JAX XLA and cuDNN attention.
 
 The public command is a small driver. Every benchmark case is executed in a
 fresh worker process so that process-wide device allocator peaks are comparable
@@ -18,9 +18,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-IMPLEMENTATIONS = ("mapped", "xla", "cudnn")
+IMPLEMENTATIONS = ("mosaic", "mapped", "xla", "cudnn")
 MODES = ("forward", "backward")
 DTYPES = ("float32", "bfloat16", "float16")
+MASKS = ("causal", "unmasked", "general")
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class Case:
     kv_heads: int
     head_dim: int
     dtype: str
-    causal: bool
+    mask: str
     mapped_backward_strategy: str
     warmup: int
     iterations: int
@@ -60,7 +61,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--implementation", choices=IMPLEMENTATIONS, action="append")
     parser.add_argument("--mode", choices=MODES, action="append")
-    parser.add_argument("--seq-len", type=_positive_int, nargs="+", default=[512])
+    parser.add_argument("--seq-len", type=_positive_int, nargs="+", default=[1024])
     parser.add_argument("--block-size", type=_positive_int, nargs="+", default=[64])
     parser.add_argument("--kv-block-size", type=_positive_int, nargs="+")
     parser.add_argument("--batch-size", type=_positive_int, default=1)
@@ -68,7 +69,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-heads", type=_positive_int, default=4)
     parser.add_argument("--head-dim", type=_positive_int, default=64)
     parser.add_argument("--dtype", choices=DTYPES, default="float16")
-    parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mask", choices=MASKS, default="causal")
     parser.add_argument(
         "--mapped-backward-strategy",
         choices=("auto", "minimal"),
@@ -136,22 +137,57 @@ def _make_inputs(case: Case) -> tuple[Any, Any, Any]:
     return query, key, value
 
 
+def _general_mask(batch: Any, head: Any, query: Any, key: Any) -> Any:
+    """Representative noncausal, batch/head-dependent coordinate mask."""
+    radius = 256 + 16 * (head % 2) + 8 * batch
+    return (abs(query - key) <= radius) & (
+        (query + 2 * key + head) % 5 != 1
+    )
+
+
 def _make_function(case: Case) -> Any:
     import jax
     import jax.numpy as jnp
 
-    if case.implementation == "mapped":
-        from jaxmodules.attention import masked_attention_via_map
+    from jaxmodules.attention import (
+        _causal_mask,
+        _masked_attention_via_map,
+        _masked_attention_via_mosaic,
+        _unmasked,
+        default_kernel,
+    )
+
+    is_causal = case.mask == "causal"
+    mask_fn = {
+        "causal": _causal_mask,
+        "unmasked": _unmasked,
+        "general": _general_mask,
+    }[case.mask]
+
+    if case.implementation in ("mosaic", "mapped"):
+        implementation = case.implementation
 
         def attention(query: Any, key: Any, value: Any) -> Any:
-            return masked_attention_via_map(
+            function = (
+                _masked_attention_via_mosaic
+                if implementation == "mosaic"
+                else _masked_attention_via_map
+            )
+            kwargs = {
+                "mask_fn": mask_fn,
+                "block_size": case.block_size,
+                "kv_block_size": case.kv_block_size,
+                "window_size": None,
+                "is_causal": is_causal,
+                "backward_strategy": case.mapped_backward_strategy,
+            }
+            if implementation == "mapped":
+                kwargs["kernel_fn"] = default_kernel
+            return function(
                 query,
                 key,
                 value,
-                block_size=case.block_size,
-                kv_block_size=case.kv_block_size,
-                is_causal=case.causal,
-                backward_strategy=case.mapped_backward_strategy,
+                **kwargs,
             )
 
     else:
@@ -161,11 +197,20 @@ def _make_function(case: Case) -> Any:
         )
 
         def attention(query: Any, key: Any, value: Any) -> Any:
+            dense_mask = None
+            if case.mask == "general":
+                dense_mask = _general_mask(
+                    jnp.arange(case.batch_size)[:, None, None, None],
+                    jnp.arange(case.query_heads)[None, :, None, None],
+                    jnp.arange(case.seq_len)[None, None, :, None],
+                    jnp.arange(case.seq_len)[None, None, None, :],
+                )
             return jax.nn.dot_product_attention(
                 query,
                 key,
                 value,
-                is_causal=case.causal,
+                mask=dense_mask,
+                is_causal=is_causal,
                 implementation=implementation,
             )
 
@@ -297,7 +342,7 @@ def _format_bytes(value: int | None) -> str:
 
 def _print_results(results: list[dict[str, Any]]) -> None:
     heading = (
-        "seq | qblk | kvblk | strategy | mode | implementation | median | "
+        "seq | mask     | qblk | kvblk | strategy | mode | implementation | median | "
         "tokens/s | device peak* | compiler temp | status"
     )
     print(heading)
@@ -316,7 +361,8 @@ def _print_results(results: list[dict[str, Any]]) -> None:
             latency = throughput = peak = temporary = "-"
             status = f"{result.get('error_type')}: {result.get('error')}"
         print(
-            f"{case['seq_len']:>3} | {case['block_size']:>4} | "
+            f"{case['seq_len']:>3} | {case['mask']:<8} | "
+            f"{case['block_size']:>4} | "
             f"{case['kv_block_size']:>5} | "
             f"{case['mapped_backward_strategy']:<8} | {case['mode']:<8} | "
             f"{case['implementation']:<14} | {latency:>9} | "
@@ -355,7 +401,7 @@ def main() -> int:
             kv_heads=args.kv_heads,
             head_dim=args.head_dim,
             dtype=args.dtype,
-            causal=args.causal,
+            mask=args.mask,
             mapped_backward_strategy=args.mapped_backward_strategy,
             warmup=args.warmup,
             iterations=args.iterations,
