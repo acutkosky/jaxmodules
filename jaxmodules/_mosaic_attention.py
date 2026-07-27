@@ -196,6 +196,18 @@ def _materialize_mask_tile(
     return mask
 
 
+def _tile_has_attention(
+    mask: jax.Array,
+    *,
+    accumulator_layout: Any,
+    row_layout: Any,
+) -> jax.Array:
+    """Reduce a mask tile without Mosaic GPU's unsupported boolean reduce-or."""
+    numeric_mask = plgpu.layout_cast(mask.astype(jnp.int32), accumulator_layout)
+    row_max = plgpu.layout_cast(numeric_mask.max(axis=1), row_layout)
+    return row_max.max() != 0
+
+
 def mosaic_attention_forward(
     query: jax.Array,
     key: jax.Array,
@@ -263,31 +275,6 @@ def mosaic_attention_forward(
         )
 
         def kv_body(kv_step, carry):
-            output_accumulator, row_max, row_sum = carry
-            key_fragment = plgpu.load(
-                plgpu.transpose_ref(
-                    key_ref.at[
-                        batch,
-                        pl.ds(kv_step * block_kv, block_kv),
-                        kv_head,
-                    ],
-                    (1, 0),
-                ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
-                optimized=False,
-            )
-            scores = plgpu.mma(
-                plgpu.layout_cast(
-                    jnp.zeros(
-                        (block_q, block_kv),
-                        dtype=jnp.float32,
-                    ),
-                    accumulator_layout,
-                ),
-                query_fragment,
-                key_fragment,
-            )
-            scores *= scale
             mask = _materialize_mask_tile(
                 mask_fn,
                 batch=batch,
@@ -298,90 +285,128 @@ def mosaic_attention_forward(
                 block_kv=block_kv,
                 layout=accumulator_layout,
             )
-            scores = jnp.where(mask, scores, -jnp.inf)
 
-            tile_max = plgpu.layout_cast(
-                scores.max(axis=1) * log2e,
-                row_layout,
-            )
-            next_row_max = jnp.maximum(row_max, tile_max)
-            safe_next_row_max = jnp.where(
-                next_row_max == -jnp.inf,
-                jnp.zeros_like(next_row_max),
-                next_row_max,
-            )
-            previous_scale = jnp.where(
-                row_sum > 0,
-                jnp.exp2(row_max - safe_next_row_max),
-                jnp.zeros_like(row_sum),
-            )
-            safe_next_row_max_broadcast = plgpu.layout_cast(
-                lax.broadcast_in_dim(
-                    safe_next_row_max,
-                    scores.shape,
-                    (0,),
-                ),
-                accumulator_layout,
-            )
-            probabilities = jnp.where(
-                mask,
-                jnp.exp2(
-                    scores * log2e - safe_next_row_max_broadcast
-                ),
-                jnp.zeros_like(scores),
-            )
-            previous_scale_broadcast = plgpu.layout_cast(
-                lax.broadcast_in_dim(
-                    previous_scale,
-                    output_accumulator.shape,
-                    (0,),
-                ),
-                accumulator_layout,
-            )
-            output_accumulator *= previous_scale_broadcast
-            row_sum *= previous_scale
-            row_max = next_row_max
-            row_sum += plgpu.layout_cast(
-                probabilities.sum(axis=1),
-                row_layout,
-            )
-
-            value_fragment = plgpu.load(
-                plgpu.transpose_ref(
-                    value_transposed_ref.at[
-                        batch,
-                        kv_head,
-                        :,
-                        pl.ds(kv_step * block_kv, block_kv),
-                    ],
-                    (1, 0),
-                ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
-                optimized=False,
-            )
-
-            # A standard FlashAttention kernel casts ``probabilities`` to the
-            # input dtype before PV. Preserve substantially all FP32
-            # probability information by decomposing it into multiple
-            # low-precision components, then accumulating each tensor-core
-            # product into the same FP32 accumulator.
-            probability_residual = probabilities
-            for _ in range(config.probability_components):
-                component = probability_residual.astype(dtype)
-                probability_smem[...] = component
-                probability_fragment = plgpu.load(
-                    probability_smem,
-                    layout=plgpu.Layout.MMA_LHS(dtype),
+            def process_tile(carry):
+                output_accumulator, row_max, row_sum = carry
+                key_fragment = plgpu.load(
+                    plgpu.transpose_ref(
+                        key_ref.at[
+                            batch,
+                            pl.ds(kv_step * block_kv, block_kv),
+                            kv_head,
+                        ],
+                        (1, 0),
+                    ),
+                    layout=plgpu.Layout.MMA_RHS(dtype),
                     optimized=False,
                 )
-                output_accumulator = plgpu.mma(
-                    output_accumulator,
-                    probability_fragment,
-                    value_fragment,
+                scores = plgpu.mma(
+                    plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_q, block_kv),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    ),
+                    query_fragment,
+                    key_fragment,
                 )
-                probability_residual -= component.astype(jnp.float32)
+                scores *= scale
+                scores = jnp.where(mask, scores, -jnp.inf)
 
-            return output_accumulator, row_max, row_sum
+                tile_max = plgpu.layout_cast(
+                    scores.max(axis=1) * log2e,
+                    row_layout,
+                )
+                next_row_max = jnp.maximum(row_max, tile_max)
+                safe_next_row_max = jnp.where(
+                    next_row_max == -jnp.inf,
+                    jnp.zeros_like(next_row_max),
+                    next_row_max,
+                )
+                previous_scale = jnp.where(
+                    row_sum > 0,
+                    jnp.exp2(row_max - safe_next_row_max),
+                    jnp.zeros_like(row_sum),
+                )
+                safe_next_row_max_broadcast = plgpu.layout_cast(
+                    lax.broadcast_in_dim(
+                        safe_next_row_max,
+                        scores.shape,
+                        (0,),
+                    ),
+                    accumulator_layout,
+                )
+                probabilities = jnp.where(
+                    mask,
+                    jnp.exp2(scores * log2e - safe_next_row_max_broadcast),
+                    jnp.zeros_like(scores),
+                )
+                previous_scale_broadcast = plgpu.layout_cast(
+                    lax.broadcast_in_dim(
+                        previous_scale,
+                        output_accumulator.shape,
+                        (0,),
+                    ),
+                    accumulator_layout,
+                )
+                output_accumulator *= previous_scale_broadcast
+                row_sum *= previous_scale
+                row_max = next_row_max
+                row_sum += plgpu.layout_cast(
+                    probabilities.sum(axis=1),
+                    row_layout,
+                )
+
+                value_fragment = plgpu.load(
+                    plgpu.transpose_ref(
+                        value_transposed_ref.at[
+                            batch,
+                            kv_head,
+                            :,
+                            pl.ds(kv_step * block_kv, block_kv),
+                        ],
+                        (1, 0),
+                    ),
+                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    optimized=False,
+                )
+
+                # A standard FlashAttention kernel casts ``probabilities`` to
+                # the input dtype before PV. Preserve substantially all FP32
+                # probability information by decomposing it into multiple
+                # low-precision components, then accumulating each
+                # tensor-core product into the same FP32 accumulator.
+                probability_residual = probabilities
+                for _ in range(config.probability_components):
+                    component = probability_residual.astype(dtype)
+                    probability_smem[...] = component
+                    probability_fragment = plgpu.load(
+                        probability_smem,
+                        layout=plgpu.Layout.MMA_LHS(dtype),
+                        optimized=False,
+                    )
+                    output_accumulator = plgpu.mma(
+                        output_accumulator,
+                        probability_fragment,
+                        value_fragment,
+                    )
+                    probability_residual -= component.astype(jnp.float32)
+
+                return output_accumulator, row_max, row_sum
+
+            if is_causal:
+                return process_tile(carry)
+            return lax.cond(
+                _tile_has_attention(
+                    mask,
+                    accumulator_layout=accumulator_layout,
+                    row_layout=row_layout,
+                ),
+                process_tile,
+                lambda x: x,
+                carry,
+            )
 
         kv_stop = num_kv_tiles
         if is_causal:
@@ -576,8 +601,7 @@ def mosaic_attention_backward(
     query_transposed = jnp.transpose(query, (0, 2, 3, 1))
     key_transposed = jnp.transpose(key, (0, 2, 3, 1))
     delta = jnp.sum(
-        upstream_gradient.astype(jnp.float32)
-        * output.astype(jnp.float32),
+        upstream_gradient.astype(jnp.float32) * output.astype(jnp.float32),
         axis=-1,
     )
     log_normalizer_transposed = jnp.transpose(log_normalizer, (0, 2, 1))
@@ -666,26 +690,6 @@ def mosaic_attention_backward(
         def kv_body(kv_step, query_gradient):
             kv_base = kv_step * block_kv
             kv_slice = pl.ds(kv_base, block_kv)
-            key_for_scores = plgpu.load(
-                plgpu.transpose_ref(
-                    key_ref.at[batch, kv_slice, kv_head],
-                    (1, 0),
-                ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
-                optimized=False,
-            )
-            scores = plgpu.mma(
-                plgpu.layout_cast(
-                    jnp.zeros(
-                        (block_q, block_kv),
-                        dtype=jnp.float32,
-                    ),
-                    accumulator_layout,
-                ),
-                query_fragment,
-                key_for_scores,
-            )
-            scores *= scale
             mask = _materialize_mask_tile(
                 mask_fn,
                 batch=batch,
@@ -696,60 +700,95 @@ def mosaic_attention_backward(
                 block_kv=block_kv,
                 layout=accumulator_layout,
             )
-            probabilities = jnp.where(
-                mask,
-                jnp.exp2((scores - lse_broadcast) * log2e),
-                jnp.zeros_like(scores),
-            )
 
-            value_for_dp = plgpu.load(
-                plgpu.transpose_ref(
-                    value_ref.at[batch, kv_slice, kv_head],
-                    (1, 0),
-                ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
-                optimized=False,
-            )
-            dp = plgpu.layout_cast(
-                jnp.zeros(
-                    (block_q, block_kv),
-                    dtype=jnp.float32,
-                ),
-                accumulator_layout,
-            )
-            for gradient_fragment in gradient_fragments:
-                dp = plgpu.mma(dp, gradient_fragment, value_for_dp)
-            ds = probabilities * (dp - delta_broadcast)
-
-            key_for_dq = plgpu.load(
-                plgpu.transpose_ref(
-                    key_transposed_ref.at[
-                        batch,
-                        kv_head,
-                        :,
-                        kv_slice,
-                    ],
-                    (1, 0),
-                ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
-                optimized=False,
-            )
-            ds_residual = ds
-            for _ in range(config.probability_components):
-                ds_component = ds_residual.astype(dtype)
-                matrix_smem[...] = ds_component
-                ds_fragment = plgpu.load(
-                    matrix_smem,
-                    layout=plgpu.Layout.MMA_LHS(dtype),
+            def process_tile(query_gradient):
+                key_for_scores = plgpu.load(
+                    plgpu.transpose_ref(
+                        key_ref.at[batch, kv_slice, kv_head],
+                        (1, 0),
+                    ),
+                    layout=plgpu.Layout.MMA_RHS(dtype),
                     optimized=False,
                 )
-                query_gradient = plgpu.mma(
-                    query_gradient,
-                    ds_fragment,
-                    key_for_dq,
+                scores = plgpu.mma(
+                    plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_q, block_kv),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    ),
+                    query_fragment,
+                    key_for_scores,
                 )
-                ds_residual -= ds_component.astype(jnp.float32)
-            return query_gradient
+                scores *= scale
+                probabilities = jnp.where(
+                    mask,
+                    jnp.exp2((scores - lse_broadcast) * log2e),
+                    jnp.zeros_like(scores),
+                )
+
+                value_for_dp = plgpu.load(
+                    plgpu.transpose_ref(
+                        value_ref.at[batch, kv_slice, kv_head],
+                        (1, 0),
+                    ),
+                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    optimized=False,
+                )
+                dp = plgpu.layout_cast(
+                    jnp.zeros(
+                        (block_q, block_kv),
+                        dtype=jnp.float32,
+                    ),
+                    accumulator_layout,
+                )
+                for gradient_fragment in gradient_fragments:
+                    dp = plgpu.mma(dp, gradient_fragment, value_for_dp)
+                ds = probabilities * (dp - delta_broadcast)
+
+                key_for_dq = plgpu.load(
+                    plgpu.transpose_ref(
+                        key_transposed_ref.at[
+                            batch,
+                            kv_head,
+                            :,
+                            kv_slice,
+                        ],
+                        (1, 0),
+                    ),
+                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    optimized=False,
+                )
+                ds_residual = ds
+                for _ in range(config.probability_components):
+                    ds_component = ds_residual.astype(dtype)
+                    matrix_smem[...] = ds_component
+                    ds_fragment = plgpu.load(
+                        matrix_smem,
+                        layout=plgpu.Layout.MMA_LHS(dtype),
+                        optimized=False,
+                    )
+                    query_gradient = plgpu.mma(
+                        query_gradient,
+                        ds_fragment,
+                        key_for_dq,
+                    )
+                    ds_residual -= ds_component.astype(jnp.float32)
+                return query_gradient
+
+            if is_causal:
+                return process_tile(query_gradient)
+            return lax.cond(
+                _tile_has_attention(
+                    mask,
+                    accumulator_layout=accumulator_layout,
+                    row_layout=row_layout,
+                ),
+                process_tile,
+                lambda x: x,
+                query_gradient,
+            )
 
         kv_stop = num_kv_tiles
         if is_causal:
@@ -830,34 +869,8 @@ def mosaic_attention_backward(
             query_head = kv_head * query_heads_per_kv_head + group_index
 
             def query_body(query_step, gradients):
-                key_gradient, value_gradient = gradients
                 query_base = query_step * block_q
                 query_slice = pl.ds(query_base, block_q)
-
-                query_for_scores = plgpu.load(
-                    plgpu.transpose_ref(
-                        query_ref.at[
-                            batch,
-                            query_slice,
-                            query_head,
-                        ],
-                        (1, 0),
-                    ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
-                    optimized=False,
-                )
-                scores_transposed = plgpu.mma(
-                    plgpu.layout_cast(
-                        jnp.zeros(
-                            (block_kv, block_q),
-                            dtype=jnp.float32,
-                        ),
-                        accumulator_layout,
-                    ),
-                    key_fragment,
-                    query_for_scores,
-                )
-                scores_transposed *= scale
                 mask_transposed = _materialize_transposed_mask_tile(
                     mask_fn,
                     batch=batch,
@@ -868,44 +881,12 @@ def mosaic_attention_backward(
                     block_kv=block_kv,
                     layout=accumulator_layout,
                 )
-                lse = plgpu.load(
-                    lse_transposed_ref.at[
-                        batch,
-                        query_head,
-                        query_slice,
-                    ],
-                    layout=column_layout,
-                    optimized=False,
-                )
-                lse_broadcast = plgpu.layout_cast(
-                    lax.broadcast_in_dim(
-                        lse,
-                        scores_transposed.shape,
-                        (1,),
-                    ),
-                    accumulator_layout,
-                )
-                probabilities_transposed = jnp.where(
-                    mask_transposed,
-                    jnp.exp2(
-                        (scores_transposed - lse_broadcast) * log2e
-                    ),
-                    jnp.zeros_like(scores_transposed),
-                )
 
-                dp_transposed = plgpu.layout_cast(
-                    jnp.zeros(
-                        (block_kv, block_q),
-                        dtype=jnp.float32,
-                    ),
-                    accumulator_layout,
-                )
-                gradient_rhs_fragments = []
-                for component in range(config.probability_components):
-                    gradient_for_dp = plgpu.load(
+                def process_tile(gradients):
+                    key_gradient, value_gradient = gradients
+                    query_for_scores = plgpu.load(
                         plgpu.transpose_ref(
-                            gradient_components_ref.at[
-                                component,
+                            query_ref.at[
                                 batch,
                                 query_slice,
                                 query_head,
@@ -915,98 +896,168 @@ def mosaic_attention_backward(
                         layout=plgpu.Layout.MMA_RHS(dtype),
                         optimized=False,
                     )
-                    gradient_rhs_fragments.append(
-                        plgpu.load(
+                    scores_transposed = plgpu.mma(
+                        plgpu.layout_cast(
+                            jnp.zeros(
+                                (block_kv, block_q),
+                                dtype=jnp.float32,
+                            ),
+                            accumulator_layout,
+                        ),
+                        key_fragment,
+                        query_for_scores,
+                    )
+                    scores_transposed *= scale
+                    lse = plgpu.load(
+                        lse_transposed_ref.at[
+                            batch,
+                            query_head,
+                            query_slice,
+                        ],
+                        layout=column_layout,
+                        optimized=False,
+                    )
+                    lse_broadcast = plgpu.layout_cast(
+                        lax.broadcast_in_dim(
+                            lse,
+                            scores_transposed.shape,
+                            (1,),
+                        ),
+                        accumulator_layout,
+                    )
+                    probabilities_transposed = jnp.where(
+                        mask_transposed,
+                        jnp.exp2((scores_transposed - lse_broadcast) * log2e),
+                        jnp.zeros_like(scores_transposed),
+                    )
+
+                    dp_transposed = plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_kv, block_q),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    )
+                    gradient_rhs_fragments = []
+                    for component in range(config.probability_components):
+                        gradient_for_dp = plgpu.load(
                             plgpu.transpose_ref(
-                                gradient_components_transposed_ref.at[
+                                gradient_components_ref.at[
                                     component,
                                     batch,
-                                    query_head,
-                                    :,
                                     query_slice,
+                                    query_head,
                                 ],
                                 (1, 0),
                             ),
                             layout=plgpu.Layout.MMA_RHS(dtype),
                             optimized=False,
                         )
-                    )
-                    dp_transposed = plgpu.mma(
-                        dp_transposed,
-                        value_fragment,
-                        gradient_for_dp,
-                    )
+                        gradient_rhs_fragments.append(
+                            plgpu.load(
+                                plgpu.transpose_ref(
+                                    gradient_components_transposed_ref.at[
+                                        component,
+                                        batch,
+                                        query_head,
+                                        :,
+                                        query_slice,
+                                    ],
+                                    (1, 0),
+                                ),
+                                layout=plgpu.Layout.MMA_RHS(dtype),
+                                optimized=False,
+                            )
+                        )
+                        dp_transposed = plgpu.mma(
+                            dp_transposed,
+                            value_fragment,
+                            gradient_for_dp,
+                        )
 
-                delta_tile = plgpu.load(
-                    delta_transposed_ref.at[
-                        batch,
-                        query_head,
-                        query_slice,
-                    ],
-                    layout=column_layout,
-                    optimized=False,
-                )
-                delta_broadcast = plgpu.layout_cast(
-                    lax.broadcast_in_dim(
-                        delta_tile,
-                        dp_transposed.shape,
-                        (1,),
-                    ),
-                    accumulator_layout,
-                )
-                ds_transposed = probabilities_transposed * (
-                    dp_transposed - delta_broadcast
-                )
-
-                query_for_dk = plgpu.load(
-                    plgpu.transpose_ref(
-                        query_transposed_ref.at[
+                    delta_tile = plgpu.load(
+                        delta_transposed_ref.at[
                             batch,
                             query_head,
-                            :,
                             query_slice,
                         ],
-                        (1, 0),
-                    ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
-                    optimized=False,
-                )
-                ds_residual = ds_transposed
-                for _ in range(config.probability_components):
-                    ds_component = ds_residual.astype(dtype)
-                    matrix_smem[...] = ds_component
-                    ds_fragment = plgpu.load(
-                        matrix_smem,
-                        layout=plgpu.Layout.MMA_LHS(dtype),
+                        layout=column_layout,
                         optimized=False,
                     )
-                    key_gradient = plgpu.mma(
-                        key_gradient,
-                        ds_fragment,
-                        query_for_dk,
+                    delta_broadcast = plgpu.layout_cast(
+                        lax.broadcast_in_dim(
+                            delta_tile,
+                            dp_transposed.shape,
+                            (1,),
+                        ),
+                        accumulator_layout,
                     )
-                    ds_residual -= ds_component.astype(jnp.float32)
+                    ds_transposed = probabilities_transposed * (
+                        dp_transposed - delta_broadcast
+                    )
 
-                probability_residual = probabilities_transposed
-                for _ in range(config.probability_components):
-                    probability_component = probability_residual.astype(dtype)
-                    matrix_smem[...] = probability_component
-                    probability_fragment = plgpu.load(
-                        matrix_smem,
-                        layout=plgpu.Layout.MMA_LHS(dtype),
+                    query_for_dk = plgpu.load(
+                        plgpu.transpose_ref(
+                            query_transposed_ref.at[
+                                batch,
+                                query_head,
+                                :,
+                                query_slice,
+                            ],
+                            (1, 0),
+                        ),
+                        layout=plgpu.Layout.MMA_RHS(dtype),
                         optimized=False,
                     )
-                    for gradient_rhs in gradient_rhs_fragments:
-                        value_gradient = plgpu.mma(
-                            value_gradient,
-                            probability_fragment,
-                            gradient_rhs,
+                    ds_residual = ds_transposed
+                    for _ in range(config.probability_components):
+                        ds_component = ds_residual.astype(dtype)
+                        matrix_smem[...] = ds_component
+                        ds_fragment = plgpu.load(
+                            matrix_smem,
+                            layout=plgpu.Layout.MMA_LHS(dtype),
+                            optimized=False,
                         )
-                    probability_residual -= probability_component.astype(
-                        jnp.float32
-                    )
+                        key_gradient = plgpu.mma(
+                            key_gradient,
+                            ds_fragment,
+                            query_for_dk,
+                        )
+                        ds_residual -= ds_component.astype(jnp.float32)
 
-                return key_gradient, value_gradient
+                    probability_residual = probabilities_transposed
+                    for _ in range(config.probability_components):
+                        probability_component = probability_residual.astype(dtype)
+                        matrix_smem[...] = probability_component
+                        probability_fragment = plgpu.load(
+                            matrix_smem,
+                            layout=plgpu.Layout.MMA_LHS(dtype),
+                            optimized=False,
+                        )
+                        for gradient_rhs in gradient_rhs_fragments:
+                            value_gradient = plgpu.mma(
+                                value_gradient,
+                                probability_fragment,
+                                gradient_rhs,
+                            )
+                        probability_residual -= probability_component.astype(
+                            jnp.float32
+                        )
+
+                    return key_gradient, value_gradient
+
+                if is_causal:
+                    return process_tile(gradients)
+                return lax.cond(
+                    _tile_has_attention(
+                        mask_transposed,
+                        accumulator_layout=accumulator_layout,
+                        row_layout=row_layout,
+                    ),
+                    process_tile,
+                    lambda x: x,
+                    gradients,
+                )
 
             query_start = 0
             if is_causal:
