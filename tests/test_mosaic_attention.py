@@ -9,6 +9,7 @@ import pytest
 
 from jaxmodules._mosaic_attention import (
     _can_use_warp_specialized_forward,
+    _mosaic_attention_backward_warp_specialized_unmasked,
     _mosaic_attention_forward_warp_specialized_unmasked,
     mask_is_mosaic_compatible,
     mosaic_attention_backward,
@@ -133,6 +134,58 @@ def test_warp_specialized_forward_matches_xla(dtype, tolerance):
         rtol=tolerance,
         atol=tolerance,
     )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [
+        (jnp.float16, 3e-3),
+        (jnp.bfloat16, 2e-2),
+    ],
+)
+def test_warp_specialized_backward_matches_xla(dtype, tolerance):
+    keys = jax.random.split(jax.random.key(47), 4)
+    query = jax.random.normal(keys[0], (1, 1024, 2, 64), dtype=dtype)
+    key = jax.random.normal(keys[1], (1, 1024, 1, 64), dtype=dtype)
+    value = jax.random.normal(keys[2], (1, 1024, 1, 64), dtype=dtype)
+    cotangent = jax.random.normal(
+        keys[3],
+        query.shape,
+        dtype=jnp.float32,
+    )
+
+    output, log_normalizer = jax.jit(
+        _mosaic_attention_forward_warp_specialized_unmasked
+    )(query, key, value)
+    gradients = jax.jit(
+        _mosaic_attention_backward_warp_specialized_unmasked
+    )(query, key, value, output, log_normalizer, cotangent)
+
+    def xla_loss(q, k, v):
+        attention = jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            implementation="xla",
+        )
+        return jnp.sum(attention.astype(jnp.float32) * cotangent)
+
+    expected = jax.jit(
+        jax.grad(xla_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+    for gradient, expected_gradient in zip(
+        gradients,
+        expected,
+        strict=True,
+    ):
+        assert gradient.dtype == dtype
+        np.testing.assert_allclose(
+            np.asarray(gradient),
+            np.asarray(expected_gradient),
+            rtol=tolerance,
+            atol=tolerance,
+        )
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
