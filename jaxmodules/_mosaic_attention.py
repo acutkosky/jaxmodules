@@ -24,7 +24,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from jaxlib.mlir.dialects import memref
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith, llvm, memref, nvvm
 
 
 # This is intentionally narrower than Mosaic GPU's full lowering registry.
@@ -2012,9 +2013,10 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
     """Compute large unmasked gradients with shared, pipelined operands.
 
     Two compute warpgroups process adjacent query tiles. A memory warpgroup
-    stages each K/V orientation once for both consumers. Query and output-
-    gradient RHS views remain in shared memory rather than occupying registers
-    for the entire K/V traversal.
+    stages one row-major copy of each K tile; native matrix loads derive both
+    the transposed score operand and the untransposed dQ operand. Query and
+    output-gradient RHS views remain in shared memory rather than occupying
+    registers for the entire K/V traversal.
     """
 
     if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
@@ -2031,8 +2033,12 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
     block_q = 64
     block_kv = 64
     num_compute_wgs = 2
-    compute_registers = 232
-    producer_registers = 40
+    if kv_length >= 32768:
+        compute_registers = 240
+        producer_registers = 32
+    else:
+        compute_registers = 232
+        producer_registers = 40
     query_superblock = block_q * num_compute_wgs
     if query_length % query_superblock:
         raise ValueError(
@@ -2046,6 +2052,7 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
     query_heads_per_kv_head = query_heads // kv_heads
     num_query_supertiles = query_length // query_superblock
     num_kv_tiles = kv_length // block_kv
+    key_pipeline_depth = 2
     dtype = query.dtype
     scale = float(head_dim**-0.5)
     log2e = math.log2(math.e)
@@ -2060,7 +2067,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
 
     gradient = upstream_gradient.astype(dtype)
     query_transposed = jnp.transpose(query, (0, 2, 3, 1))
-    key_transposed = jnp.transpose(key, (0, 2, 3, 1))
     gradient_transposed = jnp.transpose(gradient, (0, 2, 3, 1))
     delta = jnp.sum(
         upstream_gradient.astype(jnp.float32) * output.astype(jnp.float32),
@@ -2085,6 +2091,107 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             layout=plgpu.Layout.MMA_RHS(dtype).to_mgpu(),
             optimized=True,
             tiling_rank=2,
+        )
+
+    # ``mma.sync`` distributes its column-major RHS in pairs along K. The
+    # shared K tile is row-major, so use the current NVVM ``ldmatrix.trans``
+    # operation to form that register layout without a second global-memory
+    # transpose. This mapping is specific to the validated 64x64, 16-bit tile.
+    assert block_kv == head_dim == 64
+    assert jnp.dtype(dtype).itemsize == 2
+
+    @plgpu.inline_mgpu(
+        arg_types=(plgpu.RefType(rhs_smem_transforms),),
+        return_type=plgpu.ShapeDtypeStruct(
+            (block_kv, head_dim),
+            dtype,
+            layout=plgpu.Layout.MMA_RHS(dtype),
+        ),
+    )
+    def load_shared_rhs_without_transpose(_, smem_ref):
+        rhs_layout = plgpu.Layout.MMA_RHS(dtype).to_mgpu()
+        ref_type = ir.MemRefType(smem_ref.type)
+        register_type = ir.VectorType.get(
+            (rhs_layout.vector_length,),
+            ref_type.element_type,
+        )
+        registers = mgpu.FragmentedArray.splat(
+            mgpu.c(0, ref_type.element_type),
+            (block_kv, head_dim),
+            rhs_layout,
+        ).registers.copy()
+        matrix_shape = ir.Attribute.parse(
+            "#nvvm.ld_st_matrix_shape<m=8, n=8>"
+        )
+        int32 = ir.IntegerType.get_signless(32)
+        lane = arith.remui(
+            mgpu.thread_idx(),
+            mgpu.c(32, int32),
+        )
+        lane_in_octet = arith.remui(lane, mgpu.c(8, int32))
+        quadrant = arith.divui(lane, mgpu.c(8, int32))
+        base_pointer = mgpu.utils.memref_ptr(smem_ref)
+        for column_block in range(8):
+            for row_block_base in (0, 4):
+                source_row_block = arith.addi(
+                    mgpu.c(row_block_base, int32),
+                    quadrant,
+                )
+                source_row = arith.addi(
+                    arith.muli(
+                        source_row_block,
+                        mgpu.c(8, int32),
+                    ),
+                    lane_in_octet,
+                )
+                vector_offset = arith.addi(
+                    arith.muli(source_row, mgpu.c(32, int32)),
+                    mgpu.c(column_block * 4, int32),
+                )
+                swizzled_offset = arith.xori(
+                    vector_offset,
+                    arith.muli(
+                        lane_in_octet,
+                        mgpu.c(4, int32),
+                    ),
+                )
+                pointer = mgpu.utils.getelementptr(
+                    base_pointer,
+                    [swizzled_offset],
+                    register_type,
+                )
+                loaded = nvvm.ldmatrix(
+                    pointer,
+                    num=4,
+                    layout=nvvm.MMALayout.col,
+                    shape=matrix_shape,
+                    elt_type=nvvm.LdStMatrixEltType.B16,
+                )
+                for matrix_index in range(4):
+                    row_block = row_block_base + matrix_index
+                    registers[
+                        (
+                            row_block // 2,
+                            column_block,
+                            row_block % 2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                    ] = mgpu.utils.bitcast(
+                        llvm.extractvalue(
+                            int32,
+                            loaded,
+                            [matrix_index],
+                        ),
+                        register_type,
+                    )
+        return mgpu.FragmentedArray(
+            _registers=registers,
+            _layout=rhs_layout,
+            _is_signed=None,
         )
 
     @plgpu.inline_mgpu(
@@ -2140,13 +2247,10 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
         thread_name="wg",
     )
     scratch_types = (
+        # Two K slots preserve producer overlap while using the same 16 KiB
+        # that the former one-slot K and one-slot transposed-K buffers used.
         plgpu.SMEM(
-            (block_kv, head_dim),
-            dtype,
-            transforms=rhs_smem_transforms,
-        ),
-        plgpu.SMEM(
-            (head_dim, block_kv),
+            (key_pipeline_depth, block_kv, head_dim),
             dtype,
             transforms=rhs_smem_transforms,
         ),
@@ -2169,13 +2273,14 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             (num_compute_wgs, block_q, block_kv + 2),
             dtype,
         ),
-        plgpu.Barrier(),
-        plgpu.Barrier(),
+        plgpu.Barrier(num_barriers=key_pipeline_depth),
         plgpu.Barrier(),
         plgpu.Barrier(num_barriers=num_compute_wgs),
         plgpu.Barrier(num_barriers=num_compute_wgs),
-        plgpu.Barrier(num_arrivals=num_compute_wgs),
-        plgpu.Barrier(num_arrivals=num_compute_wgs),
+        plgpu.Barrier(
+            num_arrivals=num_compute_wgs,
+            num_barriers=key_pipeline_depth,
+        ),
         plgpu.Barrier(num_arrivals=num_compute_wgs),
     )
     compiler_params = plgpu.CompilerParams(
@@ -2189,7 +2294,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             key_ref,
             value_ref,
             query_transposed_ref,
-            key_transposed_ref,
             gradient_ref,
             gradient_transposed_ref,
             lse_transposed_ref,
@@ -2204,7 +2308,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             key_ref,
             value_ref,
             query_transposed_ref,
-            key_transposed_ref,
             gradient_ref,
             gradient_transposed_ref,
             lse_transposed_ref,
@@ -2213,18 +2316,15 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             key_gradient_ref,
             value_gradient_ref,
             key_for_scores_smem,
-            key_for_dq_smem,
             value_for_dp_smem,
             query_for_dk_smem,
             gradient_for_dv_smem,
             transpose_smem,
             key_for_scores_ready,
-            key_for_dq_ready,
             value_for_dp_ready,
             query_for_dk_ready,
             gradient_for_dv_ready,
             key_for_scores_consumed,
-            key_for_dq_consumed,
             value_for_dp_consumed,
         ):
             batch = lax.axis_index("batch")
@@ -2313,10 +2413,20 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
                 def process_kv_tile(kv_step, query_gradient):
                     kv_base = kv_step * block_kv
                     kv_slice = pl.ds(kv_base, block_kv)
+                    key_slot = lax.rem(
+                        kv_step,
+                        jnp.asarray(
+                            key_pipeline_depth,
+                            kv_step.dtype,
+                        ),
+                    )
 
-                    plgpu.barrier_wait(key_for_scores_ready)
-                    key_for_scores = load_shared_rhs(key_for_scores_smem)
-                    plgpu.barrier_arrive(key_for_scores_consumed)
+                    plgpu.barrier_wait(
+                        key_for_scores_ready.at[key_slot]
+                    )
+                    key_for_scores = load_shared_rhs(
+                        key_for_scores_smem.at[key_slot]
+                    )
                     scores = plgpu.mma(
                         plgpu.layout_cast(
                             jnp.zeros(
@@ -2350,9 +2460,12 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
                     ds = probabilities * (dp - delta_broadcast)
                     ds_component = ds.astype(dtype)
 
-                    plgpu.barrier_wait(key_for_dq_ready)
-                    key_for_dq = load_shared_rhs(key_for_dq_smem)
-                    plgpu.barrier_arrive(key_for_dq_consumed)
+                    key_for_dq = load_shared_rhs_without_transpose(
+                        key_for_scores_smem.at[key_slot]
+                    )
+                    plgpu.barrier_arrive(
+                        key_for_scores_consumed.at[key_slot]
+                    )
                     query_gradient = mma_with_accumulator_lhs(
                         query_gradient,
                         ds_component,
@@ -2456,26 +2569,21 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
                         gradient_for_dv_ready.at[consumer],
                     )
 
+                for key_slot in range(key_pipeline_depth):
+                    initial_key_slice = (
+                        batch,
+                        pl.ds(key_slot * block_kv, block_kv),
+                        kv_head,
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        key_ref.at[initial_key_slice],
+                        key_for_scores_smem.at[key_slot],
+                        key_for_scores_ready.at[key_slot],
+                    )
                 first_kv_slice = (
                     batch,
                     pl.ds(0, block_kv),
                     kv_head,
-                )
-                first_transposed_slice = (
-                    batch,
-                    kv_head,
-                    slice(None),
-                    pl.ds(0, block_kv),
-                )
-                plgpu.copy_gmem_to_smem(
-                    key_ref.at[first_kv_slice],
-                    key_for_scores_smem,
-                    key_for_scores_ready,
-                )
-                plgpu.copy_gmem_to_smem(
-                    key_transposed_ref.at[first_transposed_slice],
-                    key_for_dq_smem,
-                    key_for_dq_ready,
                 )
                 plgpu.copy_gmem_to_smem(
                     value_ref.at[first_kv_slice],
@@ -2483,38 +2591,57 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
                     value_for_dp_ready,
                 )
 
-                @pl.loop(0, num_kv_tiles - 1)
+                @pl.loop(0, num_kv_tiles - key_pipeline_depth)
                 def refill_pipeline(kv_step):
-                    next_kv_step = kv_step + 1
-                    next_kv_slice = (
+                    key_slot = lax.rem(
+                        kv_step,
+                        jnp.asarray(
+                            key_pipeline_depth,
+                            kv_step.dtype,
+                        ),
+                    )
+                    next_key_step = kv_step + key_pipeline_depth
+                    next_key_slice = (
                         batch,
-                        pl.ds(next_kv_step * block_kv, block_kv),
+                        pl.ds(next_key_step * block_kv, block_kv),
                         kv_head,
                     )
-                    next_transposed_slice = (
+                    plgpu.barrier_wait(
+                        key_for_scores_consumed.at[key_slot]
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        key_ref.at[next_key_slice],
+                        key_for_scores_smem.at[key_slot],
+                        key_for_scores_ready.at[key_slot],
+                    )
+
+                    next_value_step = kv_step + 1
+                    next_value_slice = (
                         batch,
+                        pl.ds(next_value_step * block_kv, block_kv),
                         kv_head,
-                        slice(None),
-                        pl.ds(next_kv_step * block_kv, block_kv),
-                    )
-                    plgpu.barrier_wait(key_for_scores_consumed)
-                    plgpu.copy_gmem_to_smem(
-                        key_ref.at[next_kv_slice],
-                        key_for_scores_smem,
-                        key_for_scores_ready,
-                    )
-                    plgpu.barrier_wait(key_for_dq_consumed)
-                    plgpu.copy_gmem_to_smem(
-                        key_transposed_ref.at[next_transposed_slice],
-                        key_for_dq_smem,
-                        key_for_dq_ready,
                     )
                     plgpu.barrier_wait(value_for_dp_consumed)
                     plgpu.copy_gmem_to_smem(
-                        value_ref.at[next_kv_slice],
+                        value_ref.at[next_value_slice],
                         value_for_dp_smem,
                         value_for_dp_ready,
                     )
+
+                final_value_slice = (
+                    batch,
+                    pl.ds(
+                        (num_kv_tiles - 1) * block_kv,
+                        block_kv,
+                    ),
+                    kv_head,
+                )
+                plgpu.barrier_wait(value_for_dp_consumed)
+                plgpu.copy_gmem_to_smem(
+                    value_ref.at[final_value_slice],
+                    value_for_dp_smem,
+                    value_for_dp_ready,
+                )
 
         @pl.kernel(
             mesh=mesh,
@@ -2526,7 +2653,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             key_ref,
             value_ref,
             query_transposed_ref,
-            key_transposed_ref,
             gradient_ref,
             gradient_transposed_ref,
             lse_transposed_ref,
@@ -2541,7 +2667,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
                     key_ref,
                     value_ref,
                     query_transposed_ref,
-                    key_transposed_ref,
                     gradient_ref,
                     gradient_transposed_ref,
                     lse_transposed_ref,
@@ -2563,7 +2688,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
             key_ref,
             value_ref,
             query_transposed_ref,
-            key_transposed_ref,
             gradient_ref,
             gradient_transposed_ref,
             lse_transposed_ref,
@@ -2578,7 +2702,6 @@ def _mosaic_attention_backward_warp_specialized_unmasked(
         key,
         value,
         query_transposed,
-        key_transposed,
         gradient,
         gradient_transposed,
         log_normalizer_transposed,
