@@ -1399,7 +1399,6 @@ def _masked_attention_via_mosaic_bwd(
         block_size,
         kv_block_size,
         window_size,
-        backward_strategy,
     )
     Q, K, V, output, log_normalizer = res
     from jaxmodules._mosaic_attention import mosaic_attention_backward
@@ -1413,6 +1412,7 @@ def _masked_attention_via_mosaic_bwd(
         upstream_grad,
         mask_fn,
         is_causal=is_causal,
+        backward_strategy=backward_strategy,
     )
 
 

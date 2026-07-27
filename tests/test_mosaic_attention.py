@@ -271,6 +271,7 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
             lse,
             gradient,
             _complex_mask,
+            backward_strategy="minimal",
         )
     )(query, key, value, mosaic_output, mosaic_lse, cotangent)
     for direct_gradient, mapped_gradient in zip(
@@ -283,6 +284,73 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
             np.asarray(mapped_gradient),
             rtol=tolerance,
             atol=tolerance,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_mosaic_custom_vjp_composes_with_jit_and_vmap():
+    keys = jax.random.split(jax.random.key(29), 4)
+    shape = (2, 1, 64, 2, 64)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    def loss(attention_fn, q, k, v, gradient):
+        output = attention_fn(
+            q,
+            k,
+            v,
+            mask_fn=_complex_mask,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=False,
+            backward_strategy="auto",
+        )
+        return jnp.sum(output * gradient)
+
+    mosaic_grad = jax.jit(
+        jax.vmap(
+            jax.grad(
+                lambda q, k, v, gradient: loss(
+                    _masked_attention_via_mosaic,
+                    q,
+                    k,
+                    v,
+                    gradient,
+                ),
+                argnums=(0, 1, 2),
+            )
+        )
+    )
+    mapped_grad = jax.jit(
+        jax.vmap(
+            jax.grad(
+                lambda q, k, v, gradient: loss(
+                    _masked_attention_via_map,
+                    q,
+                    k,
+                    v,
+                    gradient,
+                ),
+                argnums=(0, 1, 2),
+            )
+        )
+    )
+
+    mosaic_gradients = mosaic_grad(query, key, value, cotangent)
+    mapped_gradients = mapped_grad(query, key, value, cotangent)
+    for mosaic_gradient, mapped_gradient in zip(
+        mosaic_gradients,
+        mapped_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(mosaic_gradient),
+            np.asarray(mapped_gradient),
+            rtol=3e-3,
+            atol=3e-3,
         )
 
 
