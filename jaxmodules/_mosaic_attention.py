@@ -647,6 +647,7 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
     dtype = query.dtype
     scale = float(head_dim**-0.5)
     log2e = math.log2(math.e)
+    accumulator_layout = plgpu.Layout.MMA_ACC(dtype)
     swizzle = 128
     swizzle_elems = swizzle // jnp.dtype(dtype).itemsize
     lhs_smem_transforms = (
@@ -701,6 +702,38 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
             _is_signed=scalar_fragment.is_signed,
         )
 
+    @plgpu.inline_mgpu(
+        arg_types=(
+            accumulator_layout,
+            accumulator_layout,
+            plgpu.Layout.MMA_RHS(dtype),
+        ),
+        return_type=plgpu.ShapeDtypeStruct(
+            (block_q, head_dim),
+            jnp.float32,
+            layout=accumulator_layout,
+        ),
+    )
+    def mma_with_accumulator_lhs(
+        _,
+        accumulator,
+        matrix,
+        rhs,
+    ):
+        # For a 64x64 tile, casting MMA_ACC to the input dtype leaves every
+        # element in the same lane/register order expected by MMA_LHS. Rewrap
+        # those registers directly instead of storing and reloading P through
+        # shared memory.
+        lhs_layout = plgpu.Layout.MMA_LHS(dtype).to_mgpu()
+        lhs = mgpu.FragmentedArray(
+            _registers=matrix.registers.reshape(
+                lhs_layout.registers_shape(matrix.shape)
+            ),
+            _layout=lhs_layout,
+            _is_signed=matrix.is_signed,
+        )
+        return mgpu.mma(accumulator, lhs, rhs)
+
     def kernel(
         query_ref,
         key_transposed_ref,
@@ -714,11 +747,7 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
         batch = lax.axis_index("batch")
         query_head = lax.axis_index("heads")
         wg_index = lax.axis_index("wg")
-        (
-            key_smem,
-            value_smem,
-            probability_smem,
-        ) = smem_buffers
+        key_smem, value_smem = smem_buffers
         key_barriers, value_barriers = ready_barriers
         key_consumed_barriers, value_consumed_barriers = consumed_barriers
         kv_head = lax.div(
@@ -733,7 +762,6 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                 lax.axis_index("query_supertiles") * query_superblock
                 + wg_index * block_q
             )
-            wg_probability_smem = probability_smem.at[wg_index]
             query_fragment = plgpu.load(
                 query_ref.at[
                     batch,
@@ -797,14 +825,9 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                 plgpu.barrier_wait(value_barriers.at[slot])
                 value_fragment = load_shared_rhs(value_smem.at[slot])
                 plgpu.barrier_arrive(value_consumed_barriers.at[slot])
-                wg_probability_smem[...] = probabilities.astype(dtype)
-                probability_fragment = plgpu.load(
-                    wg_probability_smem,
-                    optimized=False,
-                )
-                output_accumulator = plgpu.mma(
+                output_accumulator = mma_with_accumulator_lhs(
                     output_accumulator,
-                    probability_fragment,
+                    probabilities.astype(dtype),
                     value_fragment,
                 )
                 return output_accumulator, row_max, row_sum
@@ -900,11 +923,6 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
         dtype,
         transforms=lhs_smem_transforms,
     )
-    probability_scratch = plgpu.SMEM(
-        (num_compute_wgs, block_q, block_kv),
-        dtype,
-        transforms=lhs_smem_transforms,
-    )
     output_type = jax.ShapeDtypeStruct(query.shape, dtype)
     lse_type = jax.ShapeDtypeStruct(
         (batch_size, query_heads, query_length),
@@ -918,7 +936,6 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
             (
                 key_scratch,
                 value_scratch,
-                probability_scratch,
             ),
             (
                 plgpu.Barrier(num_barriers=max_concurrent_steps),
