@@ -20,7 +20,6 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
@@ -664,42 +663,18 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
         ),
     )
     def load_shared_rhs(_, smem_ref):
-        # ``mma.sync`` expects pairs in each RHS register, but those pairs are
-        # not contiguous in the TMA-compatible shared-memory swizzle. Load the
-        # same lane ownership one scalar at a time, then pack each local pair.
+        # Store the logical RHS transposed in shared memory so its reduction
+        # dimension is contiguous. The tiled transpose restores the matrix's
+        # logical orientation and lets Mosaic lower the native MMA_RHS transfer
+        # to ``ldmatrix`` instead of scalar loads plus local packing.
+        transposed_ref = mgpu.memref_transpose(smem_ref, (1, 0, 3, 2))
         native_layout = plgpu.Layout.MMA_RHS(dtype).to_mgpu()
-        scalar_rhs_layout = mgpu.TiledLayout(
-            native_layout.tiling,
-            warp_dims=native_layout.warp_dims,
-            lane_dims=native_layout.lane_dims,
-            vector_dim=-1,
-        )
-        scalar_fragment = mgpu.FragmentedArray.load_tiled(
-            smem_ref,
+        return mgpu.FragmentedArray.load_tiled(
+            transposed_ref,
             swizzle=swizzle,
-            layout=scalar_rhs_layout,
-            optimized=False,
+            layout=native_layout,
+            optimized=True,
             tiling_rank=2,
-        )
-        native_registers = np.empty(
-            native_layout.registers_shape((block_kv, head_dim)),
-            dtype=object,
-        )
-        for native_index in np.ndindex(native_registers.shape):
-            scalar_prefix = native_index[:6]
-            scalar_suffix = native_index[7]
-            native_registers[native_index] = mgpu.utils.vector_concat(
-                [
-                    scalar_fragment.registers[
-                        (*scalar_prefix, component, scalar_suffix)
-                    ]
-                    for component in range(2)
-                ]
-            )
-        return mgpu.FragmentedArray(
-            _registers=native_registers,
-            _layout=native_layout,
-            _is_signed=scalar_fragment.is_signed,
         )
 
     @plgpu.inline_mgpu(
@@ -736,8 +711,8 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
 
     def kernel(
         query_ref,
-        key_transposed_ref,
-        value_ref,
+        key_ref,
+        value_transposed_ref,
         output_ref,
         lse_ref,
         smem_buffers,
@@ -865,19 +840,19 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                     pl.ds(kv_step * block_kv, block_kv),
                     kv_head,
                 )
-                key_slice = (
+                value_slice = (
                     batch,
                     kv_head,
                     slice(None),
                     pl.ds(kv_step * block_kv, block_kv),
                 )
                 plgpu.copy_gmem_to_smem(
-                    key_transposed_ref.at[key_slice],
+                    key_ref.at[kv_slice],
                     key_smem.at[kv_step],
                     key_barriers.at[kv_step],
                 )
                 plgpu.copy_gmem_to_smem(
-                    value_ref.at[kv_slice],
+                    value_transposed_ref.at[value_slice],
                     value_smem.at[kv_step],
                     value_barriers.at[kv_step],
                 )
@@ -895,20 +870,20 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                     pl.ds(next_kv_step * block_kv, block_kv),
                     kv_head,
                 )
-                next_key_slice = (
+                next_value_slice = (
                     batch,
                     kv_head,
                     slice(None),
                     pl.ds(next_kv_step * block_kv, block_kv),
                 )
                 plgpu.copy_gmem_to_smem(
-                    key_transposed_ref.at[next_key_slice],
+                    key_ref.at[next_kv_slice],
                     key_smem.at[slot],
                     key_barriers.at[slot],
                 )
                 plgpu.barrier_wait(value_consumed_barriers.at[slot])
                 plgpu.copy_gmem_to_smem(
-                    value_ref.at[next_kv_slice],
+                    value_transposed_ref.at[next_value_slice],
                     value_smem.at[slot],
                     value_barriers.at[slot],
                 )
@@ -928,7 +903,7 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
         (batch_size, query_heads, query_length),
         jnp.float32,
     )
-    key_transposed = jnp.transpose(key, (0, 2, 3, 1))
+    value_transposed = jnp.transpose(value, (0, 2, 3, 1))
     output, lse = plgpu.kernel(
         kernel,
         out_type=(output_type, lse_type),
@@ -960,7 +935,7 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
         grid_names=("heads", "query_supertiles", "batch"),
         num_threads=num_compute_wgs + 1,
         thread_name="wg",
-    )(query, key_transposed, value)
+    )(query, key, value_transposed)
     return output, jnp.swapaxes(lse, 1, 2)
 
 
