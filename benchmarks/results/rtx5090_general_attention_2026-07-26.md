@@ -169,3 +169,53 @@ the vendor kernel.
 Correctness was checked by eight Mosaic GPU tests, including FP16 and BF16
 gradient agreement with the mapped implementation and composition under JIT
 and VMAP. The broader mapped-attention suite adds 63 passing regression tests.
+
+## Follow-up optimization pass
+
+Commit `63d4819` adds two conservative specializations without changing the
+public callable-mask API:
+
+- calls whose mask jaxpr is literal `True` bypass mask materialization;
+- causal tiles strictly below the diagonal bypass mask materialization, and
+  causal query programs launch longest-first to reduce the triangular tail.
+
+The generic callable-mask engine is unchanged. A new test compares the
+unmasked specialization with a logically equivalent mask that is deliberately
+not recognized as literal, through both forward and custom-VJP backward. The
+focused Mosaic suite now has nine passing tests.
+
+The following current-Mosaic measurements used the same compilation,
+fresh-process, and memory methodology as above, with five warmups and 30 timed
+iterations. Memory is unchanged from the earlier causal results.
+
+| N | old forward | current forward | reduction | old gradient | current gradient | reduction |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 0.085 ms | 0.076 ms | 10.6% | 0.264 ms | 0.233 ms | 11.7% |
+| 2,048 | 0.130 ms | 0.130 ms | 0.0% | 0.473 ms | 0.432 ms | 8.7% |
+| 4,096 | 0.256 ms | 0.251 ms | 2.0% | 1.106 ms | 1.037 ms | 6.2% |
+| 8,192 | 0.655 ms | 0.582 ms | 11.1% | 3.138 ms | 2.695 ms | 14.1% |
+| 16,384 | 2.043 ms | 1.685 ms | 17.5% | 10.949 ms | 9.101 ms | 16.9% |
+| 32,768 | 7.112 ms | 6.362 ms | 10.5% | 40.287 ms | 32.034 ms | 20.5% |
+
+At `N=32,768`, the causal gap to cuDNN therefore falls from 2.1x to 1.9x
+forward and from 3.4x to 2.7x for the compiled gradient. Unmasked performance
+remained within 5% of the earlier result at every tested scale; the new
+literal-mask branch is effectively neutral on this workload.
+
+Several lower-level variants were compiled and measured, but intentionally
+reverted:
+
+| experiment | result |
+|---|---|
+| TMA FP32 reduction stores for dK/dV | Correct, but 32K general backward rose to 7.768 ms. An atomic control with the same unpadded scratch took 6.396 ms, isolating most of the loss to TMA rather than padding. |
+| Double-buffered asynchronous K/V loads | Both the current pipeline helper and a manual barrier pipeline exhausted Mosaic layout inference, even with a 10x diagnostic search budget. No compiler workaround was retained. |
+| In-kernel FP32 cotangent decomposition | Reduced 64K causal compiler temporary from 258 to 194 MiB, but runtime rose from 127.812 to 139.179 ms. At 32K with the sparse general mask it rose from 5.935 to 7.164 ms. |
+| Rotated K/V traversal to spread atomics | Correct, but 16K-64K unmasked backward was 2.9%-6.4% slower; lost K/V locality outweighed reduced write contention. |
+| Query-major CUDA grid order | Correct, but 8K-64K unmasked backward was 3.8%-19.0% slower. |
+
+These results narrow the remaining opportunity: on SM120 the current atomics
+are not the dominant dense-kernel bottleneck in isolation. Closing more of the
+cuDNN gap likely requires a warp-specialized kernel in which a dedicated
+memory warpgroup pipelines swizzled K/V tiles for multiple compute warpgroups.
+That is a different kernel organization, not a local change to the present
+single-warpgroup `mma.sync` loop.
