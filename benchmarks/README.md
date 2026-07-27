@@ -73,11 +73,13 @@ uv run python benchmarks/benchmark_mapped_attention.py \
   --iterations 10
 ```
 
-Mapped backward uses the faster one-pass strategy by default. To benchmark the
-two-pass variant that eliminates sequence-sized FP32 gradient carries, pass
-`--mapped-backward-strategy minimal`. This can reduce the total peak when that
-carry is material; inputs, outputs, forward residuals, or score-tile
-temporaries may dominate other shapes.
+Mapped and Mosaic backward use their faster one-pass strategies by default. To
+benchmark the two-pass variants that eliminate sequence-sized FP32 gradient
+carries, pass `--mapped-backward-strategy minimal`. Mosaic's one-pass path
+combines query-major programs with FP32 atomic dK/dV accumulation. The
+two-pass variant can reduce the total peak when that carry is material;
+inputs, outputs, forward residuals, or score-tile temporaries may dominate
+other shapes.
 
 The mapped standard-attention path always uses
 `jax.lax.Precision.HIGHEST` contractions and at least FP32 accumulation.

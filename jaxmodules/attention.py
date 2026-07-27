@@ -549,7 +549,7 @@ def _masked_attention_via_mosaic(
     is_causal,
     backward_strategy,
 ) -> Array:
-    """Mosaic forward paired with the established tiled custom backward."""
+    """Mosaic forward paired with its memory-efficient custom backward."""
     del block_size, kv_block_size, window_size, backward_strategy
     from jaxmodules._mosaic_attention import mosaic_attention_forward
 
@@ -1599,16 +1599,16 @@ def masked_attention_via_map(
         will be even larger for keys or values near the edges of the sequence. This parameter is indended
         to control performance rather than for exact masking.
         Use the  mask_fn to explicitly enforce a constant window size if desired.
-    backward_strategy: ``"auto"`` uses a one-pass backward and carries whichever
-        full-precision gradient set is smaller. ``"minimal"`` recomputes score
-        tiles in separate Q and K/V passes so no sequence-sized FP32 gradient
-        is carried. This trades additional compute for less gradient-carry
-        memory, although other live buffers can dominate the total peak.
-        Neither strategy changes contraction or accumulation precision. The
-        strategy applies to the optimized default kernel; custom kernels retain
-        their generic custom-VJP path. Calls eligible for the Mosaic GPU fast
-        path use its fixed two-pass, linear-memory backward and therefore do
-        not use this fallback tuning option.
+    backward_strategy: ``"auto"`` uses a one-pass backward. The mapped fallback
+        carries whichever full-precision gradient set is smaller; the Mosaic
+        fast path uses query-major programs with FP32 atomic dK/dV
+        accumulation. ``"minimal"`` recomputes score tiles in separate Q and
+        K/V passes so no sequence-sized FP32 gradient is carried. This trades
+        additional compute for less gradient-carry memory, although other live
+        buffers can dominate the total peak. Neither strategy changes
+        contraction or accumulation precision. The strategy applies to the
+        optimized default kernel; custom kernels retain their generic
+        custom-VJP path.
     """
 
     # Validate dimensions
