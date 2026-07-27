@@ -350,6 +350,82 @@ def test_masked_attention_causal():
     assert_outputs_close(output, output_torch, test_name="causal")
 
 
+def test_causal_hint_intersects_with_user_mask():
+    """A causal hint prunes acausal pairs without replacing the user mask."""
+    N, Hq, d = 8, 4, 16
+    key1, key2, key3 = jax.random.split(jax.random.PRNGKey(43), 3)
+    Q = jax.random.normal(key1, (N, Hq, d))
+    K = jax.random.normal(key2, (N, Hq, d))
+    V = jax.random.normal(key3, (N, Hq, d))
+
+    def user_mask(h, q, k):
+        return (q + 2 * k + h) % 3 != 0
+
+    def explicit_causal_user_mask(h, q, k):
+        return (q >= k) & user_mask(h, q, k)
+
+    hinted = masked_attention_via_map(
+        Q,
+        K,
+        V,
+        is_causal=True,
+        mask_fn=user_mask,
+        block_size=4,
+    )
+    explicit = masked_attention_via_map(
+        Q,
+        K,
+        V,
+        mask_fn=explicit_causal_user_mask,
+        block_size=4,
+    )
+    np.testing.assert_allclose(hinted, explicit, rtol=1e-5, atol=1e-5)
+
+    def loss(q, k, v, *, hinted):
+        output = masked_attention_via_map(
+            q,
+            k,
+            v,
+            is_causal=hinted,
+            mask_fn=user_mask if hinted else explicit_causal_user_mask,
+            block_size=4,
+        )
+        return jnp.mean(output**2)
+
+    hinted_gradients = jax.grad(
+        lambda q, k, v: loss(q, k, v, hinted=True),
+        argnums=(0, 1, 2),
+    )(Q, K, V)
+    explicit_gradients = jax.grad(
+        lambda q, k, v: loss(q, k, v, hinted=False),
+        argnums=(0, 1, 2),
+    )(Q, K, V)
+    for hinted_gradient, explicit_gradient in zip(
+        hinted_gradients,
+        explicit_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            hinted_gradient,
+            explicit_gradient,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
+def test_attention_output_matches_input_dtype(dtype):
+    keys = jax.random.split(jax.random.PRNGKey(44), 3)
+    shape = (8, 2, 16)
+    query = jax.random.normal(keys[0], shape, dtype=dtype)
+    key = jax.random.normal(keys[1], shape, dtype=dtype)
+    value = jax.random.normal(keys[2], shape, dtype=dtype)
+
+    output = masked_attention_via_map(query, key, value, block_size=4)
+
+    assert output.dtype == query.dtype
+
+
 def test_masked_attention_sliding_window():
     """Test masked_attention_via_map with sliding window mask"""
     N, Hq, d = 8, 4, 16
@@ -1324,13 +1400,6 @@ def test_masked_attention_error_cases():
     Q = jax.random.normal(key1, (N, Hq, d))
     K = jax.random.normal(key2, (L, Hkv, d))
     V = jax.random.normal(key3, (L, Hkv, d))
-    
-    # Test that is_causal and mask_fn cannot both be specified
-    def dummy_mask(h, q, k):
-        return True
-    
-    with pytest.raises(ValueError):
-        masked_attention_via_map(Q, K, V, is_causal=True, mask_fn=dummy_mask)
     
     # Test with mismatched dimensions
     K_wrong = jax.random.normal(key2, (L, Hkv, d + 1))

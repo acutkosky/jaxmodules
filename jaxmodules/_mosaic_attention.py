@@ -69,7 +69,7 @@ class MosaicAttentionConfig:
 
     block_q: int = 64
     block_kv: int = 64
-    probability_components: int = 2
+    probability_components: int = 1
 
 
 def _jaxpr_uses_supported_mask_primitives(jaxpr: jax_core.Jaxpr) -> bool:
@@ -134,10 +134,7 @@ def _select_config(
 
     if query.shape[1] % 64 or key.shape[1] % 64:
         return None
-    probability_components = 2 if query.dtype == jnp.float16 else 3
-    return MosaicAttentionConfig(
-        probability_components=probability_components,
-    )
+    return MosaicAttentionConfig()
 
 
 def supports_mosaic_attention(
@@ -181,8 +178,9 @@ def _materialize_mask_tile(
     block_q: int,
     block_kv: int,
     layout: Any,
+    is_causal: bool = False,
 ) -> jax.Array:
-    """Evaluate an accepted scalar mask expression over one score tile."""
+    """Evaluate a user-mask tile and optionally intersect it with causality."""
 
     shape = (block_q, block_kv)
     query_indices = plgpu.broadcasted_iota(
@@ -197,17 +195,21 @@ def _materialize_mask_tile(
         1,
         layout=layout,
     )
+    global_query_indices = query_indices + query_base
+    global_key_indices = key_indices + kv_step * block_kv
     mask = jnp.asarray(
         mask_fn(
             batch,
             query_head,
-            query_indices + query_base,
-            key_indices + kv_step * block_kv,
+            global_query_indices,
+            global_key_indices,
         ),
         dtype=jnp.bool_,
     )
     if not mask.shape:
         mask = lax.broadcast_in_dim(mask, shape, ())
+    if is_causal:
+        mask &= global_query_indices >= global_key_indices
     return mask
 
 
@@ -384,11 +386,9 @@ def mosaic_attention_forward(
                 optimized=False,
             )
 
-            # A standard FlashAttention kernel casts ``probabilities`` to
-            # the input dtype before PV. Preserve substantially all FP32
-            # probability information by decomposing it into multiple
-            # low-precision components, then accumulating each
-            # tensor-core product into the same FP32 accumulator.
+            # Match the input precision used by standard FlashAttention:
+            # softmax and accumulation remain FP32, while the tensor-core PV
+            # operand uses the input dtype.
             probability_residual = probabilities
             for _ in range(config.probability_components):
                 component = probability_residual.astype(dtype)
@@ -410,7 +410,7 @@ def mosaic_attention_forward(
         def unmasked_kv_body(kv_step, carry):
             return process_tile(kv_step, carry, None)
 
-        def masked_kv_body(kv_step, carry):
+        def materialize_and_process(kv_step, carry, *, apply_causal):
             mask = _materialize_mask_tile(
                 mask_fn,
                 batch=batch,
@@ -420,8 +420,9 @@ def mosaic_attention_forward(
                 block_q=block_q,
                 block_kv=block_kv,
                 layout=accumulator_layout,
+                is_causal=apply_causal,
             )
-            if is_causal:
+            if is_unmasked:
                 return process_tile(kv_step, carry, mask)
             return lax.cond(
                 _tile_has_attention(
@@ -434,8 +435,22 @@ def mosaic_attention_forward(
                 carry,
             )
 
+        def user_masked_kv_body(kv_step, carry):
+            return materialize_and_process(
+                kv_step,
+                carry,
+                apply_causal=False,
+            )
+
+        def causal_masked_kv_body(kv_step, carry):
+            return materialize_and_process(
+                kv_step,
+                carry,
+                apply_causal=True,
+            )
+
         carry = (output_accumulator, row_max, row_sum)
-        if is_unmasked:
+        if is_unmasked and not is_causal:
             output_accumulator, row_max, row_sum = lax.fori_loop(
                 0,
                 num_kv_tiles,
@@ -454,20 +469,24 @@ def mosaic_attention_forward(
             carry = lax.fori_loop(
                 0,
                 full_kv_stop,
-                unmasked_kv_body,
+                (
+                    unmasked_kv_body
+                    if is_unmasked
+                    else user_masked_kv_body
+                ),
                 carry,
             )
             output_accumulator, row_max, row_sum = lax.fori_loop(
                 full_kv_stop,
                 kv_stop,
-                masked_kv_body,
+                causal_masked_kv_body,
                 carry,
             )
         else:
             output_accumulator, row_max, row_sum = lax.fori_loop(
                 0,
                 num_kv_tiles,
-                masked_kv_body,
+                user_masked_kv_body,
                 carry,
             )
 
@@ -502,7 +521,7 @@ def mosaic_attention_forward(
             batch,
             pl.ds(query_base, block_q),
             query_head,
-        ] = normalized
+        ] = normalized.astype(dtype)
 
         # row_max is kept in base-2 units in the loop. The mapped backward
         # expects a natural-log normalizer.
@@ -527,7 +546,7 @@ def mosaic_attention_forward(
             plgpu.SwizzleTransform(swizzle),
         ),
     )
-    output_type = jax.ShapeDtypeStruct(query.shape, jnp.float32)
+    output_type = jax.ShapeDtypeStruct(query.shape, dtype)
     lse_type = jax.ShapeDtypeStruct(
         (batch_size, query_heads, query_length),
         jnp.float32,
@@ -577,8 +596,9 @@ def _materialize_transposed_mask_tile(
     block_q: int,
     block_kv: int,
     layout: Any,
+    is_causal: bool = False,
 ) -> jax.Array:
-    """Evaluate a mask tile in K-by-Q orientation."""
+    """Evaluate a user-mask tile in K-by-Q orientation."""
 
     shape = (block_kv, block_q)
     key_indices = plgpu.broadcasted_iota(
@@ -593,17 +613,21 @@ def _materialize_transposed_mask_tile(
         1,
         layout=layout,
     )
+    global_query_indices = query_indices + query_base
+    global_key_indices = key_indices + kv_base
     mask = jnp.asarray(
         mask_fn(
             batch,
             query_head,
-            query_indices + query_base,
-            key_indices + kv_base,
+            global_query_indices,
+            global_key_indices,
         ),
         dtype=jnp.bool_,
     )
     if not mask.shape:
         mask = lax.broadcast_in_dim(mask, shape, ())
+    if is_causal:
+        mask &= global_query_indices >= global_key_indices
     return mask
 
 
@@ -752,6 +776,7 @@ def _mosaic_attention_backward_two_pass(
                 block_q=block_q,
                 block_kv=block_kv,
                 layout=accumulator_layout,
+                is_causal=is_causal,
             )
 
             def process_tile(query_gradient):
@@ -933,6 +958,7 @@ def _mosaic_attention_backward_two_pass(
                     block_q=block_q,
                     block_kv=block_kv,
                     layout=accumulator_layout,
+                    is_causal=is_causal,
                 )
 
                 def process_tile(gradients):
@@ -1553,7 +1579,12 @@ def _mosaic_attention_backward_one_pass(
             def unmasked_kv_body(kv_step, query_gradient):
                 return process_tile(kv_step, query_gradient, None)
 
-            def masked_kv_body(kv_step, query_gradient):
+            def materialize_and_process(
+                kv_step,
+                query_gradient,
+                *,
+                apply_causal,
+            ):
                 mask = _materialize_mask_tile(
                     mask_fn,
                     batch=batch,
@@ -1563,8 +1594,9 @@ def _mosaic_attention_backward_one_pass(
                     block_q=block_q,
                     block_kv=block_kv,
                     layout=accumulator_layout,
+                    is_causal=apply_causal,
                 )
-                if is_causal:
+                if is_unmasked:
                     return process_tile(kv_step, query_gradient, mask)
                 return lax.cond(
                     _tile_has_attention(
@@ -1577,7 +1609,21 @@ def _mosaic_attention_backward_one_pass(
                     query_gradient,
                 )
 
-            if is_unmasked:
+            def user_masked_kv_body(kv_step, query_gradient):
+                return materialize_and_process(
+                    kv_step,
+                    query_gradient,
+                    apply_causal=False,
+                )
+
+            def causal_masked_kv_body(kv_step, query_gradient):
+                return materialize_and_process(
+                    kv_step,
+                    query_gradient,
+                    apply_causal=True,
+                )
+
+            if is_unmasked and not is_causal:
                 query_gradient = lax.fori_loop(
                     0,
                     num_kv_tiles,
@@ -1596,20 +1642,24 @@ def _mosaic_attention_backward_one_pass(
                 query_gradient = lax.fori_loop(
                     0,
                     full_kv_stop,
-                    unmasked_kv_body,
+                    (
+                        unmasked_kv_body
+                        if is_unmasked
+                        else user_masked_kv_body
+                    ),
                     query_gradient,
                 )
                 query_gradient = lax.fori_loop(
                     full_kv_stop,
                     kv_stop,
-                    masked_kv_body,
+                    causal_masked_kv_body,
                     query_gradient,
                 )
             else:
                 query_gradient = lax.fori_loop(
                     0,
                     num_kv_tiles,
-                    masked_kv_body,
+                    user_masked_kv_body,
                     query_gradient,
                 )
             query_gradient_ref[

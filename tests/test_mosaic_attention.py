@@ -37,6 +37,15 @@ def _causal_mask(batch, head, query_index, key_index):
     return query_index >= key_index
 
 
+def _causal_complex_mask(batch, head, query_index, key_index):
+    return (query_index >= key_index) & _complex_mask(
+        batch,
+        head,
+        query_index,
+        key_index,
+    )
+
+
 def _unmasked(batch, head, query_index, key_index):
     del batch, head, query_index, key_index
     return True
@@ -94,7 +103,7 @@ def test_mosaic_forward_matches_mapped_for_general_masks(mask_fn):
     mosaic_output, mosaic_lse = mosaic(query, key, value)
     mapped_output, mapped_lse = mapped(query, key, value)
 
-    assert mosaic_output.dtype == jnp.float32
+    assert mosaic_output.dtype == query.dtype
     np.testing.assert_allclose(
         np.asarray(mosaic_output),
         np.asarray(mapped_output),
@@ -251,8 +260,8 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
     np.testing.assert_allclose(
         np.asarray(mosaic_value),
         np.asarray(mapped_value),
-        rtol=2e-3,
-        atol=2e-3,
+        rtol=tolerance,
+        atol=tolerance,
     )
     for mosaic_gradient, mapped_gradient in zip(
         mosaic_gradients,
@@ -420,7 +429,17 @@ def test_unmasked_specialization_matches_the_general_engine():
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
-def test_causal_block_pruning_matches_the_general_engine():
+@pytest.mark.parametrize(
+    ("hinted_mask", "explicit_mask"),
+    [
+        (_unmasked, _causal_mask),
+        (_complex_mask, _causal_complex_mask),
+    ],
+)
+def test_causal_block_pruning_matches_the_general_engine(
+    hinted_mask,
+    explicit_mask,
+):
     keys = jax.random.split(jax.random.key(23), 4)
     shape = (1, 128, 2, 64)
     query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
@@ -433,7 +452,7 @@ def test_causal_block_pruning_matches_the_general_engine():
             q,
             k,
             v,
-            mask_fn=_causal_mask,
+            mask_fn=hinted_mask if prune else explicit_mask,
             block_size=64,
             kv_block_size=64,
             window_size=None,

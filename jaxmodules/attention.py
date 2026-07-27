@@ -61,24 +61,38 @@ def _causal_mask(b, h, q, k):
     return q >= k
 
 
-def _materialize_mask(mask_fn, B, Hq, Hkv, q_idx, k_idx):
-    """Materialize one mask tile in grouped-query layout."""
-    if mask_fn is _unmasked:
-        return True
-    if mask_fn is _causal_mask:
-        return q_idx[None, :, None, None, None] >= k_idx[None, None, None, None, :]
-
-    MQA_factor = Hq // Hkv
-    mask = fancy_vmap(
-        mask_fn,
-        "mask[b, q, h, k] = mask_fn(B[b], Hq[h], q_idx[q], k_idx[k])"
-    )(jnp.arange(B), jnp.arange(Hq), q_idx, k_idx)
-    return rearrange(
-        mask,
-        "B Lq (Hkv MQA) Lk -> B Lq Hkv MQA Lk",
-        Hkv=Hkv,
-        MQA=MQA_factor,
+def _materialize_mask(
+    mask_fn,
+    B,
+    Hq,
+    Hkv,
+    q_idx,
+    k_idx,
+    *,
+    is_causal=False,
+):
+    """Materialize one user-mask tile, intersected with causal structure."""
+    causal_mask = (
+        q_idx[None, :, None, None, None]
+        >= k_idx[None, None, None, None, :]
     )
+    if mask_fn is _unmasked:
+        return causal_mask if is_causal else True
+    if mask_fn is _causal_mask:
+        mask = causal_mask
+    else:
+        MQA_factor = Hq // Hkv
+        mask = fancy_vmap(
+            mask_fn,
+            "mask[b, q, h, k] = mask_fn(B[b], Hq[h], q_idx[q], k_idx[k])",
+        )(jnp.arange(B), jnp.arange(Hq), q_idx, k_idx)
+        mask = rearrange(
+            mask,
+            "B Lq (Hkv MQA) Lk -> B Lq Hkv MQA Lk",
+            Hkv=Hkv,
+            MQA=MQA_factor,
+        )
+    return mask & causal_mask if is_causal else mask
 
 
 def _attn_kq_block_fn(
@@ -92,6 +106,7 @@ def _attn_kq_block_fn(
     v_block, # [B, Lk, Hkv, dv]
     mask_fn,
     kernel_fn,
+    is_causal=False,
 ):
     B, Lq, Hq, dq = q_block.shape
     _, Lk, Hkv, _ = k_block.shape
@@ -105,7 +120,15 @@ def _attn_kq_block_fn(
     )
     q_block = rearrange(q_block, "B Lq (Hkv MQA) dq -> B Lq Hkv MQA dq", Hkv=Hkv)
 
-    mask = _materialize_mask(mask_fn, B, Hq, Hkv, q_idx, k_idx)
+    mask = _materialize_mask(
+        mask_fn,
+        B,
+        Hq,
+        Hkv,
+        q_idx,
+        k_idx,
+        is_causal=is_causal,
+    )
 
     max_score = rearrange(
         max_score,
@@ -194,6 +217,7 @@ def _make_attention_kq_scanner(
     kernel_fn,
     q_idx,
     q_block,
+    is_causal,
 ):
     def scan_fn(
         carry,
@@ -211,7 +235,9 @@ def _make_attention_kq_scanner(
             k_block,
             v_block,
             mask_fn,
-            kernel_fn)
+            kernel_fn,
+            is_causal=is_causal,
+        )
         return (max_score, normalizer, numerator), None
     return scan_fn
 
@@ -317,6 +343,7 @@ def _attn_block_fn(
                 v_block[i],
                 mask_fn,
                 kernel_fn,
+                is_causal=is_causal,
             )
             return (max_score, normalizer, numerator)
 
@@ -332,7 +359,13 @@ def _attn_block_fn(
         )
     else:
         # Standard scan over all K/V blocks
-        kq_scanner = _make_attention_kq_scanner(mask_fn, kernel_fn, q_idx, q_block)
+        kq_scanner = _make_attention_kq_scanner(
+            mask_fn,
+            kernel_fn,
+            q_idx,
+            q_block,
+            is_causal,
+        )
         (max_score, normalizer, numerator), _ = jax.lax.scan(
             kq_scanner,
             init=init_carry,
@@ -497,7 +530,7 @@ def _masked_attention_via_map(
         window_size=window_size,
         is_causal=is_causal,
     )
-    return values
+    return values.astype(Q.dtype)
 
 
 def _masked_attention_via_map_fwd(
@@ -524,7 +557,7 @@ def _masked_attention_via_map_fwd(
         is_causal=is_causal,
     )
     del backward_strategy
-    return values, (Q, K, V, values, log_normalizer)
+    return values.astype(Q.dtype), (Q, K, V, values, log_normalizer)
 
 
 @partial(
@@ -603,6 +636,7 @@ def _standard_attention_tile_backward(
     scale,
     accumulator_dtype,
     dot_precision,
+    is_causal,
 ):
     """Recompute one score tile and return its Q, K, and V contributions."""
     mask = _materialize_mask(
@@ -612,6 +646,7 @@ def _standard_attention_tile_backward(
         kv_heads,
         q_idx,
         k_idx,
+        is_causal=is_causal,
     )
     scores = jnp.einsum(
         "bqhgd,bkhd->bqhgk",
@@ -786,6 +821,7 @@ def _standard_attention_backward_query_major(
                 scale,
                 accumulator_dtype,
                 dot_precision,
+                is_causal,
             )
             dQ_acc = dQ_acc + dQ_block
             dK_block = dK_acc[kv_block_idx] + dK_block
@@ -948,6 +984,7 @@ def _standard_attention_backward_key_major(
                         scale,
                         accumulator_dtype,
                         dot_precision,
+                        is_causal,
                     )
                 )
                 dQ_block = dQ_carry[query_block_idx] + dQ_block
@@ -1128,6 +1165,7 @@ def _standard_attention_backward_two_pass(
                 scale,
                 accumulator_dtype,
                 dot_precision,
+                is_causal,
             )
             return dQ_acc + dQ_block
 
@@ -1180,6 +1218,7 @@ def _standard_attention_backward_two_pass(
                     scale,
                     accumulator_dtype,
                     dot_precision,
+                    is_causal,
                 )
                 return dK_carry + dK_block, dV_carry + dV_block
 
@@ -1428,17 +1467,17 @@ def _canonicalize_mask_fn(mask_fn, is_causal):
 
     Handles:
     - 3-arg mask functions (h, q, k) -> wrapped to ignore batch
-    - is_causal=True -> causal mask (q >= k)
-    - None -> no masking (always True)
+    - None -> no user masking (always True)
+
+    Causality remains a separate structural constraint. When ``is_causal`` is
+    true, the attention implementations intersect this user mask with
+    ``q >= k`` while pruning wholly acausal tiles.
     """
     if mask_fn is not None and mask_fn.__code__.co_argcount == 3:
         three_arg_mask_fn = mask_fn
         mask_fn = lambda b, h, q, k: three_arg_mask_fn(h, q, k)
 
-    if is_causal and mask_fn is not None:
-        raise ValueError("cannot specify both 'is_causal' and 'mask_fn'!")
-    if is_causal:
-        return _causal_mask
+    del is_causal
     if mask_fn is None:
         return _unmasked
     return mask_fn
@@ -1576,16 +1615,20 @@ def masked_attention_via_map(
     K: array of key values, shape [B, L, Hkv, d] or [L, Hkv, d]
     Q: array of queries, shape [B, N, Hq, d] or [N, Hq, d]
     V: array of values, shape [B, L, Hkv, d] or [L, Hkv, d]
-    is_causal: if true, apply a causal mask
+    is_causal: if true, restrict attention to causal pairs. This is a
+        structural hint that may be combined with ``mask_fn``: wholly
+        acausal tiles are skipped and the callable is only relevant within
+        the causal region.
     kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
         default is q, k -> jnp.exp( <q, k> / sqrt(d) )
         The default kernel uses ``jax.lax.Precision.HIGHEST`` contractions and
         accumulates low-precision inputs in at least FP32 in both passes.
     mask_fn: takes integers b, h, q, k or h, q, kand returns a boolean specifying
         the attention mask for the bth item in batch, hth head and the qth query and kth key.
-        If is_causal is true, you cannot provide mask_fn; it will be generated automatically.
-        If is_causal is False and mask_fn is None, then the default value of no masking will
-        be used (equivalent to mask_fn = lambda b, h, q, k: True).
+        If ``is_causal`` is true, this user mask is intersected with the causal
+        condition. If ``mask_fn`` is None, no additional restriction is used,
+        giving standard maximal causal attention. If ``is_causal`` is false
+        and ``mask_fn`` is None, no masking is used.
     block_size: Query tile size. If omitted, choose a bounded tile targeting an
         approximately 32 MiB score tile instead of materializing full attention.
         If specified and kv_block_size is omitted, use this size for both axes.
@@ -1609,6 +1652,10 @@ def masked_attention_via_map(
         contraction or accumulation precision. The strategy applies to the
         optimized default kernel; custom kernels retain their generic
         custom-VJP path.
+
+    Returns:
+        Attention values with the same dtype as ``Q``. Softmax reductions and
+        low-precision matrix-product accumulation still use FP32 internally.
     """
 
     # Validate dimensions

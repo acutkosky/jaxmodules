@@ -81,9 +81,10 @@ two-pass variant can reduce the total peak when that carry is material;
 inputs, outputs, forward residuals, or score-tile temporaries may dominate
 other shapes.
 
-The mapped standard-attention path always uses
-`jax.lax.Precision.HIGHEST` contractions and at least FP32 accumulation.
-Tile and backward-strategy sweeps do not relax that precision policy.
+The mapped and Mosaic standard-attention paths return the input dtype. They
+compute softmax reductions and low-precision matrix-product accumulations in
+FP32, matching the conventional FlashAttention precision policy. Tile and
+backward-strategy sweeps do not relax that policy.
 
 Use `--mask unmasked`, `--mask causal`, or `--mask general`. The general case
 uses a noncausal batch/head-dependent radius-plus-modulo callable for Mosaic
