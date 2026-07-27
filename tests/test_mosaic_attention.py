@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from jaxmodules._mosaic_attention import (
+    _can_use_warp_specialized_forward,
+    _mosaic_attention_forward_warp_specialized_unmasked,
     mask_is_mosaic_compatible,
     mosaic_attention_backward,
     mosaic_attention_forward,
@@ -64,6 +66,72 @@ def test_mask_compatibility_is_conservative():
     )
     assert not mask_is_mosaic_compatible(
         lambda batch, head, query, key: jnp.sin(query + key) > 0
+    )
+
+
+def test_warp_specialized_forward_selection_is_large_scale_only():
+    large = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float16)
+    small = jax.ShapeDtypeStruct((1, 2048, 2, 64), jnp.float16)
+    fp32 = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float32)
+
+    assert _can_use_warp_specialized_forward(
+        large,
+        large,
+        is_unmasked=True,
+        is_causal=False,
+    )
+    assert not _can_use_warp_specialized_forward(
+        small,
+        small,
+        is_unmasked=True,
+        is_causal=False,
+    )
+    assert not _can_use_warp_specialized_forward(
+        large,
+        large,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_forward(
+        fp32,
+        fp32,
+        is_unmasked=True,
+        is_causal=False,
+    )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [
+        (jnp.float16, 2e-3),
+        (jnp.bfloat16, 2e-2),
+    ],
+)
+def test_warp_specialized_forward_matches_xla(dtype, tolerance):
+    keys = jax.random.split(jax.random.key(5), 3)
+    query = jax.random.normal(keys[0], (1, 1024, 2, 64), dtype=dtype)
+    key = jax.random.normal(keys[1], (1, 1024, 1, 64), dtype=dtype)
+    value = jax.random.normal(keys[2], (1, 1024, 1, 64), dtype=dtype)
+
+    output, log_normalizer = jax.jit(
+        _mosaic_attention_forward_warp_specialized_unmasked
+    )(query, key, value)
+    expected = jax.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        implementation="xla",
+    )
+
+    assert output.dtype == dtype
+    assert log_normalizer.dtype == jnp.float32
+    assert bool(jnp.all(jnp.isfinite(log_normalizer)))
+    np.testing.assert_allclose(
+        np.asarray(output),
+        np.asarray(expected),
+        rtol=tolerance,
+        atol=tolerance,
     )
 
 

@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-IMPLEMENTATIONS = ("mosaic", "mapped", "xla", "cudnn")
+IMPLEMENTATIONS = ("mosaic", "mosaic-warp", "mapped", "xla", "cudnn")
 MODES = ("forward", "backward")
 DTYPES = ("float32", "bfloat16", "float16")
 MASKS = ("causal", "unmasked", "general")
@@ -155,6 +155,9 @@ def _make_function(case: Case) -> Any:
         _unmasked,
         default_kernel,
     )
+    from jaxmodules._mosaic_attention import (
+        _mosaic_attention_forward_warp_specialized_unmasked,
+    )
 
     is_causal = case.mask == "causal"
     mask_fn = {
@@ -163,7 +166,21 @@ def _make_function(case: Case) -> Any:
         "general": _general_mask,
     }[case.mask]
 
-    if case.implementation in ("mosaic", "mapped"):
+    if case.implementation == "mosaic-warp":
+        if case.mask != "unmasked":
+            raise ValueError("mosaic-warp currently supports only unmasked attention")
+        if case.mode != "forward":
+            raise ValueError("mosaic-warp currently implements only the forward pass")
+
+        def attention(query: Any, key: Any, value: Any) -> Any:
+            output, _ = _mosaic_attention_forward_warp_specialized_unmasked(
+                query,
+                key,
+                value,
+            )
+            return output
+
+    elif case.implementation in ("mosaic", "mapped"):
         implementation = case.implementation
 
         def attention(query: Any, key: Any, value: Any) -> Any:

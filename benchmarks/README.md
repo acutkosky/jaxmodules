@@ -1,11 +1,15 @@
 # Attention benchmarks
 
-`benchmark_mapped_attention.py` compares the Mosaic fast path, the previous
-mapped implementation, and JAX's XLA and cuDNN scaled-dot-product attention
+`benchmark_mapped_attention.py` compares the integrated Mosaic fast path, its
+large-unmasked warp kernel in isolation (`mosaic-warp`), the previous mapped
+implementation, and JAX's XLA and cuDNN scaled-dot-product attention
 implementations.
 
 The checked-in [RTX 5090 general-mask results](results/rtx5090_general_attention_2026-07-26.md)
 show the benchmark format and the large-context crossover.
+The [warp-specialized results](results/rtx5090_warp_specialized_2026-07-27.md)
+compare its input-precision FP16/BF16 performance and memory with cuDNN through
+128K context.
 
 Run the smoke suite while iterating:
 
@@ -51,6 +55,9 @@ Use `--case-timeout-seconds` to change that limit.
 
 Both forward and forward-plus-backward modes are measured by default. Pass
 `--mode forward` or `--mode backward` to select one.
+`--implementation mosaic-warp` is an unmasked-forward-only diagnostic for the
+private warp kernel; the normal `mosaic` implementation dispatches to it
+automatically at supported context sizes.
 
 `--block-size` accepts multiple values so that mapped attention is tuned at
 each workload rather than compared against XLA and cuDNN at an arbitrary tile
