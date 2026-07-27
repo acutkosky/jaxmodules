@@ -150,7 +150,6 @@ def _make_function(case: Case) -> Any:
     import jax.numpy as jnp
 
     from jaxmodules.attention import (
-        _causal_mask,
         _masked_attention_via_map,
         _masked_attention_via_mosaic,
         _unmasked,
@@ -159,7 +158,7 @@ def _make_function(case: Case) -> Any:
 
     is_causal = case.mask == "causal"
     mask_fn = {
-        "causal": _causal_mask,
+        "causal": _unmasked,
         "unmasked": _unmasked,
         "general": _general_mask,
     }[case.mask]
