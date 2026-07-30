@@ -8,10 +8,11 @@ import numpy as np
 import pytest
 
 from jaxmodules._mosaic_attention import (
+    _can_use_warp_specialized_causal_split_backward,
     _can_use_warp_specialized_forward,
-    _mosaic_attention_backward_warp_specialized_unmasked,
+    _mosaic_attention_backward_warp_specialized,
+    _mosaic_attention_backward_warp_specialized_causal_split,
     _mosaic_attention_forward_warp_specialized,
-    _mosaic_attention_forward_warp_specialized_unmasked,
     mask_is_mosaic_compatible,
     mosaic_attention_backward,
     mosaic_attention_forward,
@@ -117,6 +118,43 @@ def test_warp_specialized_forward_selection_respects_supported_shapes():
     assert not _can_use_warp_specialized_forward(
         fp32,
         fp32,
+        is_unmasked=True,
+        is_causal=False,
+    )
+
+
+def test_causal_split_backward_selection_avoids_small_and_gqa_cases():
+    large_mha = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float16)
+    small_mha = jax.ShapeDtypeStruct((1, 2048, 2, 64), jnp.float16)
+    large_gqa_key = jax.ShapeDtypeStruct((1, 4096, 1, 64), jnp.float16)
+
+    assert _can_use_warp_specialized_causal_split_backward(
+        large_mha,
+        large_mha,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_causal_split_backward(
+        small_mha,
+        small_mha,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_causal_split_backward(
+        large_mha,
+        large_gqa_key,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_causal_split_backward(
+        large_mha,
+        large_mha,
+        is_unmasked=False,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_causal_split_backward(
+        large_mha,
+        large_mha,
         is_unmasked=True,
         is_causal=False,
     )
@@ -261,17 +299,32 @@ def test_warp_specialized_causal_custom_vjp_matches_xla():
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize(
-    ("dtype", "tolerance"),
+    ("dtype", "tolerance", "is_causal"),
     [
-        (jnp.float16, 3e-3),
-        (jnp.bfloat16, 2e-2),
+        (jnp.float16, 3e-3, False),
+        (jnp.float16, 3e-3, True),
+        (jnp.bfloat16, 2e-2, False),
+        (jnp.bfloat16, 2e-2, True),
     ],
 )
-def test_warp_specialized_backward_matches_xla(dtype, tolerance):
+def test_warp_specialized_backward_matches_xla(
+    dtype,
+    tolerance,
+    is_causal,
+):
     keys = jax.random.split(jax.random.key(47), 4)
     query = jax.random.normal(keys[0], (1, 1024, 2, 64), dtype=dtype)
-    key = jax.random.normal(keys[1], (1, 1024, 1, 64), dtype=dtype)
-    value = jax.random.normal(keys[2], (1, 1024, 1, 64), dtype=dtype)
+    kv_heads = 2 if is_causal else 1
+    key = jax.random.normal(
+        keys[1],
+        (1, 1024, kv_heads, 64),
+        dtype=dtype,
+    )
+    value = jax.random.normal(
+        keys[2],
+        (1, 1024, kv_heads, 64),
+        dtype=dtype,
+    )
     cotangent = jax.random.normal(
         keys[3],
         query.shape,
@@ -279,10 +332,34 @@ def test_warp_specialized_backward_matches_xla(dtype, tolerance):
     )
 
     output, log_normalizer = jax.jit(
-        _mosaic_attention_forward_warp_specialized_unmasked
+        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+        )
     )(query, key, value)
     gradients = jax.jit(
-        _mosaic_attention_backward_warp_specialized_unmasked
+        lambda q, k, v, output, lse, gradient: (
+            _mosaic_attention_backward_warp_specialized_causal_split(
+                q,
+                k,
+                v,
+                output,
+                lse,
+                gradient,
+            )
+            if is_causal
+            else _mosaic_attention_backward_warp_specialized(
+                q,
+                k,
+                v,
+                output,
+                lse,
+                gradient,
+                is_causal=False,
+            )
+        )
     )(query, key, value, output, log_normalizer, cotangent)
 
     def xla_loss(q, k, v):
@@ -290,6 +367,7 @@ def test_warp_specialized_backward_matches_xla(dtype, tolerance):
             q,
             k,
             v,
+            is_causal=is_causal,
             implementation="xla",
         )
         return jnp.sum(attention.astype(jnp.float32) * cotangent)
