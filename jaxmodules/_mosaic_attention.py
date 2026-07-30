@@ -72,6 +72,23 @@ class MosaicAttentionConfig:
     block_kv: int = 64
 
 
+@dataclass(frozen=True)
+class WarpSpecializedForwardConfig:
+    """Compile-time resource allocation for a warp-specialized forward."""
+
+    block_q: int
+    block_kv: int
+    num_compute_wgs: int
+    compute_registers: int
+    producer_registers: int
+    pipeline_stages: int
+    probabilities_in_registers: bool
+
+    @property
+    def query_superblock(self) -> int:
+        return self.block_q * self.num_compute_wgs
+
+
 def _mma_layouts(
     dtype: jnp.dtype,
     block_rows: int,
@@ -307,18 +324,60 @@ def _can_use_warp_specialized_forward(
 ) -> bool:
     """Whether K/V sharing should replace the single-warpgroup forward path."""
 
-    minimum_length = 1024 if is_causal else 4096
     return (
-        is_unmasked
-        and (not is_causal or query.shape[1] == key.shape[1])
-        and query.dtype in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
-        and query.shape[1] >= minimum_length
-        and key.shape[1] >= minimum_length
-        and query.shape[1] % 128 == 0
-        and key.shape[1] % 64 == 0
-        and query.shape[3] == 64
-        and key.shape[3] == 64
+        _select_warp_specialized_forward_config(
+            query,
+            key,
+            is_unmasked=is_unmasked,
+            is_causal=is_causal,
+        )
+        is not None
     )
+
+
+def _warp_specialized_forward_config_for_head_dim(
+    head_dim: int,
+) -> WarpSpecializedForwardConfig | None:
+    """Return the tuned warp-specialized resource shape for one static D."""
+
+    if head_dim != 64:
+        return None
+    return WarpSpecializedForwardConfig(
+        block_q=64,
+        block_kv=64,
+        num_compute_wgs=2,
+        compute_registers=232,
+        producer_registers=40,
+        pipeline_stages=2,
+        probabilities_in_registers=True,
+    )
+
+
+def _select_warp_specialized_forward_config(
+    query: jax.Array,
+    key: jax.Array,
+    *,
+    is_unmasked: bool,
+    is_causal: bool,
+) -> WarpSpecializedForwardConfig | None:
+    """Select a statically generated producer/consumer kernel configuration."""
+
+    minimum_length = 1024 if is_causal else 4096
+    if (
+        not is_unmasked
+        or (is_causal and query.shape[1] != key.shape[1])
+        or query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
+        or query.shape[1] < minimum_length
+        or key.shape[1] < minimum_length
+        or query.shape[3] != key.shape[3]
+    ):
+        return None
+    config = _warp_specialized_forward_config_for_head_dim(query.shape[3])
+    if config is None:
+        return None
+    if query.shape[1] % config.query_superblock or key.shape[1] % config.block_kv:
+        return None
+    return config
 
 
 def _can_use_warp_specialized_causal_split_backward(
@@ -370,17 +429,19 @@ def mosaic_attention_forward(
     config = _select_config(query, key)
     assert config is not None
     is_unmasked = _mask_is_always_true(mask_fn)
-    if _can_use_warp_specialized_forward(
+    warp_config = _select_warp_specialized_forward_config(
         query,
         key,
         is_unmasked=is_unmasked,
         is_causal=is_causal,
-    ):
+    )
+    if warp_config is not None:
         return _mosaic_attention_forward_warp_specialized(
             query,
             key,
             value,
             is_causal=is_causal,
+            _config=warp_config,
         )
 
     batch_size, query_length, query_heads, head_dim = query.shape
@@ -492,9 +553,7 @@ def mosaic_attention_forward(
                 ),
                 accumulator_layout,
             )
-            probabilities = jnp.exp2(
-                scores * log2e - safe_next_row_max_broadcast
-            )
+            probabilities = jnp.exp2(scores * log2e - safe_next_row_max_broadcast)
             if mask is not None:
                 probabilities = jnp.where(
                     mask,
@@ -610,11 +669,7 @@ def mosaic_attention_forward(
             carry = lax.fori_loop(
                 0,
                 full_kv_stop,
-                (
-                    unmasked_kv_body
-                    if is_unmasked
-                    else user_masked_kv_body
-                ),
+                (unmasked_kv_body if is_unmasked else user_masked_kv_body),
                 carry,
             )
             output_accumulator, row_max, row_sum = lax.fori_loop(
@@ -721,6 +776,7 @@ def _mosaic_attention_forward_warp_specialized(
     value: jax.Array,
     *,
     is_causal: bool = False,
+    _config: WarpSpecializedForwardConfig | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute large dense attention with shared K/V producer staging.
 
@@ -742,16 +798,25 @@ def _mosaic_attention_forward_warp_specialized(
         raise ValueError("key and value sequence/head shapes must match")
     if query.shape[2] % key.shape[2]:
         raise ValueError("query heads must be divisible by key/value heads")
-    if query.shape[3] != 64 or key.shape[3] != 64 or value.shape[3] != 64:
-        raise ValueError("warp-specialized attention currently requires D=64")
+    if query.shape[3] != key.shape[3] or query.shape[3] != value.shape[3]:
+        raise ValueError("query, key, and value head dimensions must match")
+    config = (
+        _warp_specialized_forward_config_for_head_dim(query.shape[3])
+        if _config is None
+        else _config
+    )
+    if config is None:
+        raise ValueError(
+            f"no warp-specialized configuration is available for D={query.shape[3]}"
+        )
 
     batch_size, query_length, query_heads, head_dim = query.shape
     kv_length, kv_heads = key.shape[1:3]
-    block_q = 64
-    block_kv = 64
-    num_compute_wgs = 2
-    compute_registers = 232
-    query_superblock = block_q * num_compute_wgs
+    block_q = config.block_q
+    block_kv = config.block_kv
+    num_compute_wgs = config.num_compute_wgs
+    compute_registers = config.compute_registers
+    query_superblock = config.query_superblock
     if query_length % query_superblock:
         raise ValueError(f"query length must be divisible by {query_superblock}")
     if kv_length % block_kv:
@@ -760,7 +825,7 @@ def _mosaic_attention_forward_warp_specialized(
     query_heads_per_kv_head = query_heads // kv_heads
     num_query_supertiles = query_length // query_superblock
     num_kv_tiles = kv_length // block_kv
-    max_concurrent_steps = min(2, num_kv_tiles)
+    max_concurrent_steps = min(config.pipeline_stages, num_kv_tiles)
     dtype = query.dtype
     scale = float(head_dim**-0.5)
     log2e = math.log2(math.e)
@@ -935,9 +1000,7 @@ def _mosaic_attention_forward_warp_specialized(
                         scores.shape,
                         (0,),
                     )
-                    probabilities = jnp.exp2(
-                        scores * log2e - next_row_max_broadcast
-                    )
+                    probabilities = jnp.exp2(scores * log2e - next_row_max_broadcast)
                     previous_scale_broadcast = lax.broadcast_in_dim(
                         previous_scale,
                         output_accumulator.shape,
@@ -1016,7 +1079,10 @@ def _mosaic_attention_forward_warp_specialized(
 
         @pl.when(wg_index == num_compute_wgs)
         def memory_warpgroup():
-            plgpu.set_max_registers(40, action="decrease")
+            plgpu.set_max_registers(
+                config.producer_registers,
+                action="decrease",
+            )
             for kv_step in range(max_concurrent_steps):
                 kv_slice = (
                     batch,
@@ -1972,9 +2038,7 @@ def _mosaic_attention_backward_one_pass(
                     key_for_scores,
                 )
                 scores *= scale
-                probabilities = jnp.exp2(
-                    (scores - lse_broadcast) * log2e
-                )
+                probabilities = jnp.exp2((scores - lse_broadcast) * log2e)
                 if mask is not None:
                     probabilities = jnp.where(
                         mask,
@@ -2023,6 +2087,7 @@ def _mosaic_attention_backward_one_pass(
                 ds_component = ds.astype(dtype)
 
                 if block_q == 64:
+
                     def load_transposed_ds(matrix_smem):
                         matrix_smem[:, :block_kv] = ds_component
                         return load_transposed_scratch(matrix_smem)
@@ -2037,6 +2102,7 @@ def _mosaic_attention_backward_one_pass(
                         key_for_dq,
                     )
                 else:
+
                     def load_ds_fragments(matrix_smem):
                         matrix_smem[:, :block_kv] = ds_component
                         direct = plgpu.load(
@@ -2170,11 +2236,7 @@ def _mosaic_attention_backward_one_pass(
                 query_gradient = lax.fori_loop(
                     0,
                     full_kv_stop,
-                    (
-                        unmasked_kv_body
-                        if is_unmasked
-                        else user_masked_kv_body
-                    ),
+                    (unmasked_kv_body if is_unmasked else user_masked_kv_body),
                     query_gradient,
                 )
                 query_gradient = lax.fori_loop(
@@ -2277,9 +2339,7 @@ def _mosaic_attention_backward_warp_specialized(
     producer_registers = 40 if compute_kv_gradients else 32
     query_superblock = block_q * num_compute_wgs
     if query_length % query_superblock:
-        raise ValueError(
-            f"query length must be divisible by {query_superblock}"
-        )
+        raise ValueError(f"query length must be divisible by {query_superblock}")
     if kv_length % block_kv:
         raise ValueError(f"key/value length must be divisible by {block_kv}")
     if query_heads % kv_heads:
@@ -2356,9 +2416,7 @@ def _mosaic_attention_backward_warp_specialized(
             (block_kv, head_dim),
             rhs_layout,
         ).registers.copy()
-        matrix_shape = ir.Attribute.parse(
-            "#nvvm.ld_st_matrix_shape<m=8, n=8>"
-        )
+        matrix_shape = ir.Attribute.parse("#nvvm.ld_st_matrix_shape<m=8, n=8>")
         int32 = ir.IntegerType.get_signless(32)
         lane = arith.remui(
             mgpu.thread_idx(),
@@ -2603,9 +2661,7 @@ def _mosaic_attention_backward_warp_specialized(
                 query_base = query_tile * block_q
                 query_slice = pl.ds(query_base, block_q)
                 matrix_smem = (
-                    transpose_smem.at[wg_index]
-                    if compute_kv_gradients
-                    else None
+                    transpose_smem.at[wg_index] if compute_kv_gradients else None
                 )
 
                 query_fragment = plgpu.load(
@@ -2697,12 +2753,8 @@ def _mosaic_attention_backward_warp_specialized(
                         ),
                     )
 
-                    plgpu.barrier_wait(
-                        key_for_scores_ready.at[key_slot]
-                    )
-                    key_for_scores = load_shared_rhs(
-                        key_for_scores_smem.at[key_slot]
-                    )
+                    plgpu.barrier_wait(key_for_scores_ready.at[key_slot])
+                    key_for_scores = load_shared_rhs(key_for_scores_smem.at[key_slot])
                     scores = plgpu.mma(
                         plgpu.layout_cast(
                             jnp.zeros(
@@ -2715,9 +2767,7 @@ def _mosaic_attention_backward_warp_specialized(
                         key_for_scores,
                     )
                     scores *= scale
-                    probabilities = jnp.exp2(
-                        (scores - lse_broadcast) * log2e
-                    )
+                    probabilities = jnp.exp2((scores - lse_broadcast) * log2e)
                     if is_causal:
                         probabilities = lax.cond(
                             kv_step == query_tile,
@@ -2756,9 +2806,7 @@ def _mosaic_attention_backward_warp_specialized(
                     key_for_dq = load_shared_rhs_without_transpose(
                         key_for_scores_smem.at[key_slot]
                     )
-                    plgpu.barrier_arrive(
-                        key_for_scores_consumed.at[key_slot]
-                    )
+                    plgpu.barrier_arrive(key_for_scores_consumed.at[key_slot])
                     query_gradient = mma_with_accumulator_lhs(
                         query_gradient,
                         ds_component,
@@ -2769,12 +2817,8 @@ def _mosaic_attention_backward_warp_specialized(
 
                     probability_component = probabilities.astype(dtype)
                     matrix_smem[...] = probability_component
-                    probability_rhs = load_shared_rhs_without_transpose(
-                        matrix_smem
-                    )
-                    gradient_for_dv = load_shared_lhs(
-                        gradient_for_dv_smem.at[wg_index]
-                    )
+                    probability_rhs = load_shared_rhs_without_transpose(matrix_smem)
+                    gradient_for_dv = load_shared_lhs(gradient_for_dv_smem.at[wg_index])
                     value_gradient_transposed = plgpu.mma(
                         plgpu.layout_cast(
                             jnp.zeros(
@@ -2798,9 +2842,7 @@ def _mosaic_attention_backward_warp_specialized(
 
                     matrix_smem[...] = ds_component
                     ds_rhs = load_shared_rhs_without_transpose(matrix_smem)
-                    query_for_dk = load_shared_lhs(
-                        query_for_dk_smem.at[wg_index]
-                    )
+                    query_for_dk = load_shared_lhs(query_for_dk_smem.at[wg_index])
                     key_gradient_transposed = plgpu.mma(
                         plgpu.layout_cast(
                             jnp.zeros(
@@ -2858,9 +2900,7 @@ def _mosaic_attention_backward_warp_specialized(
                             query_for_dk_ready.at[consumer],
                         )
                         plgpu.copy_gmem_to_smem(
-                            gradient_transposed_ref.at[
-                                query_transposed_slice
-                            ],
+                            gradient_transposed_ref.at[query_transposed_slice],
                             gradient_for_dv_smem.at[consumer],
                             gradient_for_dv_ready.at[consumer],
                         )
@@ -2902,9 +2942,7 @@ def _mosaic_attention_backward_warp_specialized(
                         pl.ds(next_key_step * block_kv, block_kv),
                         kv_head,
                     )
-                    plgpu.barrier_wait(
-                        key_for_scores_consumed.at[key_slot]
-                    )
+                    plgpu.barrier_wait(key_for_scores_consumed.at[key_slot])
                     plgpu.copy_gmem_to_smem(
                         key_ref.at[next_key_slice],
                         key_for_scores_smem.at[key_slot],
@@ -3071,9 +3109,7 @@ def _mosaic_attention_backward_warp_specialized_causal_dkv(
     if query_length % block_q:
         raise ValueError(f"query length must be divisible by {block_q}")
     if kv_length % kv_superblock:
-        raise ValueError(
-            f"key/value length must be divisible by {kv_superblock}"
-        )
+        raise ValueError(f"key/value length must be divisible by {kv_superblock}")
 
     num_query_tiles = query_length // block_q
     num_kv_supertiles = kv_length // kv_superblock
@@ -3141,9 +3177,7 @@ def _mosaic_attention_backward_warp_specialized_causal_dkv(
             (head_dim, block_q),
             rhs_layout,
         ).registers.copy()
-        matrix_shape = ir.Attribute.parse(
-            "#nvvm.ld_st_matrix_shape<m=8, n=8>"
-        )
+        matrix_shape = ir.Attribute.parse("#nvvm.ld_st_matrix_shape<m=8, n=8>")
         int32 = ir.IntegerType.get_signless(32)
         lane = arith.remui(
             mgpu.thread_idx(),
@@ -3471,9 +3505,7 @@ def _mosaic_attention_backward_warp_specialized_causal_dkv(
                     query_offset,
                     jnp.asarray(pipeline_depth, query_offset.dtype),
                 )
-                next_query_tile = (
-                    query_start + query_offset + pipeline_depth
-                )
+                next_query_tile = query_start + query_offset + pipeline_depth
                 next_query_slice = pl.ds(
                     next_query_tile * block_q,
                     block_q,
@@ -3650,9 +3682,7 @@ def mosaic_attention_backward(
             is_causal=is_causal,
         )
     if backward_strategy != "auto":
-        raise ValueError(
-            "backward_strategy must be 'auto', 'minimal', or 'one_pass'"
-        )
+        raise ValueError("backward_strategy must be 'auto', 'minimal', or 'one_pass'")
 
     is_unmasked = _mask_is_always_true(mask_fn)
     use_warp_specialized = _can_use_warp_specialized_forward(
