@@ -12,6 +12,7 @@ TCGEN05 interfaces.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,13 +21,13 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jaxlib.mlir import ir
-from jaxlib.mlir.dialects import arith, llvm, memref, nvvm
-
+from jaxlib.mlir.dialects import arith, llvm, memref, nvvm, vector
 
 # This is intentionally narrower than Mosaic GPU's full lowering registry.
 # Every accepted primitive must also be covered by a compiled mask test before
@@ -125,10 +126,16 @@ def _mma_layouts(
     dtype: jnp.dtype,
     block_rows: int,
 ) -> tuple[Any, Any, Any]:
-    """Build matching synchronous-MMA layouts for 16, 32, or 64 rows."""
+    """Build matching synchronous-MMA layouts for 16, 32, or 64 rows.
 
-    if jnp.dtype(dtype).itemsize != 2:
-        raise ValueError("MMA layouts require 16-bit operands")
+    FP16/BF16 use ``m16n8k16`` instructions, while FP32 operands are rounded
+    to TF32 immediately before ``m16n8k8`` instructions. Both accumulate in
+    FP32.
+    """
+
+    itemsize = jnp.dtype(dtype).itemsize
+    if itemsize not in (2, 4):
+        raise ValueError("MMA layouts require 16- or 32-bit operands")
     if block_rows not in (16, 32, 64):
         raise ValueError("MMA row tiles must be 16, 32, or 64")
     if block_rows == 64:
@@ -140,15 +147,70 @@ def _mma_layouts(
 
     m_warps = block_rows // 16
     n_warps = 4 // m_warps
+    if itemsize == 4:
+        # Unit dimensions disappear when MMALayouts canonicalizes its TF32
+        # layouts. Spell out that canonical representation because Pallas'
+        # public TILED wrapper intentionally rejects noncanonical layouts.
+        if block_rows == 16:
+            lhs_warp_dims = (plgpu.Replicated(4),)
+            rhs_warp_dims = (plgpu.Replicated(1), -4)
+            accumulator_warp_dims = (-6,)
+        else:
+            lhs_warp_dims = (-7, plgpu.Replicated(2))
+            rhs_warp_dims = (plgpu.Replicated(2), -4)
+            accumulator_warp_dims = (-7, -6)
+        lhs_layout = plgpu.Layout.TILED(
+            plgpu.Tiling(
+                (
+                    (block_rows, 8),
+                    (16, 4),
+                    (8, 4),
+                    (1,),
+                )
+            ),
+            warp_dims=lhs_warp_dims,
+            lane_dims=(-3, -2),
+            vector_dim=-1,
+        )
+        rhs_layout = plgpu.Layout.TILED(
+            plgpu.Tiling(
+                (
+                    (8, n_warps * 8),
+                    (4, 8),
+                    (1,),
+                )
+            ),
+            warp_dims=rhs_warp_dims,
+            lane_dims=(-2, -3),
+            vector_dim=-1,
+        )
+        accumulator_layout = plgpu.Layout.TILED(
+            plgpu.Tiling(
+                (
+                    (block_rows, n_warps * 8),
+                    (16, 8),
+                    (8, 8),
+                    (2,),
+                )
+            ),
+            warp_dims=accumulator_warp_dims,
+            lane_dims=(-3, -2),
+            vector_dim=-1,
+        )
+        return lhs_layout, rhs_layout, accumulator_layout
+
+    elements_per_register = 4 // itemsize
+    mma_k = 8 * elements_per_register
+    sub_k = 4 * elements_per_register
     replicated_m = plgpu.Replicated(4 // m_warps)
     replicated_n = plgpu.Replicated(4 // n_warps)
     lhs_layout = plgpu.Layout.TILED(
         plgpu.Tiling(
             (
-                (m_warps * 16, 16),
-                (16, 8),
-                (8, 8),
-                (2,),
+                (m_warps * 16, mma_k),
+                (16, sub_k),
+                (8, sub_k),
+                (elements_per_register,),
             )
         ),
         warp_dims=(-7, replicated_m),
@@ -158,9 +220,9 @@ def _mma_layouts(
     rhs_layout = plgpu.Layout.TILED(
         plgpu.Tiling(
             (
-                (16, n_warps * 8),
-                (8, 8),
-                (2, 1),
+                (mma_k, n_warps * 8),
+                (sub_k, 8),
+                (elements_per_register, 1),
             )
         ),
         warp_dims=(replicated_n, -5),
@@ -181,6 +243,182 @@ def _mma_layouts(
         vector_dim=-1,
     )
     return lhs_layout, rhs_layout, accumulator_layout
+
+
+def _scalar_register(register: ir.Value) -> ir.Value:
+    """Unpack a one-element vector register for a TF32 conversion."""
+
+    if isinstance(register.type, ir.VectorType):
+        vector_type = ir.VectorType(register.type)
+        if vector_type.shape != [1]:
+            raise ValueError(f"expected one FP32 value, got {vector_type}")
+        return vector.extract(
+            register,
+            dynamic_position=[],
+            static_position=ir.DenseI64ArrayAttr.get([0]),
+        )
+    return register
+
+
+def _round_to_tf32_bits(value: ir.Value) -> ir.Value:
+    """Round one FP32 register to TF32 and return its packed PTX bits."""
+
+    return llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [value],
+        "cvt.rna.tf32.f32 $0, $1;",
+        "=r,f",
+        has_side_effects=False,
+    )
+
+
+def _tf32_mma_single_tile(
+    accumulator: mgpu.FragmentedArray,
+    lhs: mgpu.FragmentedArray,
+    rhs: mgpu.FragmentedArray,
+) -> mgpu.FragmentedArray:
+    """Accumulate one 16x8x8 TF32 warp-level MMA tile."""
+
+    i32 = ir.IntegerType.get_signless(32)
+    accumulator_registers = [
+        vector.extract(
+            register,
+            dynamic_position=[],
+            static_position=ir.DenseI64ArrayAttr.get([position]),
+        )
+        for register in accumulator.registers.flatten()
+        for position in range(accumulator.layout.vector_length)
+    ]
+    lhs_registers = [
+        _round_to_tf32_bits(_scalar_register(register))
+        for register in lhs.registers.flatten()
+    ]
+    rhs_registers = [
+        _round_to_tf32_bits(_scalar_register(register))
+        for register in rhs.registers.flatten()
+    ]
+    if (
+        len(accumulator_registers) != 4
+        or len(lhs_registers) != 4
+        or len(rhs_registers) != 2
+    ):
+        raise ValueError("unexpected m16n8k8 register assignment")
+
+    counter = itertools.count()
+
+    def operands(count: int) -> str:
+        return "{" + ",".join(f"${next(counter)}" for _ in range(count)) + "}"
+
+    instruction = (
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        f"{operands(4)}, {operands(4)}, {operands(2)}, {operands(4)};"
+    )
+    inputs = [
+        *lhs_registers,
+        *rhs_registers,
+        *accumulator_registers,
+    ]
+    constraints = ",".join(
+        ["=f"] * 4 + ["r"] * 4 + ["r"] * 2 + ["f"] * 4
+    )
+    output = llvm.inline_asm(
+        llvm.StructType.get_literal([ir.F32Type.get()] * 4),
+        inputs,
+        instruction,
+        constraints,
+        has_side_effects=False,
+    )
+    scalar_outputs = [
+        llvm.extractvalue(ir.F32Type.get(), output, [index])
+        for index in range(4)
+    ]
+    vector_type = ir.VectorType.get((2,), ir.F32Type.get())
+    undefined = llvm.mlir_undef(vector_type)
+    vector_outputs = []
+    for first, second in zip(
+        scalar_outputs[::2],
+        scalar_outputs[1::2],
+        strict=True,
+    ):
+        packed = llvm.insertelement(
+            undefined,
+            first,
+            position=mgpu.utils.c(0, i32),
+        )
+        packed = llvm.insertelement(
+            packed,
+            second,
+            position=mgpu.utils.c(1, i32),
+        )
+        vector_outputs.append(packed)
+    registers = np.asarray(vector_outputs, dtype=object).reshape(
+        accumulator.registers.shape
+    )
+    return mgpu.FragmentedArray(
+        _registers=registers,
+        _layout=accumulator.layout,
+        _is_signed=accumulator.is_signed,
+    )
+
+
+def _tf32_mma(
+    accumulator: mgpu.FragmentedArray,
+    lhs: mgpu.FragmentedArray,
+    rhs: mgpu.FragmentedArray,
+) -> mgpu.FragmentedArray:
+    """Compute ``accumulator + lhs @ rhs`` with TF32 tensor-core multiplies."""
+
+    m, k = lhs.shape
+    k_rhs, n = rhs.shape
+    if k != k_rhs or accumulator.shape != (m, n):
+        raise ValueError("incompatible TF32 MMA operand shapes")
+    m_tile, k_tile = lhs.layout.base_tile_shape
+    k_rhs_tile, n_tile = rhs.layout.base_tile_shape
+    if k_tile != k_rhs_tile:
+        raise ValueError("incompatible TF32 MMA layouts")
+    result = accumulator.copy()
+
+    def tile(index: int, size: int) -> slice:
+        return slice(index * size, (index + 1) * size)
+
+    for k_index in range(k // k_tile):
+        for m_index in range(m // m_tile):
+            for n_index in range(n // n_tile):
+                m_slice = tile(m_index, m_tile)
+                k_slice = tile(k_index, k_tile)
+                n_slice = tile(n_index, n_tile)
+                result[m_slice, n_slice] = _tf32_mma_single_tile(
+                    result[m_slice, n_slice],
+                    lhs[m_slice, k_slice],
+                    rhs[k_slice, n_slice],
+                )
+    return result
+
+
+def _make_mosaic_mma(
+    dtype: jnp.dtype,
+    lhs_layout: Any,
+    rhs_layout: Any,
+    accumulator_layout: Any,
+    output_shape: tuple[int, int],
+) -> Callable[[jax.Array, jax.Array, jax.Array], jax.Array]:
+    """Select native 16-bit MMA or an inline synchronous TF32 implementation."""
+
+    if jnp.dtype(dtype) != jnp.dtype(jnp.float32):
+        return plgpu.mma
+
+    @plgpu.inline_mgpu(
+        arg_types=(accumulator_layout, lhs_layout, rhs_layout),
+        return_type=plgpu.ShapeDtypeStruct(
+            output_shape,
+            jnp.float32,
+            layout=accumulator_layout,
+        ),
+    )
+    def tf32_mma(_, accumulator, lhs, rhs):
+        return _tf32_mma(accumulator, lhs, rhs)
+
+    return tf32_mma
 
 
 def _smem_swizzle_for_trailing_dimension(
@@ -276,13 +514,15 @@ def _select_config(
 ) -> MosaicAttentionConfig | None:
     """Choose score tiles that keep wide-head register pressure bounded."""
 
-    if query.shape[3] >= 80:
-        tile_size = 32
+    if query.dtype == jnp.dtype(jnp.float32):
+        block_q = block_kv = 32
+    elif query.shape[3] >= 80:
+        block_q = block_kv = 32
     else:
-        tile_size = 64
-    if query.shape[1] % tile_size or key.shape[1] % tile_size:
+        block_q = block_kv = 64
+    if query.shape[1] % block_q or key.shape[1] % block_kv:
         return None
-    return MosaicAttentionConfig(block_q=tile_size, block_kv=tile_size)
+    return MosaicAttentionConfig(block_q=block_q, block_kv=block_kv)
 
 
 def _is_supported_head_dimension(head_dim: int) -> bool:
@@ -304,7 +544,11 @@ def supports_mosaic_attention(
 
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         return False
-    if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
+    if query.dtype not in (
+        jnp.dtype(jnp.float16),
+        jnp.dtype(jnp.bfloat16),
+        jnp.dtype(jnp.float32),
+    ):
         return False
     if query.dtype != key.dtype or query.dtype != value.dtype:
         return False
@@ -576,6 +820,7 @@ def _can_use_generated_warp_specialized_split_backward(
     dkv_config = _warp_specialized_dkv_config_for_head_dim(query.shape[3])
     return (
         is_unmasked
+        and query.dtype in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
         and dq_config is not None
         and dkv_config is not None
         and _prefer_generated_warp_specialized_backward(
@@ -599,7 +844,7 @@ def _prefer_non_atomic_generic_backward(query: jax.Array) -> bool:
     mask kind.
     """
 
-    return query.shape[3] >= 80
+    return query.dtype == jnp.dtype(jnp.float32) or query.shape[3] >= 80
 
 
 def mosaic_attention_forward(
@@ -647,6 +892,20 @@ def mosaic_attention_forward(
         block_q,
     )
     row_layout = accumulator_layout.reduce(1)
+    score_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, block_kv),
+    )
+    feature_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, head_dim),
+    )
 
     def kernel(
         query_ref,
@@ -703,7 +962,7 @@ def mosaic_attention_forward(
                 layout=rhs_layout,
                 optimized=False,
             )
-            scores = plgpu.mma(
+            scores = score_mma(
                 plgpu.layout_cast(
                     jnp.zeros(
                         (block_q, block_kv),
@@ -787,7 +1046,7 @@ def mosaic_attention_forward(
                 layout=lhs_layout,
                 optimized=False,
             )
-            output_accumulator = plgpu.mma(
+            output_accumulator = feature_mma(
                 output_accumulator,
                 probability_fragment,
                 value_fragment,
@@ -1579,6 +1838,20 @@ def _mosaic_attention_backward_two_pass(
     )
     row_layout = accumulator_layout.reduce(1)
     column_layout = accumulator_layout.reduce(0)
+    score_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, block_kv),
+    )
+    feature_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, head_dim),
+    )
 
     gradient = upstream_gradient.astype(dtype)
     gradient_transposed = jnp.transpose(gradient, (0, 2, 3, 1))
@@ -1694,7 +1967,7 @@ def _mosaic_attention_backward_two_pass(
                     layout=rhs_layout,
                     optimized=False,
                 )
-                scores = plgpu.mma(
+                scores = score_mma(
                     plgpu.layout_cast(
                         jnp.zeros(
                             (block_q, block_kv),
@@ -1727,7 +2000,7 @@ def _mosaic_attention_backward_two_pass(
                     ),
                     accumulator_layout,
                 )
-                dp = plgpu.mma(dp, gradient_fragment, value_for_dp)
+                dp = score_mma(dp, gradient_fragment, value_for_dp)
                 ds = probabilities * (dp - delta_broadcast)
 
                 key_for_dq = plgpu.load(
@@ -1749,7 +2022,7 @@ def _mosaic_attention_backward_two_pass(
                     layout=lhs_layout,
                     optimized=False,
                 )
-                query_gradient = plgpu.mma(
+                query_gradient = feature_mma(
                     query_gradient,
                     ds_fragment,
                     key_for_dq,
@@ -1880,7 +2153,7 @@ def _mosaic_attention_backward_two_pass(
                         layout=rhs_layout,
                         optimized=False,
                     )
-                    scores_transposed = plgpu.mma(
+                    scores_transposed = score_mma(
                         plgpu.layout_cast(
                             jnp.zeros(
                                 (block_kv, block_q),
@@ -1947,7 +2220,7 @@ def _mosaic_attention_backward_two_pass(
                         layout=rhs_layout,
                         optimized=False,
                     )
-                    dp_transposed = plgpu.mma(
+                    dp_transposed = score_mma(
                         dp_transposed,
                         value_fragment,
                         gradient_for_dp,
@@ -1993,7 +2266,7 @@ def _mosaic_attention_backward_two_pass(
                         layout=lhs_layout,
                         optimized=False,
                     )
-                    key_gradient = plgpu.mma(
+                    key_gradient = feature_mma(
                         key_gradient,
                         ds_fragment,
                         query_for_dk,
@@ -2005,7 +2278,7 @@ def _mosaic_attention_backward_two_pass(
                         layout=lhs_layout,
                         optimized=False,
                     )
-                    value_gradient = plgpu.mma(
+                    value_gradient = feature_mma(
                         value_gradient,
                         probability_fragment,
                         gradient_rhs,
@@ -5140,6 +5413,11 @@ def mosaic_attention_backward(
             is_causal=is_causal,
         )
     if backward_strategy == "one_pass":
+        if query.dtype == jnp.dtype(jnp.float32):
+            raise ValueError(
+                "one-pass Mosaic backward is not available for FP32; "
+                "use 'auto' or 'minimal'"
+            )
         return _mosaic_attention_backward_one_pass(
             query,
             key,

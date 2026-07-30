@@ -107,9 +107,11 @@ uses larger compiler temporaries. Inputs, outputs, forward residuals, or
 score-tile temporaries may dominate the measured peak on other shapes.
 
 The mapped and Mosaic standard-attention paths return the input dtype. They
-compute softmax reductions and low-precision matrix-product accumulations in
-FP32, matching the conventional FlashAttention precision policy. Tile and
-backward-strategy sweeps do not relax that policy.
+compute softmax reductions and matrix-product accumulations in FP32.
+Float16/bfloat16 use native input-precision tensor-core multiplies; float32
+uses TF32 tensor-core multiplies on GPU while retaining FP32 accumulation,
+storage, and outputs. CPU float32 fallback uses full FP32 contractions. Tile
+and backward-strategy sweeps do not further relax that policy.
 
 Use `--mask unmasked`, `--mask causal`, `--mask general`, or
 `--mask general-dense`. The general case uses a sparse noncausal
@@ -121,5 +123,5 @@ representing either general mask.
 cuDNN results are reported as unavailable when the current backend or input
 configuration does not support cuDNN attention. The XLA and mapped
 implementations remain usable on CPU; Mosaic requires a supported GPU and
-float16 or bfloat16 inputs with a head dimension that is a multiple of 16 from
-64 through 2048.
+float16, bfloat16, or float32 inputs with a head dimension that is a multiple
+of 16 from 64 through 2048.

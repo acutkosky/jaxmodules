@@ -4,11 +4,20 @@ import jax.numpy as jnp
 import torch
 import numpy as np
 import torch.nn.functional as F
-from jaxmodules.attention import use_custom_einsum, masked_attention_via_map
+from jaxmodules.attention import (
+    attention,
+    masked_attention_via_map,
+    use_custom_einsum,
+)
 from jaxmodules.vectorize import fancy_vmap
 
 
 use_custom_einsum()  # Required for higher precision to get the tests to pass.
+
+
+def test_attention_is_the_canonical_public_name():
+    assert attention is masked_attention_via_map
+    assert attention.__name__ == "attention"
 
 
 def jax_to_torch(x):

@@ -43,18 +43,20 @@ C = jnp.ones(3)          # (i=3)
 result = vectorized(A, B, C)  # shape: (5, 3, 4) - 5 comes from unmapped dimension
 ```
 
-## masked_attention_via_map
+## attention
 
-`masked_attention_via_map` is a JAX-native memory-efficient attention
+`attention` is a JAX-native memory-efficient attention
 implementation, similar to Flash Attention. It processes attention in blocks,
 enabling efficient computation for long sequences while supporting flexible
 masking patterns.
 
-On supported NVIDIA GPUs, standard float16/bfloat16 attention with 64-wide
-heads and coordinate-only callable masks automatically uses a Mosaic GPU
-forward and custom backward kernel. The callable API is unchanged. Unsupported
-callables, shapes, dtypes, custom score kernels, and explicit windowing
-conservatively retain the `jax.lax.map` implementation.
+On supported NVIDIA GPUs, standard float16, bfloat16, and float32 attention
+with 64- to 2,048-wide heads and coordinate-only callable masks automatically
+uses a Mosaic GPU forward and custom backward kernel. Float32 contractions use
+TF32 tensor-core multiplies with FP32 accumulation and retain float32 storage
+and outputs. The callable API is unchanged. Unsupported callables, shapes,
+dtypes, custom score kernels, and explicit windowing conservatively retain the
+`jax.lax.map` implementation.
 
 Key features:
 - Memory-efficient block-wise processing using `jax.lax.map`
@@ -68,7 +70,7 @@ Key features:
 ### Examples
 
 ```python
-from jaxmodules.attention import masked_attention_via_map
+from jaxmodules.attention import attention
 import jax.numpy as jnp
 
 # Example 1: Basic causal attention
@@ -78,7 +80,7 @@ K = jnp.ones((B, L, H, d))
 V = jnp.ones((B, L, H, d))
 
 # Causal masking: each position can only attend to previous positions
-output = masked_attention_via_map(Q, K, V, is_causal=True)
+output = attention(Q, K, V, is_causal=True)
 
 # Example 2: Custom mask with windowing
 # Custom mask function: (batch, head, query_idx, key_idx) -> bool
@@ -86,7 +88,7 @@ def window_mask(b, h, q, k):
     # Allow attention within a window of 10 positions
     return jnp.abs(q - k) <= 10
 
-output = masked_attention_via_map(
+output = attention(
     Q, K, V,
     mask_fn=window_mask,
     block_size=32,  # Process in blocks of 32 for memory efficiency

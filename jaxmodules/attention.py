@@ -51,6 +51,17 @@ def default_kernel(q, k):
     return jnp.exp(jnp.dot(q, k) / jnp.sqrt(k.shape[-1]))
 
 
+def _attention_dot_precision(dtype):
+    """Use explicit GPU TF32 multiplies with FP32 accumulation for FP32."""
+
+    if (
+        jnp.dtype(dtype) == jnp.dtype(jnp.float32)
+        and jax.default_backend() == "gpu"
+    ):
+        return jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+    return jax.lax.Precision.HIGHEST
+
+
 def _unmasked(b, h, q, k):
     del b, h, q, k
     return True
@@ -150,7 +161,7 @@ def _attn_kq_block_fn(
             "bqhmd,bkhd->bqhmk",
             q_block,
             k_block,
-            precision=jax.lax.Precision.HIGHEST,
+            precision=_attention_dot_precision(q_block.dtype),
             preferred_element_type=accumulator_dtype,
         )
         scores = scores / jnp.sqrt(jnp.asarray(dq, dtype=accumulator_dtype))
@@ -176,7 +187,7 @@ def _attn_kq_block_fn(
             "bqhmk,bkhe->bqhme",
             probabilities,
             v_block,
-            precision=jax.lax.Precision.HIGHEST,
+            precision=_attention_dot_precision(q_block.dtype),
             preferred_element_type=accumulator_dtype,
         )
 
@@ -717,7 +728,7 @@ def _standard_attention_backward_query_major(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = jax.lax.Precision.HIGHEST
+    dot_precision = _attention_dot_precision(Q.dtype)
 
     q_blocks = rearrange(
         Q,
@@ -891,7 +902,7 @@ def _standard_attention_backward_key_major(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = jax.lax.Precision.HIGHEST
+    dot_precision = _attention_dot_precision(Q.dtype)
 
     q_blocks = rearrange(
         Q,
@@ -1068,7 +1079,7 @@ def _standard_attention_backward_two_pass(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = jax.lax.Precision.HIGHEST
+    dot_precision = _attention_dot_precision(Q.dtype)
 
     q_blocks = rearrange(
         Q,
@@ -1581,12 +1592,24 @@ def _default_attention_block_sizes(Q, K, V, kv_block_size):
     return query_block_size, kv_block_size
 
 
-def _can_use_mosaic_attention(Q, K, V, kernel_fn, mask_fn, window_size):
+def _can_use_mosaic_attention(
+    Q,
+    K,
+    V,
+    kernel_fn,
+    mask_fn,
+    window_size,
+    backward_strategy,
+):
     """Return whether this call can use the conservative Mosaic fast path."""
     if (
         jax.default_backend() != "gpu"
         or kernel_fn is not default_kernel
         or window_size is not None
+        or (
+            Q.dtype == jnp.dtype(jnp.float32)
+            and backward_strategy == "one_pass"
+        )
     ):
         return False
 
@@ -1595,7 +1618,7 @@ def _can_use_mosaic_attention(Q, K, V, kernel_fn, mask_fn, window_size):
     return supports_mosaic_attention(Q, K, V, mask_fn)
 
 
-def masked_attention_via_map(
+def attention(
     Q: Array,
     K: Array,
     V: Array,
@@ -1608,9 +1631,11 @@ def masked_attention_via_map(
     window_size: Optional[Tuple[int, int]] = None,
     backward_strategy: str = "auto",
 ) -> Array:
-    """
-    attention implementation that uses jax.lax.map to perform attention in a memory-efficient way
-    analogous to flash attention, but written in pure jax, and with less tricks.
+    """Compute memory-efficient attention with automatic backend dispatch.
+
+    The standard score kernel uses optimized Mosaic GPU kernels when the
+    dtype, shape, and mask are supported. Other configurations retain the
+    JAX-native tiled implementation.
 
     K: array of key values, shape [B, L, Hkv, d] or [L, Hkv, d]
     Q: array of queries, shape [B, N, Hq, d] or [N, Hq, d]
@@ -1621,8 +1646,9 @@ def masked_attention_via_map(
         the causal region.
     kernel_fn: the  unnormalized attention score is kernel_fn(Q, K).
         default is q, k -> jnp.exp( <q, k> / sqrt(d) )
-        The default kernel uses ``jax.lax.Precision.HIGHEST`` contractions and
-        accumulates low-precision inputs in at least FP32 in both passes.
+        Low-precision inputs use their native tensor-core multiplies with FP32
+        accumulation. On GPU, FP32 inputs use TF32 tensor-core multiplies with
+        FP32 accumulation; CPU fallback retains full FP32 contractions.
     mask_fn: takes integers b, h, q, k or h, q, kand returns a boolean specifying
         the attention mask for the bth item in batch, hth head and the qth query and kth key.
         If ``is_causal`` is true, this user mask is intersected with the causal
@@ -1649,13 +1675,13 @@ def masked_attention_via_map(
         computes all three gradients in one score-tile traversal; Mosaic uses
         FP32 atomic dK/dV accumulation, which can help sparse masks but uses
         larger compiler temporaries. None of the strategies changes
-        contraction or accumulation precision. The strategy applies to the
-        optimized default kernel; custom kernels retain their generic
-        custom-VJP path.
+        contraction or accumulation precision for a given input dtype. The
+        strategy applies to the optimized default kernel; custom kernels retain
+        their generic custom-VJP path.
 
     Returns:
         Attention values with the same dtype as ``Q``. Softmax reductions and
-        low-precision matrix-product accumulation still use FP32 internally.
+        matrix-product accumulation use FP32 internally.
     """
 
     # Validate dimensions
@@ -1731,6 +1757,7 @@ def masked_attention_via_map(
         kernel_fn,
         mask_fn,
         window_size,
+        backward_strategy,
     ):
         result = _masked_attention_via_mosaic(
             Q,
@@ -1764,6 +1791,11 @@ def masked_attention_via_map(
         result = result[0]
 
     return result
+
+
+# Backward-compatible name retained for existing callers. New code should use
+# ``attention``.
+masked_attention_via_map = attention
 
 
 def _flex_attention(

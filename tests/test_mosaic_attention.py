@@ -104,12 +104,30 @@ def test_mosaic_supports_flexible_head_dimensions(head_dim, expected):
     )
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (jnp.float16, True),
+        (jnp.bfloat16, True),
+        (jnp.float32, True),
+        (jnp.int32, False),
+    ],
+)
+def test_mosaic_supports_attention_dtypes(dtype, expected):
+    shape = (1, 128, 2, 64)
+    operand = jax.ShapeDtypeStruct(shape, dtype)
+
+    assert supports_mosaic_attention(operand, operand, operand, _unmasked) is expected
+
+
 def test_nondefault_head_dimensions_select_non_atomic_generic_backward():
     default_width = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.float16)
     wider = jax.ShapeDtypeStruct((1, 4096, 8, 80), jnp.float16)
+    fp32 = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.float32)
 
     assert not _prefer_non_atomic_generic_backward(default_width)
     assert _prefer_non_atomic_generic_backward(wider)
+    assert _prefer_non_atomic_generic_backward(fp32)
 
 
 def test_warp_specialized_forward_selection_respects_supported_shapes():
@@ -209,6 +227,7 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
     d176 = jax.ShapeDtypeStruct((1, 4096, 2, 176), jnp.float16)
     d240 = jax.ShapeDtypeStruct((1, 4096, 2, 240), jnp.float16)
     d256 = jax.ShapeDtypeStruct((1, 4096, 2, 256), jnp.float16)
+    fp32_d128 = jax.ShapeDtypeStruct((1, 4096, 2, 128), jnp.float32)
 
     assert _can_use_warp_specialized_causal_split_backward(
         large_mha,
@@ -260,6 +279,12 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
             is_unmasked=True,
             is_causal=True,
         )
+    assert not _can_use_generated_warp_specialized_split_backward(
+        fp32_d128,
+        fp32_d128,
+        is_unmasked=True,
+        is_causal=True,
+    )
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
@@ -777,22 +802,34 @@ def test_split_warp_specialized_dkv_matches_xla(is_causal):
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize("mask_fn", [_complex_mask, _partly_fully_masked])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_mosaic_forward_matches_mapped_for_general_masks(mask_fn, head_dim):
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [
+        (jnp.float16, 2e-3),
+        (jnp.float32, 1e-3),
+    ],
+)
+def test_mosaic_forward_matches_mapped_for_general_masks(
+    mask_fn,
+    head_dim,
+    dtype,
+    tolerance,
+):
     keys = jax.random.split(jax.random.key(7), 3)
     query = jax.random.normal(
         keys[0],
         (2, 128, 4, head_dim),
-        dtype=jnp.float16,
+        dtype=dtype,
     )
     key = jax.random.normal(
         keys[1],
         (2, 128, 2, head_dim),
-        dtype=jnp.float16,
+        dtype=dtype,
     )
     value = jax.random.normal(
         keys[2],
         (2, 128, 2, head_dim),
-        dtype=jnp.float16,
+        dtype=dtype,
     )
 
     mosaic = jax.jit(
@@ -815,14 +852,14 @@ def test_mosaic_forward_matches_mapped_for_general_masks(mask_fn, head_dim):
     np.testing.assert_allclose(
         np.asarray(mosaic_output),
         np.asarray(mapped_output),
-        rtol=2e-3,
-        atol=2e-3,
+        rtol=tolerance,
+        atol=tolerance,
     )
     np.testing.assert_allclose(
         np.asarray(mosaic_lse),
         np.asarray(mapped_lse),
-        rtol=2e-4,
-        atol=2e-4,
+        rtol=tolerance,
+        atol=tolerance,
     )
     if mask_fn is _partly_fully_masked:
         np.testing.assert_array_equal(
@@ -915,6 +952,8 @@ def test_mosaic_forward_composes_with_jit_and_vmap():
         (jnp.float16, 3e-3, 64),
         (jnp.float16, 3e-3, 128),
         (jnp.bfloat16, 2e-2, 64),
+        (jnp.float32, 3e-3, 64),
+        (jnp.float32, 3e-3, 128),
     ],
 )
 def test_mosaic_custom_vjp_matches_existing_tiled_backward(
