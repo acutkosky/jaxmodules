@@ -316,7 +316,7 @@ def _make_function(case: Case) -> Any:
         default_kernel,
     )
     from jaxmodules._mosaic_attention import (
-        _mosaic_attention_forward_warp_specialized_unmasked,
+        _mosaic_attention_forward_warp_specialized,
     )
 
     is_causal = case.mask == "causal"
@@ -327,16 +327,19 @@ def _make_function(case: Case) -> Any:
     }[case.mask]
 
     if case.implementation == "mosaic-warp":
-        if case.mask != "unmasked":
-            raise ValueError("mosaic-warp currently supports only unmasked attention")
+        if case.mask == "general":
+            raise ValueError(
+                "mosaic-warp supports only unmasked or maximal-causal attention"
+            )
         if case.mode != "forward":
             raise ValueError("mosaic-warp currently implements only the forward pass")
 
         def attention(query: Any, key: Any, value: Any) -> Any:
-            output, _ = _mosaic_attention_forward_warp_specialized_unmasked(
+            output, _ = _mosaic_attention_forward_warp_specialized(
                 query,
                 key,
                 value,
+                is_causal=is_causal,
             )
             return output
 

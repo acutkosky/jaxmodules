@@ -63,9 +63,9 @@ Use `--case-timeout-seconds` to change that limit.
 
 Both forward and forward-plus-backward modes are measured by default. Pass
 `--mode forward` or `--mode backward` to select one.
-`--implementation mosaic-warp` is an unmasked-forward-only diagnostic for the
-private warp kernel; the normal `mosaic` implementation dispatches to it
-automatically at supported context sizes.
+`--implementation mosaic-warp` is an unmasked/maximal-causal forward-only
+diagnostic for the private warp kernel; the normal `mosaic` implementation
+dispatches to it automatically at supported context sizes.
 
 `--block-size` accepts multiple values so that mapped attention is tuned at
 each workload rather than compared against XLA and cuDNN at an arbitrary tile

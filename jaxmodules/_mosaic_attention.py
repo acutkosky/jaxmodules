@@ -234,13 +234,13 @@ def _can_use_warp_specialized_forward(
 ) -> bool:
     """Whether K/V sharing should replace the single-warpgroup forward path."""
 
+    minimum_length = 1024 if is_causal else 4096
     return (
         is_unmasked
-        and not is_causal
-        and query.dtype
-        in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
-        and query.shape[1] >= 4096
-        and key.shape[1] >= 4096
+        and (not is_causal or query.shape[1] == key.shape[1])
+        and query.dtype in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
+        and query.shape[1] >= minimum_length
+        and key.shape[1] >= minimum_length
         and query.shape[1] % 128 == 0
         and key.shape[1] % 64 == 0
         and query.shape[3] == 64
@@ -269,10 +269,11 @@ def mosaic_attention_forward(
         is_unmasked=is_unmasked,
         is_causal=is_causal,
     ):
-        return _mosaic_attention_forward_warp_specialized_unmasked(
+        return _mosaic_attention_forward_warp_specialized(
             query,
             key,
             value,
+            is_causal=is_causal,
         )
 
     batch_size, query_length, query_heads, head_dim = query.shape
@@ -600,15 +601,19 @@ def mosaic_attention_forward(
     return output, jnp.swapaxes(lse, 1, 2)
 
 
-def _mosaic_attention_forward_warp_specialized_unmasked(
+def _mosaic_attention_forward_warp_specialized(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
+    *,
+    is_causal: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Compute large unmasked attention with shared K/V producer staging.
+    """Compute large dense attention with shared K/V producer staging.
 
     Two compute warpgroups process adjacent query tiles. A third warpgroup
     pipelines each K/V tile through shared memory once for both consumers.
+    Maximal causal attention streams only the common visible K/V prefix and
+    applies a triangular mask to each compute warpgroup's diagonal tile.
     """
 
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
@@ -634,9 +639,7 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
     compute_registers = 232
     query_superblock = block_q * num_compute_wgs
     if query_length % query_superblock:
-        raise ValueError(
-            f"query length must be divisible by {query_superblock}"
-        )
+        raise ValueError(f"query length must be divisible by {query_superblock}")
     if kv_length % block_kv:
         raise ValueError(f"key/value length must be divisible by {block_kv}")
 
@@ -730,14 +733,21 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
             query_head,
             jnp.asarray(query_heads_per_kv_head, query_head.dtype),
         )
+        query_supertile = lax.axis_index("query_supertiles")
+        if is_causal:
+            query_supertile = num_query_supertiles - 1 - query_supertile
+            producer_kv_stop = jnp.minimum(
+                (query_supertile + 1) * (query_superblock // block_kv),
+                num_kv_tiles,
+            )
+        else:
+            producer_kv_stop = num_kv_tiles
 
         @pl.when(wg_index < num_compute_wgs)
         def compute_warpgroup():
             plgpu.set_max_registers(compute_registers, action="increase")
-            query_base = (
-                lax.axis_index("query_supertiles") * query_superblock
-                + wg_index * block_q
-            )
+            query_tile = query_supertile * num_compute_wgs + wg_index
+            query_base = query_tile * block_q
             query_fragment = plgpu.load(
                 query_ref.at[
                     batch,
@@ -757,9 +767,22 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                 (block_q, head_dim),
                 dtype=jnp.float32,
             )
+            if is_causal:
+                query_indices = plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (block_q, block_kv),
+                    0,
+                    layout=accumulator_layout,
+                )
+                key_indices = plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (block_q, block_kv),
+                    1,
+                    layout=accumulator_layout,
+                )
+                diagonal_mask = query_indices >= key_indices
 
             def process_kv_tile(kv_step, carry):
-                output_accumulator, row_max, row_sum = carry
                 slot = lax.rem(
                     kv_step,
                     jnp.asarray(max_concurrent_steps, kv_step.dtype),
@@ -776,41 +799,86 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                 )
                 plgpu.barrier_arrive(key_consumed_barriers.at[slot])
                 scores *= scale
+                if is_causal:
+                    scores = lax.cond(
+                        kv_step == query_tile,
+                        lambda matrix: jnp.where(
+                            diagonal_mask,
+                            matrix,
+                            -jnp.inf,
+                        ),
+                        lambda matrix: matrix,
+                        scores,
+                    )
 
-                tile_max = scores.max(axis=1) * log2e
-                next_row_max = jnp.maximum(row_max, tile_max)
-                previous_scale = jnp.exp2(row_max - next_row_max)
-                next_row_max_broadcast = lax.broadcast_in_dim(
-                    next_row_max,
-                    scores.shape,
-                    (0,),
-                )
-                probabilities = jnp.exp2(
-                    scores * log2e - next_row_max_broadcast
-                )
-                previous_scale_broadcast = lax.broadcast_in_dim(
-                    previous_scale,
-                    output_accumulator.shape,
-                    (0,),
-                )
-                output_accumulator *= previous_scale_broadcast
-                row_sum *= previous_scale
-                row_max = next_row_max
-                row_sum += probabilities.sum(axis=1)
+                def update_softmax(current):
+                    output_accumulator, row_max, row_sum = current
+                    tile_max = scores.max(axis=1) * log2e
+                    next_row_max = jnp.maximum(row_max, tile_max)
+                    previous_scale = jnp.exp2(row_max - next_row_max)
+                    next_row_max_broadcast = lax.broadcast_in_dim(
+                        next_row_max,
+                        scores.shape,
+                        (0,),
+                    )
+                    probabilities = jnp.exp2(
+                        scores * log2e - next_row_max_broadcast
+                    )
+                    previous_scale_broadcast = lax.broadcast_in_dim(
+                        previous_scale,
+                        output_accumulator.shape,
+                        (0,),
+                    )
+                    output_accumulator *= previous_scale_broadcast
+                    row_sum *= previous_scale
+                    row_sum += probabilities.sum(axis=1)
+                    return (
+                        output_accumulator,
+                        next_row_max,
+                        row_sum,
+                    ), probabilities
+
+                if is_causal:
+                    carry, probabilities = lax.cond(
+                        kv_step <= query_tile,
+                        update_softmax,
+                        lambda current: (
+                            current,
+                            jnp.zeros(
+                                (block_q, block_kv),
+                                dtype=jnp.float32,
+                            ),
+                        ),
+                        carry,
+                    )
+                else:
+                    carry, probabilities = update_softmax(carry)
 
                 plgpu.barrier_wait(value_barriers.at[slot])
                 value_fragment = load_shared_rhs(value_smem.at[slot])
                 plgpu.barrier_arrive(value_consumed_barriers.at[slot])
-                output_accumulator = mma_with_accumulator_lhs(
-                    output_accumulator,
-                    probabilities.astype(dtype),
-                    value_fragment,
-                )
-                return output_accumulator, row_max, row_sum
+
+                def accumulate_value(current):
+                    output_accumulator, row_max, row_sum = current
+                    output_accumulator = mma_with_accumulator_lhs(
+                        output_accumulator,
+                        probabilities.astype(dtype),
+                        value_fragment,
+                    )
+                    return output_accumulator, row_max, row_sum
+
+                if is_causal:
+                    return lax.cond(
+                        kv_step <= query_tile,
+                        accumulate_value,
+                        lambda current: current,
+                        carry,
+                    )
+                return accumulate_value(carry)
 
             output_accumulator, row_max, row_sum = lax.fori_loop(
                 0,
-                num_kv_tiles,
+                producer_kv_stop,
                 process_kv_tile,
                 (output_accumulator, row_max, row_sum),
             )
@@ -858,7 +926,7 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
                     value_barriers.at[kv_step],
                 )
 
-            @pl.loop(0, num_kv_tiles - max_concurrent_steps)
+            @pl.loop(0, producer_kv_stop - max_concurrent_steps)
             def refill_pipeline(kv_step):
                 next_kv_step = kv_step + max_concurrent_steps
                 slot = lax.rem(
@@ -938,6 +1006,20 @@ def _mosaic_attention_forward_warp_specialized_unmasked(
         thread_name="wg",
     )(query, key, value_transposed)
     return output, jnp.swapaxes(lse, 1, 2)
+
+
+def _mosaic_attention_forward_warp_specialized_unmasked(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Compatibility wrapper for the direct unmasked-kernel diagnostic."""
+    return _mosaic_attention_forward_warp_specialized(
+        query,
+        key,
+        value,
+        is_causal=False,
+    )
 
 
 def _materialize_transposed_mask_tile(
@@ -2752,11 +2834,11 @@ def mosaic_attention_backward(
     if backward_strategy != "auto":
         raise ValueError("backward_strategy must be 'auto' or 'minimal'")
 
-    use_warp_specialized = _can_use_warp_specialized_forward(
+    use_warp_specialized = not is_causal and _can_use_warp_specialized_forward(
         query,
         key,
         is_unmasked=_mask_is_always_true(mask_fn),
-        is_causal=is_causal,
+        is_causal=False,
     )
 
     def run_selected(q, k, v, o, lse, do):

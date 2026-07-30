@@ -10,6 +10,7 @@ import pytest
 from jaxmodules._mosaic_attention import (
     _can_use_warp_specialized_forward,
     _mosaic_attention_backward_warp_specialized_unmasked,
+    _mosaic_attention_forward_warp_specialized,
     _mosaic_attention_forward_warp_specialized_unmasked,
     mask_is_mosaic_compatible,
     mosaic_attention_backward,
@@ -70,10 +71,12 @@ def test_mask_compatibility_is_conservative():
     )
 
 
-def test_warp_specialized_forward_selection_is_large_scale_only():
+def test_warp_specialized_forward_selection_respects_supported_shapes():
     large = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float16)
     small = jax.ShapeDtypeStruct((1, 2048, 2, 64), jnp.float16)
+    subkilotoken = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.float16)
     fp32 = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float32)
+    rectangular = jax.ShapeDtypeStruct((1, 8192, 2, 64), jnp.float16)
 
     assert _can_use_warp_specialized_forward(
         large,
@@ -87,9 +90,27 @@ def test_warp_specialized_forward_selection_is_large_scale_only():
         is_unmasked=True,
         is_causal=False,
     )
+    assert _can_use_warp_specialized_forward(
+        large,
+        large,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert _can_use_warp_specialized_forward(
+        small,
+        small,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_forward(
+        subkilotoken,
+        subkilotoken,
+        is_unmasked=True,
+        is_causal=True,
+    )
     assert not _can_use_warp_specialized_forward(
         large,
-        large,
+        rectangular,
         is_unmasked=True,
         is_causal=True,
     )
@@ -103,25 +124,33 @@ def test_warp_specialized_forward_selection_is_large_scale_only():
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize(
-    ("dtype", "tolerance"),
+    ("dtype", "tolerance", "is_causal"),
     [
-        (jnp.float16, 2e-3),
-        (jnp.bfloat16, 2e-2),
+        (jnp.float16, 2e-3, False),
+        (jnp.float16, 2e-3, True),
+        (jnp.bfloat16, 2e-2, False),
+        (jnp.bfloat16, 2e-2, True),
     ],
 )
-def test_warp_specialized_forward_matches_xla(dtype, tolerance):
+def test_warp_specialized_forward_matches_xla(dtype, tolerance, is_causal):
     keys = jax.random.split(jax.random.key(5), 3)
     query = jax.random.normal(keys[0], (1, 1024, 2, 64), dtype=dtype)
     key = jax.random.normal(keys[1], (1, 1024, 1, 64), dtype=dtype)
     value = jax.random.normal(keys[2], (1, 1024, 1, 64), dtype=dtype)
 
     output, log_normalizer = jax.jit(
-        _mosaic_attention_forward_warp_specialized_unmasked
+        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+        )
     )(query, key, value)
     expected = jax.nn.dot_product_attention(
         query,
         key,
         value,
+        is_causal=is_causal,
         implementation="xla",
     )
 
@@ -134,6 +163,100 @@ def test_warp_specialized_forward_matches_xla(dtype, tolerance):
         rtol=tolerance,
         atol=tolerance,
     )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_warp_specialized_causal_forward_composes_with_vmap():
+    keys = jax.random.split(jax.random.key(59), 3)
+    shape = (2, 1, 128, 1, 64)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+
+    def causal_attention(q, k, v):
+        return _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=True,
+        )[0]
+
+    output = jax.jit(jax.vmap(causal_attention))(query, key, value)
+    expected = jax.vmap(
+        lambda q, k, v: jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="xla",
+        )
+    )(query, key, value)
+
+    np.testing.assert_allclose(
+        np.asarray(output),
+        np.asarray(expected),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_warp_specialized_causal_custom_vjp_matches_xla():
+    keys = jax.random.split(jax.random.key(53), 4)
+    shape = (1, 4096, 1, 64)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    def mosaic_loss(q, k, v):
+        output = _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=_unmasked,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=True,
+            backward_strategy="auto",
+        )
+        return jnp.sum(output.astype(jnp.float32) * cotangent)
+
+    def xla_loss(q, k, v):
+        output = jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="xla",
+        )
+        return jnp.sum(output.astype(jnp.float32) * cotangent)
+
+    mosaic_value, mosaic_gradients = jax.jit(
+        jax.value_and_grad(mosaic_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+    xla_value, xla_gradients = jax.jit(
+        jax.value_and_grad(xla_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+
+    np.testing.assert_allclose(
+        np.asarray(mosaic_value),
+        np.asarray(xla_value),
+        rtol=3e-3,
+        atol=3e-3,
+    )
+    for mosaic_gradient, xla_gradient in zip(
+        mosaic_gradients,
+        xla_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(mosaic_gradient),
+            np.asarray(xla_gradient),
+            rtol=3e-3,
+            atol=3e-3,
+        )
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
