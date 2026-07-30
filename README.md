@@ -54,8 +54,11 @@ On supported NVIDIA GPUs, standard float16, bfloat16, and float32 attention
 with 64- to 2,048-wide heads and coordinate-only callable masks automatically
 uses a Mosaic GPU forward and custom backward kernel. Float32 contractions use
 TF32 tensor-core multiplies with FP32 accumulation and retain float32 storage
-and outputs. The callable API is unchanged. Unsupported callables, shapes,
-dtypes, custom score kernels, and explicit windowing conservatively retain the
+and outputs. Dense causal and unmasked FP32 attention with 64- to 128-wide
+heads additionally uses producer/consumer operand staging; wider heads and
+general callable masks retain the dimension-generic Mosaic kernel rather than
+failing. The callable API is unchanged. Unsupported callables, shapes, dtypes,
+custom score kernels, and explicit windowing conservatively retain the
 `jax.lax.map` implementation.
 
 Key features:

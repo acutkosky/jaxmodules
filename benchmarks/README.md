@@ -19,6 +19,9 @@ and cuDNN from 1K through 128K context.
 The [flexible-head results](results/rtx5090_flexible_dimensions_2026-07-29.md)
 cover 8-head, 1,024-dimensional-per-token attention at scale and validate
 per-head dimensions from 64 through 2,048.
+The [TF32 results](results/rtx5090_tf32_attention_2026-07-30.md) compare the
+staged FP32 forward and backward paths with generic Mosaic, tuned mapped
+attention, XLA, and cuDNN.
 
 Run the smoke suite while iterating:
 
@@ -78,11 +81,13 @@ dispatches to it automatically at supported context sizes.
 
 `--block-size` accepts multiple values so that mapped attention is tuned at
 each workload rather than compared against XLA and cuDNN at an arbitrary tile
-size. Mosaic tunes independently: the D=64 kernels use internal 64x64 score
-tiles and the dimension-generic D=80..2048 kernels use 32x32 tiles. The
-requested block sizes therefore do not change Mosaic. Every JSON record and
-printed row identifies both the requested and effective tile. XLA and cuDNN
-report no effective tile because their libraries choose internally.
+size. Mosaic tunes independently. Its dense FP16/BF16 producer/consumer
+kernels use 64x64 score tiles where resource limits permit. Dense FP32
+forward uses 32x64 tiles for D=64..128, while its staged backward, general
+masks, and wider-head fallback use 32x32 tiles. The requested block sizes
+therefore do not change Mosaic. Every JSON record and printed row identifies
+both the requested and effective forward tile. XLA and cuDNN report no
+effective tile because their libraries choose internally.
 
 By default, each `--block-size` is used for both query and K/V tiles. Pass one
 or more `--kv-block-size` values to benchmark the Cartesian product of query

@@ -25,7 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument(
         "--dtype",
-        choices=("float16", "bfloat16"),
+        choices=("float16", "bfloat16", "float32"),
         default="float16",
     )
     parser.add_argument("--unmasked", action="store_true")
@@ -56,6 +56,7 @@ def main() -> None:
     dtype = {
         "float16": jnp.float16,
         "bfloat16": jnp.bfloat16,
+        "float32": jnp.float32,
     }[args.dtype]
     shape = (1, args.seq_len, args.heads, args.head_dim)
     keys = jax.random.split(jax.random.key(0), 4)

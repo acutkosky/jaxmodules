@@ -16,6 +16,7 @@ from jaxmodules._mosaic_attention import (
     _mosaic_attention_backward_warp_specialized_dkv,
     _mosaic_attention_backward_warp_specialized_dkv_split,
     _mosaic_attention_backward_warp_specialized_dq,
+    _mosaic_attention_backward_warp_specialized_generated_split,
     _mosaic_attention_forward_warp_specialized,
     _prefer_non_atomic_generic_backward,
     mask_is_mosaic_compatible,
@@ -135,6 +136,8 @@ def test_warp_specialized_forward_selection_respects_supported_shapes():
     small = jax.ShapeDtypeStruct((1, 2048, 2, 64), jnp.float16)
     subkilotoken = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.float16)
     fp32 = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float32)
+    fp32_d128 = jax.ShapeDtypeStruct((1, 4096, 2, 128), jnp.float32)
+    fp32_d192 = jax.ShapeDtypeStruct((1, 4096, 2, 192), jnp.float32)
     rectangular = jax.ShapeDtypeStruct((1, 8192, 2, 64), jnp.float16)
     d128 = jax.ShapeDtypeStruct((1, 4096, 2, 128), jnp.float16)
     d192 = jax.ShapeDtypeStruct((1, 4096, 2, 192), jnp.float16)
@@ -178,9 +181,27 @@ def test_warp_specialized_forward_selection_respects_supported_shapes():
         is_unmasked=True,
         is_causal=True,
     )
+    assert _can_use_warp_specialized_forward(
+        fp32,
+        fp32,
+        is_unmasked=True,
+        is_causal=False,
+    )
+    assert _can_use_warp_specialized_forward(
+        fp32,
+        fp32,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert _can_use_warp_specialized_forward(
+        fp32_d128,
+        fp32_d128,
+        is_unmasked=True,
+        is_causal=False,
+    )
     assert not _can_use_warp_specialized_forward(
-        fp32,
-        fp32,
+        fp32_d192,
+        fp32_d192,
         is_unmasked=True,
         is_causal=False,
     )
@@ -227,6 +248,7 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
     d176 = jax.ShapeDtypeStruct((1, 4096, 2, 176), jnp.float16)
     d240 = jax.ShapeDtypeStruct((1, 4096, 2, 240), jnp.float16)
     d256 = jax.ShapeDtypeStruct((1, 4096, 2, 256), jnp.float16)
+    fp32_d64 = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float32)
     fp32_d128 = jax.ShapeDtypeStruct((1, 4096, 2, 128), jnp.float32)
 
     assert _can_use_warp_specialized_causal_split_backward(
@@ -279,12 +301,25 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
             is_unmasked=True,
             is_causal=True,
         )
-    assert not _can_use_generated_warp_specialized_split_backward(
+    assert not _can_use_warp_specialized_causal_split_backward(
+        fp32_d64,
+        fp32_d64,
+        is_unmasked=True,
+        is_causal=True,
+    )
+    assert not _can_use_warp_specialized_causal_split_backward(
         fp32_d128,
         fp32_d128,
         is_unmasked=True,
         is_causal=True,
     )
+    for shape in (fp32_d64, fp32_d128):
+        assert _can_use_generated_warp_specialized_split_backward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=True,
+        )
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
@@ -304,6 +339,10 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
         (jnp.float16, 2e-3, False, 192),
         (jnp.float16, 2e-3, True, 192),
         (jnp.float16, 2e-3, False, 240),
+        (jnp.float32, 3e-3, False, 64),
+        (jnp.float32, 3e-3, True, 64),
+        (jnp.float32, 3e-3, False, 128),
+        (jnp.float32, 3e-3, True, 128),
     ],
 )
 def test_warp_specialized_forward_matches_xla(
@@ -621,7 +660,11 @@ def test_warp_specialized_backward_matches_xla(
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
     ("dtype", "tolerance"),
-    [(jnp.float16, 3e-3), (jnp.bfloat16, 2e-2)],
+    [
+        (jnp.float16, 3e-3),
+        (jnp.bfloat16, 2e-2),
+        (jnp.float32, 3e-3),
+    ],
 )
 def test_generated_warp_specialized_dq_matches_xla(
     head_dim,
@@ -682,7 +725,11 @@ def test_generated_warp_specialized_dq_matches_xla(
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
     ("dtype", "tolerance"),
-    [(jnp.float16, 3e-3), (jnp.bfloat16, 2e-2)],
+    [
+        (jnp.float16, 3e-3),
+        (jnp.bfloat16, 2e-2),
+        (jnp.float32, 3e-3),
+    ],
 )
 def test_generated_warp_specialized_dkv_matches_xla(
     head_dim,
@@ -740,6 +787,62 @@ def test_generated_warp_specialized_dkv_matches_xla(
             np.asarray(expected_gradient),
             rtol=tolerance,
             atol=tolerance,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_tf32_generated_split_backward_d64_matches_xla(is_causal):
+    keys = jax.random.split(jax.random.key(83), 4)
+    shape = (1, 1024, 2, 64)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float32)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float32)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float32)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    output, log_normalizer = jax.jit(
+        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+        )
+    )(query, key, value)
+    gradients = jax.jit(
+        lambda q, k, v, o, lse, do: (
+            _mosaic_attention_backward_warp_specialized_generated_split(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                is_causal=is_causal,
+            )
+        )
+    )(query, key, value, output, log_normalizer, cotangent)
+
+    def xla_loss(q, k, v):
+        attention = jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+            implementation="xla",
+        )
+        return jnp.sum(attention * cotangent)
+
+    expected = jax.jit(jax.grad(xla_loss, argnums=(0, 1, 2)))(query, key, value)
+    for gradient, expected_gradient in zip(
+        gradients,
+        expected,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(gradient),
+            np.asarray(expected_gradient),
+            rtol=3e-3,
+            atol=3e-3,
         )
 
 
@@ -1212,12 +1315,15 @@ def test_mosaic_custom_vjp_composes_with_jit_and_vmap():
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
-def test_mosaic_custom_vjp_vmaps_value_only_and_reduces_shared_qk_gradients():
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.float32])
+def test_mosaic_custom_vjp_vmaps_value_only_and_reduces_shared_qk_gradients(
+    dtype,
+):
     keys = jax.random.split(jax.random.key(83), 5)
     shape = (1, 1024, 2, 80)
-    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
-    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
-    values = jax.random.normal(keys[2], (3, *shape), dtype=jnp.float16)
+    query = jax.random.normal(keys[0], shape, dtype=dtype)
+    key = jax.random.normal(keys[1], shape, dtype=dtype)
+    values = jax.random.normal(keys[2], (3, *shape), dtype=dtype)
     cotangents = jax.random.normal(
         keys[3],
         values.shape,

@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
@@ -753,6 +753,75 @@ def _prefer_generated_warp_specialized_backward(
     return not (is_causal and head_dim == 192)
 
 
+def _adapt_warp_specialized_forward_config_for_dtype(
+    config: WarpSpecializedForwardConfig | None,
+    *,
+    dtype: jnp.dtype,
+    head_dim: int,
+) -> WarpSpecializedForwardConfig | None:
+    """Fit FP32 staging into consumer-GPU shared-memory limits."""
+
+    if config is None or jnp.dtype(dtype) != jnp.dtype(jnp.float32):
+        return config
+    if head_dim > 128:
+        return None
+    return replace(
+        config,
+        block_q=32,
+        block_kv=64,
+        num_compute_wgs=1,
+        compute_registers=232,
+        producer_registers=40,
+        pipeline_stages=1,
+    )
+
+
+def _adapt_warp_specialized_dq_config_for_dtype(
+    config: WarpSpecializedDQConfig | None,
+    *,
+    dtype: jnp.dtype,
+    head_dim: int,
+) -> WarpSpecializedDQConfig | None:
+    """Fit TF32 dQ staging into consumer-GPU shared memory."""
+
+    if jnp.dtype(dtype) != jnp.dtype(jnp.float32):
+        return config
+    if config is None or head_dim > 128:
+        return None
+    return replace(
+        config,
+        block_q=32,
+        block_kv=32,
+        num_compute_wgs=1,
+        compute_registers=232,
+        producer_registers=40,
+        pipeline_stages=1,
+    )
+
+
+def _adapt_warp_specialized_dkv_config_for_dtype(
+    config: WarpSpecializedDKVConfig | None,
+    *,
+    dtype: jnp.dtype,
+    head_dim: int,
+) -> WarpSpecializedDKVConfig | None:
+    """Generate a bounded-resource TF32 key-major backward configuration."""
+
+    if jnp.dtype(dtype) != jnp.dtype(jnp.float32):
+        return config
+    if not 64 <= head_dim <= 128 or head_dim % 16:
+        return None
+    return WarpSpecializedDKVConfig(
+        block_q=32,
+        block_kv=32,
+        num_compute_wgs=1,
+        compute_registers=232,
+        producer_registers=40,
+        pipeline_stages=1,
+        split_gradients=head_dim >= 96,
+    )
+
+
 def _select_warp_specialized_forward_config(
     query: jax.Array,
     key: jax.Array,
@@ -766,7 +835,12 @@ def _select_warp_specialized_forward_config(
     if (
         not is_unmasked
         or (is_causal and query.shape[1] != key.shape[1])
-        or query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
+        or query.dtype
+        not in (
+            jnp.dtype(jnp.float16),
+            jnp.dtype(jnp.bfloat16),
+            jnp.dtype(jnp.float32),
+        )
         or query.shape[1] < minimum_length
         or key.shape[1] < minimum_length
         or query.shape[3] != key.shape[3]
@@ -775,6 +849,11 @@ def _select_warp_specialized_forward_config(
     config = _warp_specialized_forward_config_for_head_dim(
         query.shape[3],
         is_causal=is_causal,
+    )
+    config = _adapt_warp_specialized_forward_config_for_dtype(
+        config,
+        dtype=query.dtype,
+        head_dim=query.shape[3],
     )
     if config is None:
         return None
@@ -794,6 +873,7 @@ def _can_use_warp_specialized_causal_split_backward(
 
     return (
         is_causal
+        and query.dtype in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
         and query.shape[3] == 64
         and query.shape[2] == key.shape[2]
         and query.shape[1] >= 1024
@@ -816,16 +896,32 @@ def _can_use_generated_warp_specialized_split_backward(
     """Whether generated non-atomic dQ and dK/dV passes cover this call."""
 
     minimum_length = 1024 if is_causal else 4096
-    dq_config = _warp_specialized_dq_config_for_head_dim(query.shape[3])
-    dkv_config = _warp_specialized_dkv_config_for_head_dim(query.shape[3])
+    dq_config = _adapt_warp_specialized_dq_config_for_dtype(
+        _warp_specialized_dq_config_for_head_dim(query.shape[3]),
+        dtype=query.dtype,
+        head_dim=query.shape[3],
+    )
+    dkv_config = _adapt_warp_specialized_dkv_config_for_dtype(
+        _warp_specialized_dkv_config_for_head_dim(query.shape[3]),
+        dtype=query.dtype,
+        head_dim=query.shape[3],
+    )
     return (
         is_unmasked
-        and query.dtype in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
+        and query.dtype
+        in (
+            jnp.dtype(jnp.float16),
+            jnp.dtype(jnp.bfloat16),
+            jnp.dtype(jnp.float32),
+        )
         and dq_config is not None
         and dkv_config is not None
-        and _prefer_generated_warp_specialized_backward(
-            query.shape[3],
-            is_causal=is_causal,
+        and (
+            query.dtype == jnp.dtype(jnp.float32)
+            or _prefer_generated_warp_specialized_backward(
+                query.shape[3],
+                is_causal=is_causal,
+            )
         )
         and query.shape[1] == key.shape[1]
         and query.shape[2] == key.shape[2]
@@ -1235,8 +1331,14 @@ def _mosaic_attention_forward_warp_specialized(
 
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("query, key, and value must be rank-4 arrays")
-    if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
-        raise ValueError("warp-specialized attention requires FP16 or BF16")
+    if query.dtype not in (
+        jnp.dtype(jnp.float16),
+        jnp.dtype(jnp.bfloat16),
+        jnp.dtype(jnp.float32),
+    ):
+        raise ValueError(
+            "warp-specialized attention requires FP16, BF16, or FP32"
+        )
     if query.dtype != key.dtype or query.dtype != value.dtype:
         raise ValueError("query, key, and value must have the same dtype")
     if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
@@ -1254,6 +1356,11 @@ def _mosaic_attention_forward_warp_specialized(
         )
         if _config is None
         else _config
+    )
+    config = _adapt_warp_specialized_forward_config_for_dtype(
+        config,
+        dtype=query.dtype,
+        head_dim=query.shape[3],
     )
     if config is None:
         raise ValueError(
@@ -1284,6 +1391,20 @@ def _mosaic_attention_forward_warp_specialized(
         block_q,
     )
     row_layout = accumulator_layout.reduce(1)
+    score_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, block_kv),
+    )
+    feature_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, head_dim),
+    )
     key_swizzle = _smem_swizzle_for_trailing_dimension(
         head_dim,
         dtype,
@@ -1375,6 +1496,10 @@ def _mosaic_attention_forward_warp_specialized(
         )
         return mgpu.mma(accumulator, lhs, rhs)
 
+    @plgpu.inline_mgpu()
+    def synchronize_warpgroup(_):
+        mgpu.warpgroup_barrier()
+
     def kernel(
         query_ref,
         key_ref,
@@ -1384,6 +1509,7 @@ def _mosaic_attention_forward_warp_specialized(
         smem_buffers,
         ready_barriers,
         consumed_barriers,
+        probability_smem,
     ):
         batch = lax.axis_index("batch")
         query_head = lax.axis_index("heads")
@@ -1477,7 +1603,7 @@ def _mosaic_attention_forward_warp_specialized(
                 )
                 plgpu.barrier_wait(key_barriers.at[slot])
                 key_fragment = load_shared_key_rhs(key_smem.at[slot])
-                scores = plgpu.mma(
+                scores = score_mma(
                     plgpu.layout_cast(
                         jnp.zeros(
                             (block_q, block_kv),
@@ -1583,11 +1709,27 @@ def _mosaic_attention_forward_warp_specialized(
 
                 def accumulate_value(current):
                     output_accumulator, row_max, row_sum = current
-                    output_accumulator = mma_with_accumulator_lhs(
-                        output_accumulator,
-                        probabilities.astype(dtype),
-                        value_fragment,
-                    )
+                    if dtype == jnp.dtype(jnp.float32):
+                        probability_ref = probability_smem.at[wg_index]
+                        probability_ref[...] = probabilities
+                        plgpu.commit_smem()
+                        synchronize_warpgroup()
+                        probability_fragment = plgpu.load(
+                            probability_ref,
+                            layout=lhs_layout,
+                            optimized=False,
+                        )
+                        output_accumulator = feature_mma(
+                            output_accumulator,
+                            probability_fragment,
+                            value_fragment,
+                        )
+                    else:
+                        output_accumulator = mma_with_accumulator_lhs(
+                            output_accumulator,
+                            probabilities.astype(dtype),
+                            value_fragment,
+                        )
                     return output_accumulator, row_max, row_sum
 
                 if is_causal:
@@ -1704,6 +1846,18 @@ def _mosaic_attention_forward_warp_specialized(
         dtype,
         transforms=value_smem_transforms,
     )
+    if dtype == jnp.dtype(jnp.float32):
+        probability_transforms = _smem_transforms_for_trailing_dimension(
+            block_kv,
+            dtype,
+        )
+        probability_scratch = plgpu.SMEM(
+            (num_compute_wgs, block_q, block_kv),
+            dtype,
+            transforms=probability_transforms,
+        )
+    else:
+        probability_scratch = plgpu.SMEM((1,), dtype)
     output_type = jax.ShapeDtypeStruct(query.shape, dtype)
     lse_type = jax.ShapeDtypeStruct(
         (batch_size, query_heads, query_length),
@@ -1732,6 +1886,7 @@ def _mosaic_attention_forward_warp_specialized(
                     num_barriers=max_concurrent_steps,
                 ),
             ),
+            probability_scratch,
         ),
         compiler_params=plgpu.CompilerParams(
             approx_math=False,
@@ -2886,8 +3041,12 @@ def _mosaic_attention_backward_warp_specialized_dq(
     global transpose used by the generic backward.
     """
 
-    if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
-        raise ValueError("warp-specialized dQ requires FP16 or BF16")
+    if query.dtype not in (
+        jnp.dtype(jnp.float16),
+        jnp.dtype(jnp.bfloat16),
+        jnp.dtype(jnp.float32),
+    ):
+        raise ValueError("warp-specialized dQ requires FP16, BF16, or FP32")
     if query.dtype != key.dtype or query.dtype != value.dtype:
         raise ValueError("query, key, and value must have the same dtype")
     if query.shape != output.shape or query.shape != upstream_gradient.shape:
@@ -2905,6 +3064,11 @@ def _mosaic_attention_backward_warp_specialized_dq(
         _warp_specialized_dq_config_for_head_dim(head_dim)
         if _config is None
         else _config
+    )
+    config = _adapt_warp_specialized_dq_config_for_dtype(
+        config,
+        dtype=query.dtype,
+        head_dim=head_dim,
     )
     if config is None:
         raise ValueError(
@@ -2930,6 +3094,20 @@ def _mosaic_attention_backward_warp_specialized_dq(
     log2e = math.log2(math.e)
     lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(dtype, block_q)
     row_layout = accumulator_layout.reduce(1)
+    score_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, block_kv),
+    )
+    feature_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_q, head_dim),
+    )
     row_operand_swizzle = _smem_swizzle_for_trailing_dimension(head_dim, dtype)
     row_operand_smem_transforms = _smem_transforms_for_trailing_dimension(
         head_dim,
@@ -3012,6 +3190,10 @@ def _mosaic_attention_backward_warp_specialized_dq(
         )
         return mgpu.mma(accumulator, lhs, rhs)
 
+    @plgpu.inline_mgpu()
+    def synchronize_warpgroup(_):
+        mgpu.warpgroup_barrier()
+
     def kernel(
         query_ref,
         key_ref,
@@ -3024,6 +3206,7 @@ def _mosaic_attention_backward_warp_specialized_dq(
         smem_buffers,
         ready_barriers,
         consumed_barriers,
+        matrix_smem,
     ):
         batch = lax.axis_index("batch")
         query_head = lax.axis_index("heads")
@@ -3105,7 +3288,7 @@ def _mosaic_attention_backward_warp_specialized_dq(
                 )
                 plgpu.barrier_wait(key_barriers.at[slot])
                 key_for_scores = load_shared_transposed_rhs(key_smem.at[slot])
-                scores = plgpu.mma(
+                scores = score_mma(
                     plgpu.layout_cast(
                         jnp.zeros(
                             (block_q, block_kv),
@@ -3138,7 +3321,7 @@ def _mosaic_attention_backward_warp_specialized_dq(
 
                 plgpu.barrier_wait(value_barriers.at[slot])
                 value_for_dp = load_shared_transposed_rhs(value_smem.at[slot])
-                dp = plgpu.mma(
+                dp = score_mma(
                     plgpu.layout_cast(
                         jnp.zeros(
                             (block_q, block_kv),
@@ -3155,11 +3338,27 @@ def _mosaic_attention_backward_warp_specialized_dq(
                 key_for_dq = load_shared_direct_rhs(
                     key_for_dq_smem.at[slot]
                 )
-                query_gradient = mma_with_accumulator_lhs(
-                    query_gradient,
-                    ds.astype(dtype),
-                    key_for_dq,
-                )
+                if dtype == jnp.dtype(jnp.float32):
+                    matrix_ref = matrix_smem.at[wg_index]
+                    matrix_ref[...] = ds
+                    plgpu.commit_smem()
+                    synchronize_warpgroup()
+                    ds_fragment = plgpu.load(
+                        matrix_ref,
+                        layout=lhs_layout,
+                        optimized=False,
+                    )
+                    query_gradient = feature_mma(
+                        query_gradient,
+                        ds_fragment,
+                        key_for_dq,
+                    )
+                else:
+                    query_gradient = mma_with_accumulator_lhs(
+                        query_gradient,
+                        ds.astype(dtype),
+                        key_for_dq,
+                    )
                 plgpu.barrier_arrive(key_consumed_barriers.at[slot])
                 return query_gradient
 
@@ -3263,6 +3462,17 @@ def _mosaic_attention_backward_warp_specialized_dq(
         dtype,
         transforms=transposed_key_smem_transforms,
     )
+    if dtype == jnp.dtype(jnp.float32):
+        matrix_scratch = plgpu.SMEM(
+            (num_compute_wgs, block_q, block_kv),
+            dtype,
+            transforms=_smem_transforms_for_trailing_dimension(
+                block_kv,
+                dtype,
+            ),
+        )
+    else:
+        matrix_scratch = plgpu.SMEM((1,), dtype)
     return plgpu.kernel(
         kernel,
         out_type=jax.ShapeDtypeStruct(query.shape, dtype),
@@ -3287,6 +3497,7 @@ def _mosaic_attention_backward_warp_specialized_dq(
                     num_barriers=max_concurrent_steps,
                 ),
             ),
+            matrix_scratch,
         ),
         compiler_params=plgpu.CompilerParams(
             approx_math=False,
@@ -4096,8 +4307,14 @@ def _mosaic_attention_backward_warp_specialized_dkv(
     negligible beside the O(N**2*D) contractions at the intended scale.
     """
 
-    if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
-        raise ValueError("warp-specialized dK/dV requires FP16 or BF16")
+    if query.dtype not in (
+        jnp.dtype(jnp.float16),
+        jnp.dtype(jnp.bfloat16),
+        jnp.dtype(jnp.float32),
+    ):
+        raise ValueError(
+            "warp-specialized dK/dV requires FP16, BF16, or FP32"
+        )
     if query.dtype != key.dtype or query.dtype != value.dtype:
         raise ValueError("query, key, and value must have the same dtype")
     if query.shape != output.shape or query.shape != upstream_gradient.shape:
@@ -4124,6 +4341,11 @@ def _mosaic_attention_backward_warp_specialized_dkv(
         if _config is None
         else _config
     )
+    config = _adapt_warp_specialized_dkv_config_for_dtype(
+        config,
+        dtype=query.dtype,
+        head_dim=head_dim,
+    )
     if config is None:
         raise ValueError(
             f"no warp-specialized dK/dV configuration is available for D={head_dim}"
@@ -4132,7 +4354,10 @@ def _mosaic_attention_backward_warp_specialized_dkv(
     block_kv = config.block_kv
     if gradient_kind == "both":
         num_compute_wgs = config.num_compute_wgs
-        if head_dim > 96:
+        if (
+            head_dim > 96
+            and query.dtype != jnp.dtype(jnp.float32)
+        ):
             compute_registers = 256
             producer_registers = 24
         else:
@@ -4153,7 +4378,9 @@ def _mosaic_attention_backward_warp_specialized_dkv(
     stage_transposed_operands = not (
         gradient_kind == "both" and head_dim > 96
     )
-    if gradient_kind == "both":
+    if query.dtype == jnp.dtype(jnp.float32):
+        requested_pipeline_depth = config.pipeline_stages
+    elif gradient_kind == "both":
         requested_pipeline_depth = (
             config.pipeline_stages
             if stage_transposed_operands
@@ -4169,6 +4396,20 @@ def _mosaic_attention_backward_warp_specialized_dkv(
     log2e = math.log2(math.e)
     lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(dtype, block_kv)
     column_layout = accumulator_layout.reduce(0)
+    score_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_kv, block_q),
+    )
+    feature_mma = _make_mosaic_mma(
+        dtype,
+        lhs_layout,
+        rhs_layout,
+        accumulator_layout,
+        (block_kv, head_dim),
+    )
     row_operand_swizzle = _smem_swizzle_for_trailing_dimension(head_dim, dtype)
     row_operand_smem_transforms = _smem_transforms_for_trailing_dimension(
         head_dim,
@@ -4250,6 +4491,10 @@ def _mosaic_attention_backward_warp_specialized_dkv(
         )
         return mgpu.mma(accumulator, lhs, rhs)
 
+    @plgpu.inline_mgpu()
+    def synchronize_warpgroup(_):
+        mgpu.warpgroup_barrier()
+
     def kernel(
         query_ref,
         query_transposed_ref,
@@ -4264,6 +4509,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
         smem_buffers,
         ready_barriers,
         consumed_barriers,
+        matrix_smem,
     ):
         batch = lax.axis_index("batch")
         kv_head = lax.axis_index("kv_heads")
@@ -4357,7 +4603,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                 query_for_scores = load_row_as_transposed_rhs(
                     query_smem.at[slot]
                 )
-                scores_transposed = plgpu.mma(
+                scores_transposed = score_mma(
                     plgpu.layout_cast(
                         jnp.zeros(
                             (block_kv, block_q),
@@ -4413,7 +4659,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                     gradient_for_dp = load_row_as_transposed_rhs(
                         gradient_smem.at[slot]
                     )
-                    dp_transposed = plgpu.mma(
+                    dp_transposed = score_mma(
                         plgpu.layout_cast(
                             jnp.zeros(
                                 (block_kv, block_q),
@@ -4467,11 +4713,29 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                             layout=rhs_layout,
                             optimized=False,
                         )
-                    key_gradient = mma_with_accumulator_lhs(
-                        key_gradient,
-                        ds_transposed.astype(dtype),
-                        query_for_dk,
-                    )
+                    if dtype == jnp.dtype(jnp.float32):
+                        matrix_ref = matrix_smem.at[wg_index]
+                        matrix_ref[...] = ds_transposed
+                        plgpu.commit_smem()
+                        synchronize_warpgroup()
+                        ds_fragment = plgpu.load(
+                            matrix_ref,
+                            layout=lhs_layout,
+                            optimized=False,
+                        )
+                        if compute_value_gradient:
+                            synchronize_warpgroup()
+                        key_gradient = feature_mma(
+                            key_gradient,
+                            ds_fragment,
+                            query_for_dk,
+                        )
+                    else:
+                        key_gradient = mma_with_accumulator_lhs(
+                            key_gradient,
+                            ds_transposed.astype(dtype),
+                            query_for_dk,
+                        )
                     if stage_transposed_operands:
                         plgpu.barrier_arrive(
                             query_transposed_consumed.at[slot]
@@ -4498,11 +4762,27 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                             layout=rhs_layout,
                             optimized=False,
                         )
-                    value_gradient = mma_with_accumulator_lhs(
-                        value_gradient,
-                        probabilities_transposed.astype(dtype),
-                        gradient_for_dv,
-                    )
+                    if dtype == jnp.dtype(jnp.float32):
+                        matrix_ref = matrix_smem.at[wg_index]
+                        matrix_ref[...] = probabilities_transposed
+                        plgpu.commit_smem()
+                        synchronize_warpgroup()
+                        probability_fragment = plgpu.load(
+                            matrix_ref,
+                            layout=lhs_layout,
+                            optimized=False,
+                        )
+                        value_gradient = feature_mma(
+                            value_gradient,
+                            probability_fragment,
+                            gradient_for_dv,
+                        )
+                    else:
+                        value_gradient = mma_with_accumulator_lhs(
+                            value_gradient,
+                            probabilities_transposed.astype(dtype),
+                            gradient_for_dv,
+                        )
                     if stage_transposed_operands:
                         plgpu.barrier_arrive(
                             gradient_transposed_consumed.at[slot]
@@ -4682,6 +4962,17 @@ def _mosaic_attention_backward_warp_specialized_dkv(
         )
         for _ in range(4)
     )
+    if dtype == jnp.dtype(jnp.float32):
+        matrix_scratch = plgpu.SMEM(
+            (num_compute_wgs, block_kv, block_q),
+            dtype,
+            transforms=_smem_transforms_for_trailing_dimension(
+                block_q,
+                dtype,
+            ),
+        )
+    else:
+        matrix_scratch = plgpu.SMEM((1,), dtype)
     key_gradient, value_gradient = plgpu.kernel(
         kernel,
         out_type=(
@@ -4697,6 +4988,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
             ),
             barriers,
             consumed_barriers,
+            matrix_scratch,
         ),
         compiler_params=plgpu.CompilerParams(
             approx_math=False,
@@ -5338,7 +5630,11 @@ def _mosaic_attention_backward_warp_specialized_generated_split(
         upstream_gradient,
         is_causal=is_causal,
     )
-    dkv_config = _warp_specialized_dkv_config_for_head_dim(query.shape[3])
+    dkv_config = _adapt_warp_specialized_dkv_config_for_dtype(
+        _warp_specialized_dkv_config_for_head_dim(query.shape[3]),
+        dtype=query.dtype,
+        head_dim=query.shape[3],
+    )
     assert dkv_config is not None
     dkv_function = (
         _mosaic_attention_backward_warp_specialized_dkv_split
