@@ -13,9 +13,11 @@ from jaxmodules._mosaic_attention import (
     _mosaic_attention_backward_warp_specialized,
     _mosaic_attention_backward_warp_specialized_causal_split,
     _mosaic_attention_forward_warp_specialized,
+    _prefer_non_atomic_generic_backward,
     mask_is_mosaic_compatible,
     mosaic_attention_backward,
     mosaic_attention_forward,
+    supports_mosaic_attention,
 )
 from jaxmodules.attention import (
     _masked_attention_via_map,
@@ -70,6 +72,38 @@ def test_mask_compatibility_is_conservative():
     assert not mask_is_mosaic_compatible(
         lambda batch, head, query, key: jnp.sin(query + key) > 0
     )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "expected"),
+    [
+        (48, False),
+        (64, True),
+        (80, True),
+        (128, True),
+        (256, True),
+        (512, True),
+        (1024, True),
+        (2048, True),
+        (2064, False),
+    ],
+)
+def test_mosaic_supports_flexible_head_dimensions(head_dim, expected):
+    query = jax.ShapeDtypeStruct((1, 128, 2, head_dim), jnp.float16)
+    key_value = jax.ShapeDtypeStruct((1, 128, 1, head_dim), jnp.float16)
+
+    assert (
+        supports_mosaic_attention(query, key_value, key_value, _unmasked)
+        is expected
+    )
+
+
+def test_wide_heads_select_non_atomic_generic_backward():
+    narrow = jax.ShapeDtypeStruct((1, 4096, 8, 256), jnp.float16)
+    wide = jax.ShapeDtypeStruct((1, 4096, 8, 512), jnp.float16)
+
+    assert not _prefer_non_atomic_generic_backward(narrow)
+    assert _prefer_non_atomic_generic_backward(wide)
 
 
 def test_warp_specialized_forward_selection_respects_supported_shapes():
@@ -467,21 +501,22 @@ def test_warp_specialized_backward_matches_xla(
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize("mask_fn", [_complex_mask, _partly_fully_masked])
-def test_mosaic_forward_matches_mapped_for_general_masks(mask_fn):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_mosaic_forward_matches_mapped_for_general_masks(mask_fn, head_dim):
     keys = jax.random.split(jax.random.key(7), 3)
     query = jax.random.normal(
         keys[0],
-        (2, 128, 4, 64),
+        (2, 128, 4, head_dim),
         dtype=jnp.float16,
     )
     key = jax.random.normal(
         keys[1],
-        (2, 128, 2, 64),
+        (2, 128, 2, head_dim),
         dtype=jnp.float16,
     )
     value = jax.random.normal(
         keys[2],
-        (2, 128, 2, 64),
+        (2, 128, 2, head_dim),
         dtype=jnp.float16,
     )
 
@@ -600,16 +635,21 @@ def test_mosaic_forward_composes_with_jit_and_vmap():
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize(
-    ("dtype", "tolerance"),
+    ("dtype", "tolerance", "head_dim"),
     [
-        (jnp.float16, 3e-3),
-        (jnp.bfloat16, 2e-2),
+        (jnp.float16, 3e-3, 64),
+        (jnp.float16, 3e-3, 128),
+        (jnp.bfloat16, 2e-2, 64),
     ],
 )
-def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
+def test_mosaic_custom_vjp_matches_existing_tiled_backward(
+    dtype,
+    tolerance,
+    head_dim,
+):
     keys = jax.random.split(jax.random.key(19), 4)
-    query_shape = (1, 128, 4, 64)
-    kv_shape = (1, 128, 2, 64)
+    query_shape = (1, 128, 4, head_dim)
+    kv_shape = (1, 128, 2, head_dim)
     query = jax.random.normal(keys[0], query_shape, dtype=dtype)
     key = jax.random.normal(keys[1], kv_shape, dtype=dtype)
     value = jax.random.normal(keys[2], kv_shape, dtype=dtype)
@@ -701,6 +741,82 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward(dtype, tolerance):
             np.asarray(mapped_gradient),
             rtol=tolerance,
             atol=tolerance,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize(
+    ("head_dim", "mask_fn", "is_causal"),
+    [
+        (512, _complex_mask, False),
+        (1024, _unmasked, False),
+        (2048, _unmasked, True),
+    ],
+)
+def test_wide_head_custom_vjp_matches_xla(head_dim, mask_fn, is_causal):
+    keys = jax.random.split(jax.random.key(67 + head_dim), 4)
+    shape = (1, 64, 1, head_dim)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    def mosaic_loss(q, k, v):
+        result = _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=mask_fn,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=is_causal,
+            backward_strategy="auto",
+        )
+        return jnp.sum(result.astype(jnp.float32) * cotangent)
+
+    def xla_loss(q, k, v):
+        mask = None
+        if mask_fn is _complex_mask:
+            mask = _complex_mask(
+                jnp.asarray(0),
+                jnp.asarray(0),
+                jnp.arange(shape[1])[:, None],
+                jnp.arange(shape[1])[None, :],
+            )
+        result = jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            mask=mask,
+            is_causal=is_causal,
+            implementation="xla",
+        )
+        return jnp.sum(result.astype(jnp.float32) * cotangent)
+
+    mosaic_value, mosaic_gradients = jax.jit(
+        jax.value_and_grad(mosaic_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+    xla_value, xla_gradients = jax.jit(
+        jax.value_and_grad(xla_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+
+    np.testing.assert_allclose(
+        np.asarray(mosaic_value),
+        np.asarray(xla_value),
+        rtol=3e-3,
+        atol=3e-3,
+    )
+    for mosaic_gradient, xla_gradient in zip(
+        mosaic_gradients,
+        xla_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(mosaic_gradient),
+            np.asarray(xla_gradient),
+            rtol=3e-3,
+            atol=3e-3,
         )
 
 

@@ -98,7 +98,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=_positive_int, default=1)
     parser.add_argument("--query-heads", type=_positive_int, default=4)
     parser.add_argument("--kv-heads", type=_positive_int, default=4)
-    parser.add_argument("--head-dim", type=_positive_int, default=64)
+    parser.add_argument("--head-dim", type=_positive_int, nargs="+", default=[64])
     parser.add_argument("--dtype", choices=DTYPES, default="float16")
     parser.add_argument("--mask", choices=MASKS, default="causal")
     parser.add_argument(
@@ -529,8 +529,8 @@ def _format_bytes(value: int | None) -> str:
 
 def _print_results(results: list[dict[str, Any]]) -> None:
     heading = (
-        "seq | mask     | qblk | kvblk | strategy | mode | implementation | median | "
-        "tokens/s | device peak* | compiler temp | status"
+        "seq | hdim | mask     | qblk | kvblk | strategy | mode | implementation | "
+        "median | tokens/s | device peak* | compiler temp | status"
     )
     print(heading)
     print("-" * len(heading))
@@ -548,7 +548,8 @@ def _print_results(results: list[dict[str, Any]]) -> None:
             latency = throughput = peak = temporary = "-"
             status = f"{result.get('error_type')}: {result.get('error')}"
         print(
-            f"{case['seq_len']:>3} | {case['mask']:<8} | "
+            f"{case['seq_len']:>3} | {case['head_dim']:>4} | "
+            f"{case['mask']:<8} | "
             f"{case['block_size']:>4} | "
             f"{case['kv_block_size']:>5} | "
             f"{case['mapped_backward_strategy']:<8} | {case['mode']:<8} | "
@@ -586,7 +587,7 @@ def main() -> int:
             batch_size=args.batch_size,
             query_heads=args.query_heads,
             kv_heads=args.kv_heads,
-            head_dim=args.head_dim,
+            head_dim=head_dim,
             dtype=args.dtype,
             mask=args.mask,
             mapped_backward_strategy=args.mapped_backward_strategy,
@@ -595,6 +596,7 @@ def main() -> int:
             seed=args.seed,
         )
         for seq_len in args.seq_len
+        for head_dim in args.head_dim
         for block_size, kv_block_size in tile_sizes
         for mode in modes
         for implementation in implementations

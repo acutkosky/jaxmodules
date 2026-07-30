@@ -72,6 +72,62 @@ class MosaicAttentionConfig:
     block_kv: int = 64
 
 
+def _mma_layouts(
+    dtype: jnp.dtype,
+    block_rows: int,
+) -> tuple[Any, Any, Any]:
+    """Build matching synchronous-MMA layouts for 16, 32, or 64 rows."""
+
+    if jnp.dtype(dtype).itemsize != 2:
+        raise ValueError("MMA layouts require 16-bit operands")
+    if block_rows not in (16, 32, 64):
+        raise ValueError("MMA row tiles must be 16, 32, or 64")
+
+    m_warps = block_rows // 16
+    n_warps = 4 // m_warps
+    replicated_m = plgpu.Replicated(4 // m_warps)
+    replicated_n = plgpu.Replicated(4 // n_warps)
+    lhs_layout = plgpu.Layout.TILED(
+        plgpu.Tiling(
+            (
+                (m_warps * 16, 16),
+                (16, 8),
+                (8, 8),
+                (2,),
+            )
+        ),
+        warp_dims=(-7, replicated_m),
+        lane_dims=(-3, -2),
+        vector_dim=-1,
+    )
+    rhs_layout = plgpu.Layout.TILED(
+        plgpu.Tiling(
+            (
+                (16, n_warps * 8),
+                (8, 8),
+                (2, 1),
+            )
+        ),
+        warp_dims=(replicated_n, -5),
+        lane_dims=(-3, -4),
+        vector_dim=-2,
+    )
+    accumulator_layout = plgpu.Layout.TILED(
+        plgpu.Tiling(
+            (
+                (m_warps * 16, n_warps * 8),
+                (16, 8),
+                (8, 8),
+                (2,),
+            )
+        ),
+        warp_dims=(-7, -6),
+        lane_dims=(-3, -2),
+        vector_dim=-1,
+    )
+    return lhs_layout, rhs_layout, accumulator_layout
+
+
 def _jaxpr_uses_supported_mask_primitives(jaxpr: jax_core.Jaxpr) -> bool:
     if jaxpr.effects:
         return False
@@ -130,11 +186,24 @@ def _select_config(
     query: jax.Array,
     key: jax.Array,
 ) -> MosaicAttentionConfig | None:
-    """Choose a conservative initial configuration for supported shapes."""
+    """Choose score tiles that keep wide-head register pressure bounded."""
 
-    if query.shape[1] % 64 or key.shape[1] % 64:
+    if query.shape[3] >= 512:
+        tile_size = 32
+    else:
+        tile_size = 64
+    if query.shape[1] % tile_size or key.shape[1] % tile_size:
         return None
-    return MosaicAttentionConfig()
+    return MosaicAttentionConfig(block_q=tile_size, block_kv=tile_size)
+
+
+def _is_supported_head_dimension(head_dim: int) -> bool:
+    """Whether warp-level MMA can represent the shared attention dimension."""
+
+    # ``mma.sync.m16n8k16`` consumes the feature dimension in groups of 16.
+    # Keep the implementation parametric over all such widths instead of
+    # selecting a kernel for one model-specific embedding shape.
+    return 64 <= head_dim <= 2048 and head_dim % 16 == 0
 
 
 def supports_mosaic_attention(
@@ -159,9 +228,7 @@ def supports_mosaic_attention(
         return False
     if query.shape[3] != key.shape[3] or query.shape[3] != value.shape[3]:
         return False
-    # Start with the overwhelmingly common D=64 case. Wider head dimensions
-    # need separate register-pressure and tile-size tuning.
-    if query.shape[3] != 64:
+    if not _is_supported_head_dimension(query.shape[3]):
         return False
     if _select_config(query, key) is None:
         return False
@@ -270,6 +337,18 @@ def _can_use_warp_specialized_causal_split_backward(
     )
 
 
+def _prefer_non_atomic_generic_backward(query: jax.Array) -> bool:
+    """Whether complete locally accumulated gradients beat tile atomics.
+
+    Wide heads increase both the register footprint of the one-pass kernel and
+    the amount of data committed through global atomics. The key-major split
+    avoids those atomics and reduces compiler temporaries for every supported
+    mask kind.
+    """
+
+    return query.shape[3] >= 512
+
+
 def mosaic_attention_forward(
     query: jax.Array,
     key: jax.Array,
@@ -308,7 +387,10 @@ def mosaic_attention_forward(
     num_kv_tiles = kv_length // block_kv
     scale = float(head_dim**-0.5)
     log2e = math.log2(math.e)
-    accumulator_layout = plgpu.Layout.MMA_ACC(dtype)
+    lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(
+        dtype,
+        block_q,
+    )
     row_layout = accumulator_layout.reduce(1)
 
     def kernel(
@@ -336,7 +418,7 @@ def mosaic_attention_forward(
                 pl.ds(query_base, block_q),
                 query_head,
             ],
-            layout=plgpu.Layout.MMA_LHS(dtype),
+            layout=lhs_layout,
             optimized=False,
         )
         row_max = plgpu.layout_cast(
@@ -363,7 +445,7 @@ def mosaic_attention_forward(
                     ],
                     (1, 0),
                 ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
+                layout=rhs_layout,
                 optimized=False,
             )
             scores = plgpu.mma(
@@ -439,7 +521,7 @@ def mosaic_attention_forward(
                     ],
                     (1, 0),
                 ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
+                layout=rhs_layout,
                 optimized=False,
             )
 
@@ -449,7 +531,7 @@ def mosaic_attention_forward(
             probability_smem[...] = probabilities.astype(dtype)
             probability_fragment = plgpu.load(
                 probability_smem,
-                layout=plgpu.Layout.MMA_LHS(dtype),
+                layout=lhs_layout,
                 optimized=False,
             )
             output_accumulator = plgpu.mma(
@@ -589,7 +671,7 @@ def mosaic_attention_forward(
             jnp.zeros_like(natural_lse),
         )
 
-    swizzle = 128
+    swizzle = min(128, block_kv * jnp.dtype(dtype).itemsize)
     swizzle_elems = swizzle // jnp.dtype(dtype).itemsize
     probability_scratch = plgpu.SMEM(
         (block_q, block_kv),
@@ -615,7 +697,11 @@ def mosaic_attention_forward(
         scratch_types=(probability_scratch,),
         compiler_params=plgpu.CompilerParams(
             approx_math=False,
-            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+            lowering_semantics=(
+                plgpu.LoweringSemantics.Lane
+                if block_q < 64
+                else plgpu.LoweringSemantics.Warpgroup
+            ),
         ),
         grid=(query_heads, num_query_tiles, batch_size),
         grid_names=("heads", "query_tiles", "batch"),
@@ -1117,7 +1203,10 @@ def _mosaic_attention_backward_two_pass(
     num_kv_tiles = kv_length // block_kv
     scale = float(head_dim**-0.5)
     log2e = math.log2(math.e)
-    accumulator_layout = plgpu.Layout.MMA_ACC(dtype)
+    lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(
+        dtype,
+        block_q,
+    )
     row_layout = accumulator_layout.reduce(1)
     column_layout = accumulator_layout.reduce(0)
 
@@ -1132,7 +1221,7 @@ def _mosaic_attention_backward_two_pass(
     log_normalizer_transposed = jnp.transpose(log_normalizer, (0, 2, 1))
     delta_transposed = jnp.transpose(delta, (0, 2, 1))
 
-    swizzle = 128
+    swizzle = min(128, block_kv * jnp.dtype(dtype).itemsize)
     swizzle_elems = swizzle // jnp.dtype(dtype).itemsize
     matrix_scratch_type = plgpu.SMEM(
         (block_q, block_kv),
@@ -1168,7 +1257,7 @@ def _mosaic_attention_backward_two_pass(
 
         query_fragment = plgpu.load(
             query_ref.at[batch, query_slice, query_head],
-            layout=plgpu.Layout.MMA_LHS(dtype),
+            layout=lhs_layout,
             optimized=False,
         )
         gradient_fragment = plgpu.load(
@@ -1177,7 +1266,7 @@ def _mosaic_attention_backward_two_pass(
                 query_slice,
                 query_head,
             ],
-            layout=plgpu.Layout.MMA_LHS(dtype),
+            layout=lhs_layout,
             optimized=False,
         )
         lse = plgpu.load(
@@ -1232,7 +1321,7 @@ def _mosaic_attention_backward_two_pass(
                         key_ref.at[batch, kv_slice, kv_head],
                         (1, 0),
                     ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    layout=rhs_layout,
                     optimized=False,
                 )
                 scores = plgpu.mma(
@@ -1258,7 +1347,7 @@ def _mosaic_attention_backward_two_pass(
                         value_ref.at[batch, kv_slice, kv_head],
                         (1, 0),
                     ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    layout=rhs_layout,
                     optimized=False,
                 )
                 dp = plgpu.layout_cast(
@@ -1281,13 +1370,13 @@ def _mosaic_attention_backward_two_pass(
                         ],
                         (1, 0),
                     ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    layout=rhs_layout,
                     optimized=False,
                 )
                 matrix_smem[...] = ds.astype(dtype)
                 ds_fragment = plgpu.load(
                     matrix_smem,
-                    layout=plgpu.Layout.MMA_LHS(dtype),
+                    layout=lhs_layout,
                     optimized=False,
                 )
                 query_gradient = plgpu.mma(
@@ -1334,7 +1423,11 @@ def _mosaic_attention_backward_two_pass(
         scratch_types=(matrix_scratch_type,),
         compiler_params=plgpu.CompilerParams(
             approx_math=False,
-            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+            lowering_semantics=(
+                plgpu.LoweringSemantics.Lane
+                if block_q < 64
+                else plgpu.LoweringSemantics.Warpgroup
+            ),
         ),
         grid=(query_heads, num_query_tiles, batch_size),
         grid_names=("heads", "query_tiles", "batch"),
@@ -1368,12 +1461,12 @@ def _mosaic_attention_backward_two_pass(
 
         key_fragment = plgpu.load(
             key_ref.at[batch, kv_slice, kv_head],
-            layout=plgpu.Layout.MMA_LHS(dtype),
+            layout=lhs_layout,
             optimized=False,
         )
         value_fragment = plgpu.load(
             value_ref.at[batch, kv_slice, kv_head],
-            layout=plgpu.Layout.MMA_LHS(dtype),
+            layout=lhs_layout,
             optimized=False,
         )
         key_gradient = plgpu.layout_cast(
@@ -1414,7 +1507,7 @@ def _mosaic_attention_backward_two_pass(
                             ],
                             (1, 0),
                         ),
-                        layout=plgpu.Layout.MMA_RHS(dtype),
+                        layout=rhs_layout,
                         optimized=False,
                     )
                     scores_transposed = plgpu.mma(
@@ -1468,7 +1561,7 @@ def _mosaic_attention_backward_two_pass(
                             ],
                             (1, 0),
                         ),
-                        layout=plgpu.Layout.MMA_RHS(dtype),
+                        layout=rhs_layout,
                         optimized=False,
                     )
                     gradient_rhs = plgpu.load(
@@ -1481,7 +1574,7 @@ def _mosaic_attention_backward_two_pass(
                             ],
                             (1, 0),
                         ),
-                        layout=plgpu.Layout.MMA_RHS(dtype),
+                        layout=rhs_layout,
                         optimized=False,
                     )
                     dp_transposed = plgpu.mma(
@@ -1521,13 +1614,13 @@ def _mosaic_attention_backward_two_pass(
                             ],
                             (1, 0),
                         ),
-                        layout=plgpu.Layout.MMA_RHS(dtype),
+                        layout=rhs_layout,
                         optimized=False,
                     )
                     matrix_smem[...] = ds_transposed.astype(dtype)
                     ds_fragment = plgpu.load(
                         matrix_smem,
-                        layout=plgpu.Layout.MMA_LHS(dtype),
+                        layout=lhs_layout,
                         optimized=False,
                     )
                     key_gradient = plgpu.mma(
@@ -1539,7 +1632,7 @@ def _mosaic_attention_backward_two_pass(
                     matrix_smem[...] = probabilities_transposed.astype(dtype)
                     probability_fragment = plgpu.load(
                         matrix_smem,
-                        layout=plgpu.Layout.MMA_LHS(dtype),
+                        layout=lhs_layout,
                         optimized=False,
                     )
                     value_gradient = plgpu.mma(
@@ -1596,7 +1689,11 @@ def _mosaic_attention_backward_two_pass(
         scratch_types=(matrix_scratch_type,),
         compiler_params=plgpu.CompilerParams(
             approx_math=False,
-            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+            lowering_semantics=(
+                plgpu.LoweringSemantics.Lane
+                if block_q < 64
+                else plgpu.LoweringSemantics.Warpgroup
+            ),
         ),
         grid=(kv_heads, num_kv_tiles, batch_size),
         grid_names=("kv_heads", "kv_tiles", "batch"),
@@ -3491,12 +3588,12 @@ def mosaic_attention_backward(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run the selected fast backward, or the lower-temporary two-pass variant.
 
-    For large maximal-causal MHA, ``"auto"`` combines a query-major dQ pass
-    with a key-major dK/dV pass that accumulates complete tiles locally and
-    avoids global atomics. Other supported dense cases use the single-pass
-    warp-specialized implementation with FP32 atomic dK/dV accumulation.
-    ``"minimal"`` retains the generic two-pass implementation for callers
-    that prefer its smaller compiler temporary estimate.
+    For large maximal-causal D=64 MHA, ``"auto"`` combines specialized
+    query-major dQ and key-major dK/dV passes. Wide heads use the generic
+    query-major/key-major split for causal, unmasked, and callable masks;
+    complete dK/dV tiles are accumulated locally without global atomics.
+    Other supported dense cases use a single-pass implementation with FP32
+    atomic dK/dV accumulation. ``"minimal"`` always selects the generic split.
     """
     if backward_strategy == "minimal":
         return _mosaic_attention_backward_two_pass(
@@ -3525,6 +3622,7 @@ def mosaic_attention_backward(
         is_unmasked=is_unmasked,
         is_causal=is_causal,
     )
+    use_generic_split = _prefer_non_atomic_generic_backward(query)
 
     def run_selected(q, k, v, o, lse, do):
         if use_causal_split:
@@ -3535,6 +3633,17 @@ def mosaic_attention_backward(
                 o,
                 lse,
                 do,
+            )
+        if use_generic_split:
+            return _mosaic_attention_backward_two_pass(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                mask_fn,
+                is_causal=is_causal,
             )
         if use_warp_specialized:
             return _mosaic_attention_backward_warp_specialized(
