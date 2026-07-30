@@ -1744,7 +1744,10 @@ def _mosaic_attention_backward_one_pass(
     num_kv_tiles = kv_length // block_kv
     scale = float(head_dim**-0.5)
     log2e = math.log2(math.e)
-    accumulator_layout = plgpu.Layout.MMA_ACC(dtype)
+    lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(
+        dtype,
+        block_q,
+    )
     row_layout = accumulator_layout.reduce(1)
 
     gradient = upstream_gradient.astype(dtype)
@@ -1770,21 +1773,23 @@ def _mosaic_attention_backward_one_pass(
     )
     compiler_params = plgpu.CompilerParams(
         approx_math=False,
-        lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+        lowering_semantics=(
+            plgpu.LoweringSemantics.Lane
+            if block_q < 64
+            else plgpu.LoweringSemantics.Warpgroup
+        ),
     )
 
-    # This is specific to the 64x64, four-warp MMA layouts selected above.
+    # This shortcut is specific to the 64x64, four-warp MMA layouts.
     # After the FP32 accumulator is cast to the input dtype, MMA_ACC and
     # MMA_LHS assign every element to the same lane and register in the same
-    # order. Rewrapping the registers therefore avoids a shared-memory reload;
-    # changing the tile or warp layout requires revalidating that invariant.
-    assert block_q == block_kv == 64
+    # order. Smaller tiles use the general shared-memory conversion below.
 
     @plgpu.inline_mgpu(
         arg_types=(
             accumulator_layout,
             accumulator_layout,
-            plgpu.Layout.MMA_RHS(dtype),
+            rhs_layout,
         ),
         return_type=plgpu.ShapeDtypeStruct(
             (block_q, head_dim),
@@ -1813,13 +1818,13 @@ def _mosaic_attention_backward_one_pass(
         return_type=plgpu.ShapeDtypeStruct(
             (block_kv, block_q),
             dtype,
-            layout=plgpu.Layout.MMA_LHS(dtype),
+            layout=lhs_layout,
         ),
     )
     def load_transposed_scratch(_, scratch_ref):
         return mgpu.FragmentedArray.build(
             (block_kv, block_q),
-            plgpu.Layout.MMA_LHS(dtype).to_mgpu(),
+            lhs_layout.to_mgpu(),
             lambda row, column: memref.load(
                 scratch_ref,
                 (column, row),
@@ -1875,7 +1880,7 @@ def _mosaic_attention_backward_one_pass(
 
             query_fragment = plgpu.load(
                 query_ref.at[batch, query_slice, query_head],
-                layout=plgpu.Layout.MMA_LHS(dtype),
+                layout=lhs_layout,
                 optimized=False,
             )
             query_for_dk = plgpu.load(
@@ -1888,7 +1893,7 @@ def _mosaic_attention_backward_one_pass(
                     ],
                     (1, 0),
                 ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
+                layout=rhs_layout,
                 optimized=False,
             )
             gradient_fragment = plgpu.load(
@@ -1897,7 +1902,7 @@ def _mosaic_attention_backward_one_pass(
                     query_slice,
                     query_head,
                 ],
-                layout=plgpu.Layout.MMA_LHS(dtype),
+                layout=lhs_layout,
                 optimized=False,
             )
             gradient_rhs = plgpu.load(
@@ -1910,7 +1915,7 @@ def _mosaic_attention_backward_one_pass(
                     ],
                     (1, 0),
                 ),
-                layout=plgpu.Layout.MMA_RHS(dtype),
+                layout=rhs_layout,
                 optimized=False,
             )
             lse = plgpu.load(
@@ -1952,7 +1957,7 @@ def _mosaic_attention_backward_one_pass(
                         key_ref.at[batch, kv_slice, kv_head],
                         (1, 0),
                     ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    layout=rhs_layout,
                     optimized=False,
                 )
                 scores = plgpu.mma(
@@ -1982,7 +1987,7 @@ def _mosaic_attention_backward_one_pass(
                         value_ref.at[batch, kv_slice, kv_head],
                         (1, 0),
                     ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    layout=rhs_layout,
                     optimized=False,
                 )
                 dp = plgpu.layout_cast(
@@ -2005,7 +2010,7 @@ def _mosaic_attention_backward_one_pass(
                         ],
                         (1, 0),
                     ),
-                    layout=plgpu.Layout.MMA_RHS(dtype),
+                    layout=rhs_layout,
                     optimized=False,
                 )
                 key_gradient = plgpu.layout_cast(
@@ -2017,19 +2022,39 @@ def _mosaic_attention_backward_one_pass(
                 )
                 ds_component = ds.astype(dtype)
 
-                def load_transposed_ds(matrix_smem):
-                    matrix_smem[:, :block_kv] = ds_component
-                    return load_transposed_scratch(matrix_smem)
+                if block_q == 64:
+                    def load_transposed_ds(matrix_smem):
+                        matrix_smem[:, :block_kv] = ds_component
+                        return load_transposed_scratch(matrix_smem)
 
-                ds_transposed_fragment = pl.run_scoped(
-                    load_transposed_ds,
-                    matrix_scratch_type,
-                )
-                query_gradient = mma_with_accumulator_lhs(
-                    query_gradient,
-                    ds_component,
-                    key_for_dq,
-                )
+                    ds_transposed_fragment = pl.run_scoped(
+                        load_transposed_ds,
+                        matrix_scratch_type,
+                    )
+                    query_gradient = mma_with_accumulator_lhs(
+                        query_gradient,
+                        ds_component,
+                        key_for_dq,
+                    )
+                else:
+                    def load_ds_fragments(matrix_smem):
+                        matrix_smem[:, :block_kv] = ds_component
+                        direct = plgpu.load(
+                            matrix_smem.at[:, :block_kv],
+                            layout=lhs_layout,
+                            optimized=False,
+                        )
+                        return load_transposed_scratch(matrix_smem), direct
+
+                    ds_transposed_fragment, ds_fragment = pl.run_scoped(
+                        load_ds_fragments,
+                        matrix_scratch_type,
+                    )
+                    query_gradient = plgpu.mma(
+                        query_gradient,
+                        ds_fragment,
+                        key_for_dq,
+                    )
                 key_gradient = plgpu.mma(
                     key_gradient,
                     ds_transposed_fragment,
@@ -3599,7 +3624,8 @@ def mosaic_attention_backward(
     query-major/key-major split for causal, unmasked, and callable masks;
     complete dK/dV tiles are accumulated locally without global atomics.
     Other supported dense cases use a single-pass implementation with FP32
-    atomic dK/dV accumulation. ``"minimal"`` always selects the generic split.
+    atomic dK/dV accumulation. ``"minimal"`` always selects the generic split;
+    ``"one_pass"`` explicitly selects the generic atomic implementation.
     """
     if backward_strategy == "minimal":
         return _mosaic_attention_backward_two_pass(
@@ -3612,8 +3638,21 @@ def mosaic_attention_backward(
             mask_fn,
             is_causal=is_causal,
         )
+    if backward_strategy == "one_pass":
+        return _mosaic_attention_backward_one_pass(
+            query,
+            key,
+            value,
+            output,
+            log_normalizer,
+            upstream_gradient,
+            mask_fn,
+            is_causal=is_causal,
+        )
     if backward_strategy != "auto":
-        raise ValueError("backward_strategy must be 'auto' or 'minimal'")
+        raise ValueError(
+            "backward_strategy must be 'auto', 'minimal', or 'one_pass'"
+        )
 
     is_unmasked = _mask_is_always_true(mask_fn)
     use_warp_specialized = _can_use_warp_specialized_forward(

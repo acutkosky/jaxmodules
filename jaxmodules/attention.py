@@ -1642,13 +1642,13 @@ def masked_attention_via_map(
         will be even larger for keys or values near the edges of the sequence. This parameter is indended
         to control performance rather than for exact masking.
         Use the  mask_fn to explicitly enforce a constant window size if desired.
-    backward_strategy: ``"auto"`` uses a one-pass backward. The mapped fallback
-        carries whichever full-precision gradient set is smaller; the Mosaic
-        fast path uses query-major programs with FP32 atomic dK/dV
-        accumulation. ``"minimal"`` recomputes score tiles in separate Q and
-        K/V passes so no sequence-sized FP32 gradient is carried. This trades
-        additional compute for less gradient-carry memory, although other live
-        buffers can dominate the total peak. Neither strategy changes
+    backward_strategy: ``"auto"`` selects between one-pass and split
+        query-major/key-major backward kernels. ``"minimal"`` always
+        recomputes score tiles in separate Q and K/V passes so no
+        sequence-sized FP32 gradient is carried. ``"one_pass"`` instead
+        computes all three gradients in one score-tile traversal; Mosaic uses
+        FP32 atomic dK/dV accumulation, which can help sparse masks but uses
+        larger compiler temporaries. None of the strategies changes
         contraction or accumulation precision. The strategy applies to the
         optimized default kernel; custom kernels retain their generic
         custom-VJP path.
@@ -1688,8 +1688,10 @@ def masked_attention_via_map(
         raise ValueError("block_size must be positive")
     if kv_block_size is not None and kv_block_size <= 0:
         raise ValueError("kv_block_size must be positive")
-    if backward_strategy not in ("auto", "minimal"):
-        raise ValueError("backward_strategy must be 'auto' or 'minimal'")
+    if backward_strategy not in ("auto", "minimal", "one_pass"):
+        raise ValueError(
+            "backward_strategy must be 'auto', 'minimal', or 'one_pass'"
+        )
 
     # Canonicalize mask_fn to 4-arg form
     mask_fn = _canonicalize_mask_fn(mask_fn, is_causal)

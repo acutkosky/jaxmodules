@@ -80,7 +80,9 @@ def test_mask_compatibility_is_conservative():
         (48, False),
         (64, True),
         (80, True),
+        (96, True),
         (128, True),
+        (192, True),
         (256, True),
         (512, True),
         (1024, True),
@@ -746,14 +748,24 @@ def test_mosaic_custom_vjp_matches_existing_tiled_backward(
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize(
-    ("head_dim", "mask_fn", "is_causal"),
+    ("head_dim", "mask_fn", "is_causal", "backward_strategy"),
     [
-        (512, _complex_mask, False),
-        (1024, _unmasked, False),
-        (2048, _unmasked, True),
+        (80, _complex_mask, False, "auto"),
+        (96, _unmasked, True, "auto"),
+        (128, _complex_mask, False, "one_pass"),
+        (192, _complex_mask, False, "auto"),
+        (256, _unmasked, False, "auto"),
+        (512, _complex_mask, False, "auto"),
+        (1024, _unmasked, False, "auto"),
+        (2048, _unmasked, True, "auto"),
     ],
 )
-def test_wide_head_custom_vjp_matches_xla(head_dim, mask_fn, is_causal):
+def test_wide_head_custom_vjp_matches_xla(
+    head_dim,
+    mask_fn,
+    is_causal,
+    backward_strategy,
+):
     keys = jax.random.split(jax.random.key(67 + head_dim), 4)
     shape = (1, 64, 1, head_dim)
     query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
@@ -771,7 +783,7 @@ def test_wide_head_custom_vjp_matches_xla(head_dim, mask_fn, is_causal):
             kv_block_size=64,
             window_size=None,
             is_causal=is_causal,
-            backward_strategy="auto",
+            backward_strategy=backward_strategy,
         )
         return jnp.sum(result.astype(jnp.float32) * cotangent)
 

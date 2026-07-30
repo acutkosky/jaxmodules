@@ -654,8 +654,8 @@ def test_masked_attention_independent_tile_gradients():
 
 
 @pytest.mark.parametrize("use_window", [False, True])
-def test_masked_attention_minimal_backward_matches_auto(use_window):
-    """Two-pass backward preserves the one-pass FP32 accumulation result."""
+def test_masked_attention_backward_strategies_match(use_window):
+    """Explicit one- and two-pass choices preserve the auto result."""
     length, query_heads, kv_heads, dim = 9, 4, 2, 8
     query, key, value, cotangent = (
         jax.random.normal(random_key, shape)
@@ -703,13 +703,25 @@ def test_masked_attention_minimal_backward_matches_auto(use_window):
         lambda q, k, v: loss(q, k, v, "minimal"),
         argnums=(0, 1, 2),
     )(query, key, value)
+    one_pass_gradients = jax.grad(
+        lambda q, k, v: loss(q, k, v, "one_pass"),
+        argnums=(0, 1, 2),
+    )(query, key, value)
 
-    for auto_gradient, minimal_gradient in zip(
+    for auto_gradient, minimal_gradient, one_pass_gradient in zip(
         auto_gradients,
         minimal_gradients,
+        one_pass_gradients,
+        strict=True,
     ):
         assert jnp.allclose(
             minimal_gradient,
+            auto_gradient,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        assert jnp.allclose(
+            one_pass_gradient,
             auto_gradient,
             rtol=1e-5,
             atol=1e-6,
