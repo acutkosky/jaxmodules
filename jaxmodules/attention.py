@@ -427,6 +427,197 @@ def _window_block_config(
     return left, min(window_num_blocks, num_kv_blocks)
 
 
+_SINGLE_TILE_SCORE_BYTE_LIMIT = 1024 * 1024
+
+
+def _can_use_single_tile_attention(
+    Q,
+    K,
+    V,
+    block_size,
+    kv_block_size,
+    window_size,
+    backward_strategy,
+):
+    """Whether a dense JAX tile is a bounded replacement for tiled scans."""
+    if (
+        window_size is not None
+        or backward_strategy != "auto"
+        or Q.dtype != K.dtype
+        or Q.dtype != V.dtype
+        or Q.dtype
+        not in (
+            jnp.dtype(jnp.float16),
+            jnp.dtype(jnp.bfloat16),
+            jnp.dtype(jnp.float32),
+        )
+        or Q.shape[2] % K.shape[2]
+        or K.shape[2] != V.shape[2]
+        or Q.shape[1] != block_size
+        or K.shape[1] != kv_block_size
+    ):
+        return False
+
+    accumulator_dtype = jnp.result_type(
+        Q.dtype,
+        K.dtype,
+        V.dtype,
+        jnp.float32,
+    )
+    score_elements = Q.shape[0] * Q.shape[1] * Q.shape[2] * K.shape[1]
+    return (
+        score_elements * jnp.dtype(accumulator_dtype).itemsize
+        <= _SINGLE_TILE_SCORE_BYTE_LIMIT
+    )
+
+
+def _single_tile_attention(
+    Q,
+    K,
+    V,
+    *,
+    kernel_fn,
+    mask_fn,
+    is_causal,
+):
+    """Evaluate one bounded score tile without scan or online-softmax state."""
+    B, query_length, query_heads, query_dim = Q.shape
+    _, kv_length, kv_heads, _ = K.shape
+    group_size = query_heads // kv_heads
+    accumulator_dtype = jnp.result_type(
+        Q.dtype,
+        K.dtype,
+        V.dtype,
+        jnp.float32,
+    )
+    grouped_query = rearrange(
+        Q,
+        "B Q (H G) d -> B Q H G d",
+        H=kv_heads,
+    )
+    mask = _materialize_mask(
+        mask_fn,
+        B,
+        query_heads,
+        kv_heads,
+        jnp.arange(query_length),
+        jnp.arange(kv_length),
+        is_causal=is_causal,
+    )
+    if mask is not True:
+        mask = jnp.broadcast_to(
+            mask,
+            (B, query_length, kv_heads, group_size, kv_length),
+        )
+
+    def attend_to_one_query_group(query_group, group_mask):
+        if kernel_fn is default_kernel:
+            scores = jnp.einsum(
+                "bqhd,bkhd->bhqk",
+                query_group,
+                K,
+                precision=_attention_dot_precision(Q.dtype),
+                preferred_element_type=accumulator_dtype,
+            )
+            scores *= jnp.asarray(
+                query_dim**-0.5,
+                dtype=accumulator_dtype,
+            )
+
+            valid_rows = None
+            if group_mask is not True:
+                head_major_mask = rearrange(
+                    group_mask,
+                    "B Q H K -> B H Q K",
+                )
+                scores = jnp.where(head_major_mask, scores, -jnp.inf)
+                # A maximal causal or unmasked row always contains at least
+                # one key. Other callables and padding may fully mask a row.
+                if mask_fn is not _unmasked:
+                    valid_rows = jnp.any(
+                        head_major_mask,
+                        axis=-1,
+                        keepdims=True,
+                    )
+                    scores = jnp.where(
+                        valid_rows,
+                        scores,
+                        jnp.zeros_like(scores),
+                    )
+
+            probabilities = jax.nn.softmax(scores, axis=-1)
+            if valid_rows is not None:
+                probabilities = jnp.where(
+                    valid_rows,
+                    probabilities,
+                    jnp.zeros_like(probabilities),
+                )
+
+            # Softmax remains FP32. The tensor-core operand has the same
+            # precision as the inputs, while the contraction accumulates FP32.
+            probability_operand = probabilities.astype(Q.dtype)
+            return jnp.einsum(
+                "bhqk,bkhe->bqhe",
+                probability_operand,
+                V,
+                precision=_attention_dot_precision(Q.dtype),
+                preferred_element_type=accumulator_dtype,
+            )
+
+        weights = fancy_vmap(
+            kernel_fn,
+            (
+                "weights[b, q, h, k] = "
+                "kernel_fn(query[b, q, h, :], key[b, k, h, :])"
+            ),
+        )(query_group, K)
+        weights = jnp.asarray(weights, dtype=accumulator_dtype)
+        weights = jnp.where(
+            group_mask,
+            weights,
+            jnp.zeros_like(weights),
+        )
+        normalizer = jnp.sum(weights, axis=-1, keepdims=True)
+        numerator = einsum(
+            weights,
+            V,
+            "B Q H K, B K H e -> B Q H e",
+        )
+        safe_normalizer = jnp.where(
+            normalizer > 0,
+            normalizer,
+            jnp.ones_like(normalizer),
+        )
+        return jnp.where(
+            normalizer > 0,
+            numerator / safe_normalizer,
+            jnp.zeros_like(numerator),
+        )
+
+    if group_size == 1:
+        group_mask = True if mask is True else mask[:, :, :, 0, :]
+        output = attend_to_one_query_group(
+            grouped_query[:, :, :, 0, :],
+            group_mask,
+        )
+    elif mask is True:
+        output = jax.vmap(
+            lambda query_group: attend_to_one_query_group(query_group, True),
+            in_axes=3,
+            out_axes=3,
+        )(grouped_query)
+        output = rearrange(output, "B Q H G e -> B Q (H G) e")
+    else:
+        output = jax.vmap(
+            attend_to_one_query_group,
+            in_axes=(3, 3),
+            out_axes=3,
+        )(grouped_query, mask)
+        output = rearrange(output, "B Q H G e -> B Q (H G) e")
+
+    return output.astype(Q.dtype)
+
+
 def _masked_attention_via_map_impl(
     Q: Array,
     K: Array,
@@ -1751,10 +1942,28 @@ def attention(
         mask_fn,
     )
 
-    # Core computation. The callable mask API is unchanged: supported
-    # coordinate-only JAX expressions use Mosaic GPU, while every other case
-    # retains the established mapped implementation.
-    if _can_use_mosaic_attention(
+    # Core computation. Small single-tile calls avoid carrying the online
+    # multi-tile state through one-element loops. The callable mask API is
+    # unchanged: larger supported coordinate-only JAX expressions use Mosaic
+    # GPU, while every other case retains the established mapped implementation.
+    if _can_use_single_tile_attention(
+        Q,
+        K,
+        V,
+        effective_block_size,
+        effective_kv_block_size,
+        window_size,
+        backward_strategy,
+    ):
+        result = _single_tile_attention(
+            Q,
+            K,
+            V,
+            kernel_fn=kernel_fn,
+            mask_fn=mask_fn,
+            is_causal=is_causal,
+        )
+    elif _can_use_mosaic_attention(
         Q,
         K,
         V,

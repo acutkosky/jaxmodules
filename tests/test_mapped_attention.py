@@ -1385,7 +1385,8 @@ def test_masked_attention_edge_cases():
     )
 
 
-def test_masked_attention_fully_masked_rows_are_finite():
+@pytest.mark.parametrize("block_size", [2, 6])
+def test_masked_attention_fully_masked_rows_are_finite(block_size):
     """Fully masked rows produce defined zero outputs and gradients."""
     query, key, value = (
         jax.random.normal(random_key, (6, 2, 8))
@@ -1403,7 +1404,7 @@ def test_masked_attention_fully_masked_rows_are_finite():
                 k,
                 v,
                 mask_fn=no_attention,
-                block_size=2,
+                block_size=block_size,
             )
         )
 
@@ -1412,7 +1413,7 @@ def test_masked_attention_fully_masked_rows_are_finite():
         key,
         value,
         mask_fn=no_attention,
-        block_size=2,
+        block_size=block_size,
     )
     gradients = jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
 
@@ -1590,7 +1591,12 @@ def test_masked_attention_different_kernel():
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_custom_kernel_low_precision_backward(dtype, is_causal):
+@pytest.mark.parametrize("backward_strategy", ["auto", "minimal"])
+def test_custom_kernel_low_precision_backward(
+    dtype,
+    is_causal,
+    backward_strategy,
+):
     """Custom kernels transpose the low-precision public output cast."""
     N, H, d = 8, 2, 16
     query, key, value = (
@@ -1630,6 +1636,7 @@ def test_custom_kernel_low_precision_backward(dtype, is_causal):
             kernel_fn=custom_kernel,
             block_size=N,
             is_causal=is_causal,
+            backward_strategy=backward_strategy,
         )
         return jnp.mean(output.astype(jnp.float32) ** 2)
 

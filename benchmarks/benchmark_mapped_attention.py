@@ -22,7 +22,14 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, cast
 
-IMPLEMENTATIONS = ("mosaic", "mosaic-warp", "mapped", "xla", "cudnn")
+IMPLEMENTATIONS = (
+    "attention",
+    "mosaic",
+    "mosaic-warp",
+    "mapped",
+    "xla",
+    "cudnn",
+)
 MODES = ("forward", "backward")
 DTYPES = ("float32", "bfloat16", "float16")
 MASKS = ("causal", "unmasked", "general", "general-dense")
@@ -305,7 +312,7 @@ def _effective_tile(
     key: Any,
 ) -> dict[str, int] | None:
     """Report the score tile actually selected by an explicit tiled kernel."""
-    if case.implementation == "mapped":
+    if case.implementation in {"attention", "mapped"}:
         return {
             "block_q": case.block_size,
             "block_kv": case.kv_block_size,
@@ -367,6 +374,7 @@ def _make_function(case: Case) -> Any:
         _masked_attention_via_map,
         _masked_attention_via_mosaic,
         _unmasked,
+        attention as public_attention,
         default_kernel,
     )
     from jaxmodules._mosaic_attention import (
@@ -381,7 +389,23 @@ def _make_function(case: Case) -> Any:
         "general-dense": _dense_general_mask,
     }[case.mask]
 
-    if case.implementation == "mosaic-warp":
+    if case.implementation == "attention":
+
+        def attention(query: Any, key: Any, value: Any) -> Any:
+            return public_attention(
+                query,
+                key,
+                value,
+                is_causal=is_causal,
+                kernel_fn=default_kernel,
+                mask_fn=mask_fn,
+                block_size=case.block_size,
+                kv_block_size=case.kv_block_size,
+                window_size=None,
+                backward_strategy=case.mapped_backward_strategy,
+            )
+
+    elif case.implementation == "mosaic-warp":
         if case.mask in {"general", "general-dense"}:
             raise ValueError(
                 "mosaic-warp supports only unmasked or maximal-causal attention"
