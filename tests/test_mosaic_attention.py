@@ -98,12 +98,12 @@ def test_mosaic_supports_flexible_head_dimensions(head_dim, expected):
     )
 
 
-def test_wide_heads_select_non_atomic_generic_backward():
-    narrow = jax.ShapeDtypeStruct((1, 4096, 8, 256), jnp.float16)
-    wide = jax.ShapeDtypeStruct((1, 4096, 8, 512), jnp.float16)
+def test_nondefault_head_dimensions_select_non_atomic_generic_backward():
+    default_width = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.float16)
+    wider = jax.ShapeDtypeStruct((1, 4096, 8, 80), jnp.float16)
 
-    assert not _prefer_non_atomic_generic_backward(narrow)
-    assert _prefer_non_atomic_generic_backward(wide)
+    assert not _prefer_non_atomic_generic_backward(default_width)
+    assert _prefer_non_atomic_generic_backward(wider)
 
 
 def test_warp_specialized_forward_selection_respects_supported_shapes():

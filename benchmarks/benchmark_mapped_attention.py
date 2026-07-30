@@ -610,11 +610,12 @@ def main() -> int:
             flush=True,
         )
         results.append(_run_isolated(case, args.case_timeout_seconds))
+        if args.json_output is not None:
+            args.json_output.write_text(json.dumps(results, indent=2) + "\n")
 
     print()
     _print_results(results)
     if args.json_output is not None:
-        args.json_output.write_text(json.dumps(results, indent=2) + "\n")
         print(f"\nWrote {args.json_output}")
     return int(not all(result["status"] == "ok" for result in results))
 

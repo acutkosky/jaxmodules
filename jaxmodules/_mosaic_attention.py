@@ -82,6 +82,12 @@ def _mma_layouts(
         raise ValueError("MMA layouts require 16-bit operands")
     if block_rows not in (16, 32, 64):
         raise ValueError("MMA row tiles must be 16, 32, or 64")
+    if block_rows == 64:
+        return (
+            plgpu.Layout.MMA_LHS(dtype),
+            plgpu.Layout.MMA_RHS(dtype),
+            plgpu.Layout.MMA_ACC(dtype),
+        )
 
     m_warps = block_rows // 16
     n_warps = 4 // m_warps
@@ -188,7 +194,7 @@ def _select_config(
 ) -> MosaicAttentionConfig | None:
     """Choose score tiles that keep wide-head register pressure bounded."""
 
-    if query.shape[3] >= 512:
+    if query.shape[3] >= 80:
         tile_size = 32
     else:
         tile_size = 64
@@ -346,7 +352,7 @@ def _prefer_non_atomic_generic_backward(query: jax.Array) -> bool:
     mask kind.
     """
 
-    return query.shape[3] >= 512
+    return query.shape[3] >= 80
 
 
 def mosaic_attention_forward(
