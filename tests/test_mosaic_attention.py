@@ -123,9 +123,10 @@ def test_warp_specialized_forward_selection_respects_supported_shapes():
     )
 
 
-def test_causal_split_backward_selection_avoids_small_and_gqa_cases():
+def test_causal_split_backward_selection_respects_supported_mha_cases():
     large_mha = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float16)
     small_mha = jax.ShapeDtypeStruct((1, 2048, 2, 64), jnp.float16)
+    subkilotoken_mha = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.float16)
     large_gqa_key = jax.ShapeDtypeStruct((1, 4096, 1, 64), jnp.float16)
 
     assert _can_use_warp_specialized_causal_split_backward(
@@ -134,9 +135,15 @@ def test_causal_split_backward_selection_avoids_small_and_gqa_cases():
         is_unmasked=True,
         is_causal=True,
     )
+    assert _can_use_warp_specialized_causal_split_backward(
+        small_mha,
+        small_mha,
+        is_unmasked=True,
+        is_causal=True,
+    )
     assert not _can_use_warp_specialized_causal_split_backward(
-        small_mha,
-        small_mha,
+        subkilotoken_mha,
+        subkilotoken_mha,
         is_unmasked=True,
         is_causal=True,
     )
@@ -239,13 +246,29 @@ def test_warp_specialized_causal_forward_composes_with_vmap():
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
-def test_warp_specialized_causal_custom_vjp_matches_xla():
+@pytest.mark.parametrize(
+    ("sequence_length", "query_heads", "kv_heads"),
+    [
+        (4096, 1, 1),
+        (1024, 2, 1),
+    ],
+)
+def test_warp_specialized_causal_custom_vjp_matches_xla(
+    sequence_length,
+    query_heads,
+    kv_heads,
+):
     keys = jax.random.split(jax.random.key(53), 4)
-    shape = (1, 4096, 1, 64)
-    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
-    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
-    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
-    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+    query_shape = (1, sequence_length, query_heads, 64)
+    kv_shape = (1, sequence_length, kv_heads, 64)
+    query = jax.random.normal(keys[0], query_shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], kv_shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], kv_shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(
+        keys[3],
+        query_shape,
+        dtype=jnp.float32,
+    )
 
     def mosaic_loss(q, k, v):
         output = _masked_attention_via_mosaic(
@@ -284,6 +307,59 @@ def test_warp_specialized_causal_custom_vjp_matches_xla():
         rtol=3e-3,
         atol=3e-3,
     )
+    for mosaic_gradient, xla_gradient in zip(
+        mosaic_gradients,
+        xla_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(mosaic_gradient),
+            np.asarray(xla_gradient),
+            rtol=3e-3,
+            atol=3e-3,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_warp_specialized_causal_split_backward_composes_with_vmap():
+    keys = jax.random.split(jax.random.key(61), 4)
+    shape = (2, 1, 4096, 1, 64)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    def mosaic_loss(q, k, v, gradient):
+        output = _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=_unmasked,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=True,
+            backward_strategy="auto",
+        )
+        return jnp.sum(output.astype(jnp.float32) * gradient)
+
+    def xla_loss(q, k, v, gradient):
+        output = jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="xla",
+        )
+        return jnp.sum(output.astype(jnp.float32) * gradient)
+
+    mosaic_gradients = jax.jit(
+        jax.vmap(jax.grad(mosaic_loss, argnums=(0, 1, 2)))
+    )(query, key, value, cotangent)
+    xla_gradients = jax.jit(
+        jax.vmap(jax.grad(xla_loss, argnums=(0, 1, 2)))
+    )(query, key, value, cotangent)
+
     for mosaic_gradient, xla_gradient in zip(
         mosaic_gradients,
         xla_gradients,

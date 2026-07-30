@@ -260,7 +260,7 @@ def _can_use_warp_specialized_causal_split_backward(
     return (
         is_causal
         and query.shape[2] == key.shape[2]
-        and query.shape[1] >= 4096
+        and query.shape[1] >= 1024
         and _can_use_warp_specialized_forward(
             query,
             key,
@@ -3489,12 +3489,14 @@ def mosaic_attention_backward(
     is_causal: bool = False,
     backward_strategy: str = "auto",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Run the one-pass backward, or the lower-temporary two-pass variant.
+    """Run the selected fast backward, or the lower-temporary two-pass variant.
 
-    ``"auto"`` traverses every active score tile once and combines query-major
-    programs with FP32 atomic dK/dV accumulation. ``"minimal"`` retains the
-    two-pass implementation for callers that prefer its smaller compiler
-    temporary estimate.
+    For large maximal-causal MHA, ``"auto"`` combines a query-major dQ pass
+    with a key-major dK/dV pass that accumulates complete tiles locally and
+    avoids global atomics. Other supported dense cases use the single-pass
+    warp-specialized implementation with FP32 atomic dK/dV accumulation.
+    ``"minimal"`` retains the generic two-pass implementation for callers
+    that prefer its smaller compiler temporary estimate.
     """
     if backward_strategy == "minimal":
         return _mosaic_attention_backward_two_pass(

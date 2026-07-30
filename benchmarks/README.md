@@ -13,6 +13,9 @@ compare its input-precision FP16/BF16 performance and memory with cuDNN through
 The [causal warp-specialized results](results/rtx5090_causal_warp_2026-07-29.md)
 compare the maximal-causal fast path with the previous Mosaic kernel and cuDNN
 from 1K through 32K context.
+The [non-atomic causal-backward results](results/rtx5090_causal_split_backward_2026-07-29.md)
+compare the split query-major/key-major VJP with the previous atomic backward
+and cuDNN from 1K through 128K context.
 
 Run the smoke suite while iterating:
 
@@ -91,13 +94,14 @@ uv run python benchmarks/benchmark_mapped_attention.py \
   --iterations 10
 ```
 
-Mapped and Mosaic backward use their faster one-pass strategies by default. To
-benchmark the two-pass variants that eliminate sequence-sized FP32 gradient
-carries, pass `--mapped-backward-strategy minimal`. Mosaic's one-pass path
-combines query-major programs with FP32 atomic dK/dV accumulation. The
-two-pass variant can reduce the total peak when that carry is material;
-inputs, outputs, forward residuals, or score-tile temporaries may dominate
-other shapes.
+Mapped and Mosaic backward use their faster strategies by default. To
+benchmark the generic two-pass variants that eliminate sequence-sized FP32
+gradient carries, pass `--mapped-backward-strategy minimal`. Large
+maximal-causal MHA uses separate query-major dQ and key-major dK/dV passes; the
+latter owns complete gradient tiles and avoids global atomics. Other
+warp-specialized cases use query-major programs with FP32 atomic dK/dV
+accumulation. Inputs, outputs, forward residuals, or score-tile temporaries may
+dominate the measured peak on other shapes.
 
 The mapped and Mosaic standard-attention paths return the input dtype. They
 compute softmax reductions and low-precision matrix-product accumulations in
