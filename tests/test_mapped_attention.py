@@ -5,6 +5,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from jaxmodules.attention import (
+    _masked_attention_via_map_impl,
+    _unmasked,
     attention,
     masked_attention_via_map,
     use_custom_einsum,
@@ -1663,6 +1665,206 @@ def test_custom_kernel_low_precision_backward(
             expected_gradient,
             rtol=5e-2,
             atol=5e-3,
+        )
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_custom_kernel_multitile_backward_matches_dense_reference(
+    dtype,
+    is_causal,
+):
+    """The analytic callable VJP preserves masks, batches, GQA, and value width."""
+    B, N, L = 2, 8, 12
+    Hq, Hkv, group_size = 4, 2, 2
+    query_dim, value_dim = 16, 7
+    query, key, value = (
+        0.2 * jax.random.normal(random_key, shape, dtype=dtype)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(45), 3),
+            (
+                (B, N, Hq, query_dim),
+                (B, L, Hkv, query_dim),
+                (B, L, Hkv, value_dim),
+            ),
+            strict=True,
+        )
+    )
+
+    def custom_kernel(q, k):
+        distance = jnp.mean((q - k) ** 2)
+        modulation = 1 + 0.1 * jnp.tanh(jnp.dot(q, k))
+        return jnp.exp(-distance) * modulation
+
+    def coordinate_mask(batch, head, query_index, key_index):
+        return (batch + head + query_index + 2 * key_index) % 3 != 0
+
+    def reference(q, k, v):
+        grouped_query = jnp.reshape(
+            q,
+            (B, N, Hkv, group_size, query_dim),
+        )
+        weights = fancy_vmap(
+            custom_kernel,
+            (
+                "weights[b, q, h, g, k] = "
+                "custom_kernel(q[b, q, h, g, :], k[b, k, h, :])"
+            ),
+        )(grouped_query, k).astype(jnp.float32)
+
+        batch_indices = jnp.arange(B)[:, None, None, None, None]
+        query_indices = jnp.arange(N)[None, :, None, None, None]
+        head_indices = jnp.reshape(
+            jnp.arange(Hq),
+            (1, 1, Hkv, group_size, 1),
+        )
+        key_indices = jnp.arange(L)[None, None, None, None, :]
+        mask = (
+            batch_indices
+            + head_indices
+            + query_indices
+            + 2 * key_indices
+        ) % 3 != 0
+        if is_causal:
+            mask &= query_indices >= key_indices
+
+        weights = jnp.where(mask, weights, 0)
+        normalizer = jnp.sum(weights, axis=-1, keepdims=True)
+        safe_normalizer = jnp.where(normalizer > 0, normalizer, 1)
+        numerator = jnp.einsum(
+            "bqhgk,bkhe->bqhge",
+            weights,
+            v,
+            preferred_element_type=jnp.float32,
+        )
+        output = jnp.where(
+            normalizer > 0,
+            numerator / safe_normalizer,
+            0,
+        )
+        return jnp.reshape(output, (B, N, Hq, value_dim)).astype(dtype)
+
+    def implementation(q, k, v):
+        return masked_attention_via_map(
+            q,
+            k,
+            v,
+            kernel_fn=custom_kernel,
+            mask_fn=coordinate_mask,
+            block_size=4,
+            kv_block_size=3,
+            is_causal=is_causal,
+        )
+
+    def loss(function, q, k, v):
+        return jnp.mean(function(q, k, v).astype(jnp.float32) ** 2)
+
+    actual = jax.jit(
+        jax.value_and_grad(
+            lambda q, k, v: loss(implementation, q, k, v),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, value)
+    expected = jax.jit(
+        jax.value_and_grad(
+            lambda q, k, v: loss(reference, q, k, v),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, value)
+
+    tolerance = 5e-2 if dtype == jnp.bfloat16 else _FP32_TILE_RTOL
+    assert jnp.allclose(
+        actual[0],
+        expected[0],
+        rtol=tolerance,
+        atol=tolerance / 10,
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual[1],
+        expected[1],
+        strict=True,
+    ):
+        assert actual_gradient.dtype == dtype
+        assert jnp.all(jnp.isfinite(actual_gradient))
+        assert jnp.allclose(
+            actual_gradient,
+            expected_gradient,
+            rtol=tolerance,
+            atol=tolerance / 10,
+        )
+
+
+def test_custom_kernel_multitile_backward_preserves_window_semantics():
+    """The analytic callable VJP uses the same block-window selection."""
+    B, N, L, H, d = 1, 12, 16, 2, 8
+    query, key, value = (
+        0.2 * jax.random.normal(random_key, shape)
+        for random_key, shape in zip(
+            jax.random.split(jax.random.PRNGKey(46), 3),
+            (
+                (B, N, H, d),
+                (B, L, H, d),
+                (B, L, H, d),
+            ),
+            strict=True,
+        )
+    )
+
+    def custom_kernel(q, k):
+        return jnp.exp(-jnp.mean((q - k) ** 2))
+
+    def implementation(q, k, v):
+        return masked_attention_via_map(
+            q,
+            k,
+            v,
+            kernel_fn=custom_kernel,
+            block_size=4,
+            kv_block_size=4,
+            window_size=(3, 2),
+        )
+
+    def autodiff_reference(q, k, v):
+        output, _ = _masked_attention_via_map_impl(
+            q,
+            k,
+            v,
+            kernel_fn=custom_kernel,
+            mask_fn=_unmasked,
+            block_size=4,
+            kv_block_size=4,
+            window_size=(3, 2),
+            is_causal=False,
+        )
+        return output.astype(q.dtype)
+
+    def loss(function, q, k, v):
+        return jnp.mean(function(q, k, v) ** 2)
+
+    actual = jax.jit(
+        jax.value_and_grad(
+            lambda q, k, v: loss(implementation, q, k, v),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, value)
+    expected = jax.jit(
+        jax.value_and_grad(
+            lambda q, k, v: loss(autodiff_reference, q, k, v),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, value)
+
+    assert jnp.allclose(actual[0], expected[0], rtol=1e-5, atol=1e-6)
+    for actual_gradient, expected_gradient in zip(
+        actual[1],
+        expected[1],
+        strict=True,
+    ):
+        assert jnp.allclose(
+            actual_gradient,
+            expected_gradient,
+            rtol=1e-5,
+            atol=1e-6,
         )
 
 

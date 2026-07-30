@@ -393,12 +393,17 @@ def _attn_block_fn(
         numerator / safe_normalizer[..., None],
         jnp.zeros_like(numerator),
     )
-    log_normalizer = jnp.where(
-        normalizer > 0,
-        max_score + jnp.log(safe_normalizer),
-        jnp.zeros_like(normalizer),
-    )
-    return output, log_normalizer
+    if kernel_fn is default_kernel:
+        normalizer_state = jnp.where(
+            normalizer > 0,
+            max_score + jnp.log(safe_normalizer),
+            jnp.zeros_like(normalizer),
+        )
+    else:
+        # An arbitrary positive kernel exposes weights rather than logits.
+        # Preserve its global denominator for the analytic custom backward.
+        normalizer_state = normalizer
+    return output, normalizer_state
 
 
 def _window_block_config(
@@ -1519,6 +1524,234 @@ def _standard_attention_backward(
     )
 
 
+def _custom_kernel_attention_backward(
+    Q,
+    K,
+    V,
+    output,
+    normalizer,
+    upstream_grad,
+    kernel_fn,
+    mask_fn,
+    block_size,
+    kv_block_size,
+    window_size,
+    is_causal,
+):
+    """Differentiate weighted attention while treating kernel_fn as opaque."""
+    B, N, Hq, _ = Q.shape
+    _, L, Hkv, _ = K.shape
+    accumulator_dtype = jnp.result_type(
+        Q.dtype,
+        K.dtype,
+        V.dtype,
+        upstream_grad.dtype,
+        jnp.float32,
+    )
+    dot_precision = _attention_dot_precision(Q.dtype)
+
+    q_blocks = rearrange(
+        Q,
+        "B (Q Qb) (H G) d -> Q B Qb H G d",
+        Qb=block_size,
+        H=Hkv,
+    )
+    output_blocks = rearrange(
+        output,
+        "B (Q Qb) (H G) e -> Q B Qb H G e",
+        Qb=block_size,
+        H=Hkv,
+    )
+    grad_blocks = rearrange(
+        upstream_grad,
+        "B (Q Qb) (H G) e -> Q B Qb H G e",
+        Qb=block_size,
+        H=Hkv,
+    )
+    normalizer_blocks = rearrange(
+        normalizer,
+        "B (Q Qb) (H G) -> Q B Qb H G 1",
+        Qb=block_size,
+        H=Hkv,
+    )
+    k_blocks = rearrange(
+        K,
+        "B (K Kb) H d -> K B Kb H d",
+        Kb=kv_block_size,
+    )
+    v_blocks = rearrange(
+        V,
+        "B (K Kb) H e -> K B Kb H e",
+        Kb=kv_block_size,
+    )
+
+    num_q_blocks = q_blocks.shape[0]
+    num_kv_blocks = k_blocks.shape[0]
+    q_indices = jnp.reshape(jnp.arange(N), (num_q_blocks, block_size))
+    k_indices = jnp.reshape(jnp.arange(L), (num_kv_blocks, kv_block_size))
+    window_left, total_window_blocks = _window_block_config(
+        window_size,
+        block_size,
+        kv_block_size,
+        num_kv_blocks,
+    )
+
+    def evaluate_weights(query_block, key_block):
+        return fancy_vmap(
+            kernel_fn,
+            (
+                "weights[b, q, h, g, k] = "
+                "kernel_fn(query[b, q, h, g, :], key[b, k, h, :])"
+            ),
+        )(query_block, key_block)
+
+    dK_init = jnp.zeros_like(k_blocks)
+    dV_init = jnp.zeros_like(v_blocks)
+
+    def query_block_backward(dK_dV, query_data):
+        dK, dV = dK_dV
+        (
+            q_idx,
+            q_block,
+            output_block,
+            grad_block,
+            normalizer_block,
+        ) = query_data
+        grad_block = grad_block.astype(accumulator_dtype)
+        output_block = output_block.astype(accumulator_dtype)
+        valid_rows = normalizer_block > 0
+        safe_normalizer = jnp.where(
+            valid_rows,
+            normalizer_block,
+            jnp.ones_like(normalizer_block),
+        )
+        delta_block = jnp.sum(
+            grad_block * output_block,
+            axis=-1,
+            keepdims=True,
+        )
+        dQ = jnp.zeros_like(q_block)
+
+        if window_left is not None:
+            kv_start = jnp.maximum(
+                0,
+                jnp.floor_divide(q_idx[0] - window_left, kv_block_size),
+            )
+            kv_start = jnp.minimum(
+                kv_start,
+                num_kv_blocks - total_window_blocks,
+            )
+            kv_stop = kv_start + total_window_blocks
+        else:
+            kv_start = 0
+            kv_stop = num_kv_blocks
+
+        if is_causal:
+            causal_stop = jnp.minimum(
+                jnp.floor_divide(q_idx[-1], kv_block_size) + 1,
+                num_kv_blocks,
+            )
+            kv_stop = jnp.minimum(kv_stop, causal_stop)
+
+        def kv_block_backward(kv_block_idx, state):
+            dQ_acc, dK_acc, dV_acc = state
+            k_block = k_blocks[kv_block_idx]
+            v_block = v_blocks[kv_block_idx]
+            raw_weights, weights_vjp = jax.vjp(
+                evaluate_weights,
+                q_block,
+                k_block,
+            )
+            mask = _materialize_mask(
+                mask_fn,
+                B,
+                Hq,
+                Hkv,
+                q_idx,
+                k_indices[kv_block_idx],
+                is_causal=is_causal,
+            )
+            weights = jnp.asarray(
+                raw_weights,
+                dtype=accumulator_dtype,
+            )
+            weights = jnp.where(
+                mask,
+                weights,
+                jnp.zeros_like(weights),
+            )
+            probabilities = jnp.where(
+                valid_rows,
+                weights / safe_normalizer,
+                jnp.zeros_like(weights),
+            )
+
+            dV_block = jnp.einsum(
+                "bqhgk,bqhge->bkhe",
+                probabilities,
+                grad_block,
+                precision=dot_precision,
+                preferred_element_type=accumulator_dtype,
+            )
+            value_cotangent = jnp.einsum(
+                "bqhge,bkhe->bqhgk",
+                grad_block,
+                v_block,
+                precision=dot_precision,
+                preferred_element_type=accumulator_dtype,
+            )
+            weight_cotangent = jnp.where(
+                mask & valid_rows,
+                (value_cotangent - delta_block) / safe_normalizer,
+                jnp.zeros_like(value_cotangent),
+            )
+            dQ_block, dK_block = weights_vjp(
+                weight_cotangent.astype(raw_weights.dtype)
+            )
+
+            dQ_acc = dQ_acc + dQ_block
+            dK_block = dK_acc[kv_block_idx] + dK_block.astype(K.dtype)
+            dV_block = dV_acc[kv_block_idx] + dV_block.astype(V.dtype)
+            dK_acc = jax.lax.dynamic_update_slice_in_dim(
+                dK_acc,
+                dK_block[None],
+                kv_block_idx,
+                axis=0,
+            )
+            dV_acc = jax.lax.dynamic_update_slice_in_dim(
+                dV_acc,
+                dV_block[None],
+                kv_block_idx,
+                axis=0,
+            )
+            return dQ_acc, dK_acc, dV_acc
+
+        dQ, dK, dV = jax.lax.fori_loop(
+            kv_start,
+            kv_stop,
+            kv_block_backward,
+            (dQ, dK, dV),
+        )
+        return (dK, dV), dQ
+
+    (dK, dV), dQ = jax.lax.scan(
+        query_block_backward,
+        init=(dK_init, dV_init),
+        xs=(
+            q_indices,
+            q_blocks,
+            output_blocks,
+            grad_blocks,
+            normalizer_blocks,
+        ),
+    )
+
+    dQ = rearrange(dQ, "Q B Qb H G d -> B (Q Qb) (H G) d")
+    dK = rearrange(dK, "K B Kb H d -> B (K Kb) H d")
+    dV = rearrange(dV, "K B Kb H e -> B (K Kb) H e")
+    return dQ.astype(Q.dtype), dK.astype(K.dtype), dV.astype(V.dtype)
+
+
 def _masked_attention_via_map_bwd(
     kernel_fn: Callable[[Array, Array], float],
     mask_fn: Optional[Union[Callable[int, Array], Array]],
@@ -1539,13 +1772,6 @@ def _masked_attention_via_map_bwd(
         block_size = N
     if kv_block_size is None:
         kv_block_size = block_size
-
-    window_left, window_num_blocks = _window_block_config(
-        window_size,
-        block_size,
-        kv_block_size,
-        L // kv_block_size,
-    )
 
     assert d == dq and Lv == L, (
         f"shape mismatch in K {K.shape}, Q {Q.shape} and V {V.shape}"
@@ -1578,56 +1804,21 @@ def _masked_attention_via_map_bwd(
             backward_strategy,
         )
 
-    def attn_fn(dK_dV, block_idx_q_idx_q_g):
-        block_idx, q_idx, q, g = block_idx_q_idx_q_g
-        dK_carry, dV_carry = dK_dV
-
-        def get_values(q, K, V):
-            values, _ = _attn_block_fn(
-                block_idx,
-                q_idx,
-                q,
-                K,
-                V,
-                kv_block_size,
-                mask_fn,
-                kernel_fn,
-                window_left,
-                window_num_blocks,
-                is_causal=is_causal,
-                # Disable block skipping in backward pass - fori_loop with
-                # dynamic bounds doesn't support reverse-mode differentiation
-                use_causal_block_skipping=False,
-            )
-            return values
-
-        values, vjp_fn = jax.vjp(get_values, q, K, V)
-        # The tiled implementation accumulates custom-kernel outputs in FP32
-        # before the public function casts them back to Q.dtype.  Transpose that
-        # output cast explicitly: low-precision cotangents otherwise do not
-        # match the FP32 output expected by ``vjp_fn``.
-        dq, dK, dV = vjp_fn(g.astype(values.dtype))
-
-        dK_carry = dK_carry + dK
-        dV_carry = dV_carry + dV
-        return (dK_carry, dV_carry), dq
-
-
-    # break it up into blocks of size block_size
-    g_blocks = rearrange(upstream_grad, "B (blocks block_size) Hq dv -> blocks B block_size Hq dv", block_size=block_size)
-
-
-
-    Q = rearrange(Q, "B (blocks block_size) Hq dq -> blocks B block_size Hq dq", block_size=block_size)
-
-    q_idx = jnp.reshape(jnp.arange(N), (N//block_size, block_size))
-    block_idx = jnp.arange(N//block_size)
-    
-    (k_grad, v_grad), q_grad = jax.lax.scan(
-        attn_fn, init=(jnp.zeros_like(K), jnp.zeros_like(V)), xs=(block_idx, q_idx, Q, g_blocks)
+    del backward_strategy
+    return _custom_kernel_attention_backward(
+        Q,
+        K,
+        V,
+        output,
+        log_normalizer,
+        upstream_grad,
+        kernel_fn,
+        mask_fn,
+        block_size,
+        kv_block_size,
+        window_size,
+        is_causal,
     )
-    q_grad = rearrange(q_grad, "blocks B block_size Hq dq -> B (blocks block_size) Hq dq")
-    return q_grad, k_grad, v_grad
 
 
 def _masked_attention_via_mosaic_bwd(
