@@ -12,6 +12,8 @@ from jaxmodules._mosaic_attention import (
     _can_use_warp_specialized_forward,
     _mosaic_attention_backward_warp_specialized,
     _mosaic_attention_backward_warp_specialized_causal_split,
+    _mosaic_attention_backward_warp_specialized_dkv,
+    _mosaic_attention_backward_warp_specialized_dq,
     _mosaic_attention_forward_warp_specialized,
     _prefer_non_atomic_generic_backward,
     mask_is_mosaic_compatible,
@@ -563,6 +565,115 @@ def test_warp_specialized_backward_matches_xla(
             np.asarray(expected_gradient),
             rtol=tolerance,
             atol=tolerance,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize("head_dim", [80, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_generated_warp_specialized_dq_matches_xla(head_dim, is_causal):
+    keys = jax.random.split(jax.random.key(71), 4)
+    shape = (1, 1024, 2, head_dim)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    output, log_normalizer = jax.jit(
+        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+        )
+    )(query, key, value)
+    query_gradient = jax.jit(
+        lambda q, k, v, o, lse, do: (
+            _mosaic_attention_backward_warp_specialized_dq(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                is_causal=is_causal,
+            )
+        )
+    )(query, key, value, output, log_normalizer, cotangent)
+
+    def xla_loss(q):
+        attention = jax.nn.dot_product_attention(
+            q,
+            key,
+            value,
+            is_causal=is_causal,
+            implementation="xla",
+        )
+        return jnp.sum(attention.astype(jnp.float32) * cotangent)
+
+    expected = jax.jit(jax.grad(xla_loss))(query)
+    np.testing.assert_allclose(
+        np.asarray(query_gradient),
+        np.asarray(expected),
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize("head_dim", [80, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_generated_warp_specialized_dkv_matches_xla(head_dim, is_causal):
+    keys = jax.random.split(jax.random.key(73), 4)
+    shape = (1, 1024, 2, head_dim)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    output, log_normalizer = jax.jit(
+        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+        )
+    )(query, key, value)
+    gradients = jax.jit(
+        lambda q, k, v, o, lse, do: (
+            _mosaic_attention_backward_warp_specialized_dkv(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                is_causal=is_causal,
+            )
+        )
+    )(query, key, value, output, log_normalizer, cotangent)
+
+    def xla_loss(k, v):
+        attention = jax.nn.dot_product_attention(
+            query,
+            k,
+            v,
+            is_causal=is_causal,
+            implementation="xla",
+        )
+        return jnp.sum(attention.astype(jnp.float32) * cotangent)
+
+    expected = jax.jit(jax.grad(xla_loss, argnums=(0, 1)))(key, value)
+    for gradient, expected_gradient in zip(
+        gradients,
+        expected,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(gradient),
+            np.asarray(expected_gradient),
+            rtol=3e-3,
+            atol=3e-3,
         )
 
 

@@ -88,6 +88,38 @@ class WarpSpecializedForwardConfig:
         return self.block_q * self.num_compute_wgs
 
 
+@dataclass(frozen=True)
+class WarpSpecializedDQConfig:
+    """Compile-time resource allocation for a warp-specialized dQ pass."""
+
+    block_q: int
+    block_kv: int
+    num_compute_wgs: int
+    compute_registers: int
+    producer_registers: int
+    pipeline_stages: int
+
+    @property
+    def query_superblock(self) -> int:
+        return self.block_q * self.num_compute_wgs
+
+
+@dataclass(frozen=True)
+class WarpSpecializedDKVConfig:
+    """Compile-time resources for a non-atomic key-major dK/dV pass."""
+
+    block_q: int
+    block_kv: int
+    num_compute_wgs: int
+    compute_registers: int
+    producer_registers: int
+    pipeline_stages: int
+
+    @property
+    def kv_superblock(self) -> int:
+        return self.block_kv * self.num_compute_wgs
+
+
 def _mma_layouts(
     dtype: jnp.dtype,
     block_rows: int,
@@ -408,6 +440,49 @@ def _warp_specialized_forward_config_for_head_dim(
     return None
 
 
+def _warp_specialized_dq_config_for_head_dim(
+    head_dim: int,
+) -> WarpSpecializedDQConfig | None:
+    """Generate the staged dQ resource shape for one static head width."""
+
+    if head_dim == 64:
+        return WarpSpecializedDQConfig(
+            block_q=64,
+            block_kv=64,
+            num_compute_wgs=2,
+            compute_registers=240,
+            producer_registers=32,
+            pipeline_stages=2,
+        )
+    if 80 <= head_dim <= 128 and head_dim % 16 == 0:
+        return WarpSpecializedDQConfig(
+            block_q=64,
+            block_kv=64,
+            num_compute_wgs=1,
+            compute_registers=240,
+            producer_registers=32,
+            pipeline_stages=2,
+        )
+    return None
+
+
+def _warp_specialized_dkv_config_for_head_dim(
+    head_dim: int,
+) -> WarpSpecializedDKVConfig | None:
+    """Generate a locally accumulated dK/dV resource shape."""
+
+    if 80 <= head_dim <= 128 and head_dim % 16 == 0:
+        return WarpSpecializedDKVConfig(
+            block_q=64,
+            block_kv=64,
+            num_compute_wgs=1,
+            compute_registers=240,
+            producer_registers=32,
+            pipeline_stages=2 if head_dim <= 96 else 1,
+        )
+    return None
+
+
 def _select_warp_specialized_forward_config(
     query: jax.Array,
     key: jax.Array,
@@ -449,7 +524,15 @@ def _can_use_warp_specialized_causal_split_backward(
 
     return (
         is_causal
-        and query.shape[3] == 64
+        and (
+            query.shape[3] == 64
+            or (
+                _warp_specialized_dq_config_for_head_dim(query.shape[3])
+                is not None
+                and _warp_specialized_dkv_config_for_head_dim(query.shape[3])
+                is not None
+            )
+        )
         and query.shape[2] == key.shape[2]
         and query.shape[1] >= 1024
         and _can_use_warp_specialized_forward(
@@ -458,6 +541,30 @@ def _can_use_warp_specialized_causal_split_backward(
             is_unmasked=is_unmasked,
             is_causal=is_causal,
         )
+    )
+
+
+def _can_use_generated_warp_specialized_split_backward(
+    query: jax.Array,
+    key: jax.Array,
+    *,
+    is_unmasked: bool,
+    is_causal: bool,
+) -> bool:
+    """Whether generated non-atomic dQ and dK/dV passes cover this call."""
+
+    minimum_length = 1024 if is_causal else 4096
+    dq_config = _warp_specialized_dq_config_for_head_dim(query.shape[3])
+    dkv_config = _warp_specialized_dkv_config_for_head_dim(query.shape[3])
+    return (
+        is_unmasked
+        and dq_config is not None
+        and dkv_config is not None
+        and query.shape[1] == key.shape[1]
+        and query.shape[2] == key.shape[2]
+        and query.shape[1] >= minimum_length
+        and query.shape[1] % dq_config.query_superblock == 0
+        and key.shape[1] % dkv_config.kv_superblock == 0
     )
 
 
@@ -2465,6 +2572,446 @@ def _mosaic_attention_backward_one_pass(
     )
 
 
+def _mosaic_attention_backward_warp_specialized_dq(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    output: jax.Array,
+    log_normalizer: jax.Array,
+    upstream_gradient: jax.Array,
+    *,
+    is_causal: bool = False,
+    _config: WarpSpecializedDQConfig | None = None,
+) -> jax.Array:
+    """Compute dQ with a generated producer/consumer Mosaic kernel.
+
+    K and V are each loaded once into a pipelined row-major shared-memory
+    representation. Native tiled loads derive K.T/V.T for the score and dP
+    contractions and K for the final dS@K contraction, avoiding the extra
+    global transpose used by the generic backward.
+    """
+
+    if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
+        raise ValueError("warp-specialized dQ requires FP16 or BF16")
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError("query, key, and value must have the same dtype")
+    if query.shape != output.shape or query.shape != upstream_gradient.shape:
+        raise ValueError("output and upstream gradient must match query shape")
+    if query.shape[3] != key.shape[3] or query.shape[3] != value.shape[3]:
+        raise ValueError("query, key, and value head dimensions must match")
+    if is_causal and query.shape[1] != key.shape[1]:
+        raise ValueError(
+            "warp-specialized causal dQ requires square self-attention"
+        )
+
+    batch_size, query_length, query_heads, head_dim = query.shape
+    kv_length, kv_heads = key.shape[1:3]
+    config = (
+        _warp_specialized_dq_config_for_head_dim(head_dim)
+        if _config is None
+        else _config
+    )
+    if config is None:
+        raise ValueError(
+            f"no warp-specialized dQ configuration is available for D={head_dim}"
+        )
+    block_q = config.block_q
+    block_kv = config.block_kv
+    num_compute_wgs = config.num_compute_wgs
+    query_superblock = config.query_superblock
+    if query_length % query_superblock:
+        raise ValueError(f"query length must be divisible by {query_superblock}")
+    if kv_length % block_kv:
+        raise ValueError(f"key/value length must be divisible by {block_kv}")
+    if query_heads % kv_heads:
+        raise ValueError("query heads must be divisible by key/value heads")
+
+    query_heads_per_kv_head = query_heads // kv_heads
+    num_query_supertiles = query_length // query_superblock
+    num_kv_tiles = kv_length // block_kv
+    max_concurrent_steps = min(config.pipeline_stages, num_kv_tiles)
+    dtype = query.dtype
+    scale = float(head_dim**-0.5)
+    log2e = math.log2(math.e)
+    lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(dtype, block_q)
+    row_layout = accumulator_layout.reduce(1)
+    row_operand_swizzle = _smem_swizzle_for_trailing_dimension(head_dim, dtype)
+    row_operand_smem_transforms = _smem_transforms_for_trailing_dimension(
+        head_dim,
+        dtype,
+    )
+    transposed_key_swizzle = _smem_swizzle_for_trailing_dimension(
+        block_kv,
+        dtype,
+    )
+    transposed_key_smem_transforms = _smem_transforms_for_trailing_dimension(
+        block_kv,
+        dtype,
+    )
+
+    gradient = upstream_gradient.astype(dtype)
+    key_transposed = jnp.transpose(key, (0, 2, 3, 1))
+    delta = jnp.sum(
+        upstream_gradient.astype(jnp.float32) * output.astype(jnp.float32),
+        axis=-1,
+    )
+    log_normalizer_transposed = jnp.transpose(log_normalizer, (0, 2, 1))
+    delta_transposed = jnp.transpose(delta, (0, 2, 1))
+
+    @plgpu.inline_mgpu(
+        arg_types=(plgpu.RefType(row_operand_smem_transforms),),
+        return_type=plgpu.ShapeDtypeStruct(
+            (head_dim, block_kv),
+            dtype,
+            layout=rhs_layout,
+        ),
+    )
+    def load_shared_transposed_rhs(_, smem_ref):
+        transposed_ref = mgpu.memref_transpose(smem_ref, (1, 0, 3, 2))
+        return mgpu.FragmentedArray.load_tiled(
+            transposed_ref,
+            swizzle=row_operand_swizzle,
+            layout=rhs_layout.to_mgpu(),
+            optimized=True,
+            tiling_rank=2,
+        )
+
+    @plgpu.inline_mgpu(
+        arg_types=(plgpu.RefType(transposed_key_smem_transforms),),
+        return_type=plgpu.ShapeDtypeStruct(
+            (block_kv, head_dim),
+            dtype,
+            layout=rhs_layout,
+        ),
+    )
+    def load_shared_direct_rhs(_, smem_ref):
+        transposed_ref = mgpu.memref_transpose(smem_ref, (1, 0, 3, 2))
+        return mgpu.FragmentedArray.load_tiled(
+            transposed_ref,
+            swizzle=transposed_key_swizzle,
+            layout=rhs_layout.to_mgpu(),
+            optimized=True,
+            tiling_rank=2,
+        )
+
+    @plgpu.inline_mgpu(
+        arg_types=(
+            accumulator_layout,
+            accumulator_layout,
+            rhs_layout,
+        ),
+        return_type=plgpu.ShapeDtypeStruct(
+            (block_q, head_dim),
+            jnp.float32,
+            layout=accumulator_layout,
+        ),
+    )
+    def mma_with_accumulator_lhs(_, accumulator, matrix, rhs):
+        native_lhs_layout = lhs_layout.to_mgpu()
+        lhs = mgpu.FragmentedArray(
+            _registers=matrix.registers.reshape(
+                native_lhs_layout.registers_shape(matrix.shape)
+            ),
+            _layout=native_lhs_layout,
+            _is_signed=matrix.is_signed,
+        )
+        return mgpu.mma(accumulator, lhs, rhs)
+
+    def kernel(
+        query_ref,
+        key_ref,
+        key_transposed_ref,
+        value_ref,
+        gradient_ref,
+        lse_transposed_ref,
+        delta_transposed_ref,
+        query_gradient_ref,
+        smem_buffers,
+        ready_barriers,
+        consumed_barriers,
+    ):
+        batch = lax.axis_index("batch")
+        query_head = lax.axis_index("heads")
+        wg_index = lax.axis_index("wg")
+        key_smem, key_for_dq_smem, value_smem = smem_buffers
+        key_barriers, key_for_dq_barriers, value_barriers = ready_barriers
+        key_consumed_barriers, value_consumed_barriers = consumed_barriers
+        kv_head = lax.div(
+            query_head,
+            jnp.asarray(query_heads_per_kv_head, query_head.dtype),
+        )
+        query_supertile = lax.axis_index("query_supertiles")
+        if is_causal:
+            query_supertile = num_query_supertiles - 1 - query_supertile
+            producer_kv_stop = jnp.minimum(
+                (query_supertile + 1) * (query_superblock // block_kv),
+                num_kv_tiles,
+            )
+        else:
+            producer_kv_stop = num_kv_tiles
+
+        @pl.when(wg_index < num_compute_wgs)
+        def compute_warpgroup():
+            plgpu.set_max_registers(config.compute_registers, action="increase")
+            query_tile = query_supertile * num_compute_wgs + wg_index
+            query_base = query_tile * block_q
+            query_slice = pl.ds(query_base, block_q)
+            query_fragment = plgpu.load(
+                query_ref.at[batch, query_slice, query_head],
+                layout=lhs_layout,
+                optimized=False,
+            )
+            gradient_fragment = plgpu.load(
+                gradient_ref.at[batch, query_slice, query_head],
+                layout=lhs_layout,
+                optimized=False,
+            )
+            lse = plgpu.load(
+                lse_transposed_ref.at[batch, query_head, query_slice],
+                layout=row_layout,
+                optimized=False,
+            )
+            delta_tile = plgpu.load(
+                delta_transposed_ref.at[batch, query_head, query_slice],
+                layout=row_layout,
+                optimized=False,
+            )
+            lse_broadcast = plgpu.layout_cast(
+                lax.broadcast_in_dim(lse, (block_q, block_kv), (0,)),
+                accumulator_layout,
+            )
+            delta_broadcast = plgpu.layout_cast(
+                lax.broadcast_in_dim(delta_tile, (block_q, block_kv), (0,)),
+                accumulator_layout,
+            )
+            query_gradient = plgpu.layout_cast(
+                jnp.zeros((block_q, head_dim), dtype=jnp.float32),
+                accumulator_layout,
+            )
+            if is_causal:
+                query_indices = plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (block_q, block_kv),
+                    0,
+                    layout=accumulator_layout,
+                )
+                key_indices = plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (block_q, block_kv),
+                    1,
+                    layout=accumulator_layout,
+                )
+                diagonal_mask = query_indices >= key_indices
+
+            def process_kv_tile(kv_step, query_gradient):
+                slot = lax.rem(
+                    kv_step,
+                    jnp.asarray(max_concurrent_steps, kv_step.dtype),
+                )
+                plgpu.barrier_wait(key_barriers.at[slot])
+                key_for_scores = load_shared_transposed_rhs(key_smem.at[slot])
+                scores = plgpu.mma(
+                    plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_q, block_kv),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    ),
+                    query_fragment,
+                    key_for_scores,
+                )
+                scores *= scale
+                probabilities = jnp.exp2((scores - lse_broadcast) * log2e)
+                if is_causal:
+                    probabilities = lax.cond(
+                        kv_step == query_tile,
+                        lambda matrix: jnp.where(
+                            diagonal_mask,
+                            matrix,
+                            jnp.zeros_like(matrix),
+                        ),
+                        lambda matrix: matrix,
+                        probabilities,
+                    )
+                    probabilities = lax.cond(
+                        kv_step <= query_tile,
+                        lambda matrix: matrix,
+                        jnp.zeros_like,
+                        probabilities,
+                    )
+
+                plgpu.barrier_wait(value_barriers.at[slot])
+                value_for_dp = load_shared_transposed_rhs(value_smem.at[slot])
+                dp = plgpu.mma(
+                    plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_q, block_kv),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    ),
+                    gradient_fragment,
+                    value_for_dp,
+                )
+                plgpu.barrier_arrive(value_consumed_barriers.at[slot])
+                ds = probabilities * (dp - delta_broadcast)
+                plgpu.barrier_wait(key_for_dq_barriers.at[slot])
+                key_for_dq = load_shared_direct_rhs(
+                    key_for_dq_smem.at[slot]
+                )
+                query_gradient = mma_with_accumulator_lhs(
+                    query_gradient,
+                    ds.astype(dtype),
+                    key_for_dq,
+                )
+                plgpu.barrier_arrive(key_consumed_barriers.at[slot])
+                return query_gradient
+
+            query_gradient = lax.fori_loop(
+                0,
+                producer_kv_stop,
+                process_kv_tile,
+                query_gradient,
+            )
+            query_gradient_ref[
+                batch,
+                query_slice,
+                query_head,
+            ] = (query_gradient * scale).astype(dtype)
+
+        @pl.when(wg_index == num_compute_wgs)
+        def memory_warpgroup():
+            plgpu.set_max_registers(
+                config.producer_registers,
+                action="decrease",
+            )
+            for kv_step in range(max_concurrent_steps):
+                @pl.when(kv_step < producer_kv_stop)
+                def prefill_pipeline():
+                    kv_slice = (
+                        batch,
+                        pl.ds(kv_step * block_kv, block_kv),
+                        kv_head,
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        key_ref.at[kv_slice],
+                        key_smem.at[kv_step],
+                        key_barriers.at[kv_step],
+                    )
+                    key_transposed_slice = (
+                        batch,
+                        kv_head,
+                        slice(None),
+                        pl.ds(kv_step * block_kv, block_kv),
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        key_transposed_ref.at[key_transposed_slice],
+                        key_for_dq_smem.at[kv_step],
+                        key_for_dq_barriers.at[kv_step],
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        value_ref.at[kv_slice],
+                        value_smem.at[kv_step],
+                        value_barriers.at[kv_step],
+                    )
+
+            @pl.loop(
+                0,
+                jnp.maximum(
+                    producer_kv_stop - max_concurrent_steps,
+                    0,
+                ),
+            )
+            def refill_pipeline(kv_step):
+                next_kv_step = kv_step + max_concurrent_steps
+                slot = lax.rem(
+                    kv_step,
+                    jnp.asarray(max_concurrent_steps, kv_step.dtype),
+                )
+                next_kv_slice = (
+                    batch,
+                    pl.ds(next_kv_step * block_kv, block_kv),
+                    kv_head,
+                )
+                plgpu.barrier_wait(key_consumed_barriers.at[slot])
+                plgpu.copy_gmem_to_smem(
+                    key_ref.at[next_kv_slice],
+                    key_smem.at[slot],
+                    key_barriers.at[slot],
+                )
+                next_key_transposed_slice = (
+                    batch,
+                    kv_head,
+                    slice(None),
+                    pl.ds(next_kv_step * block_kv, block_kv),
+                )
+                plgpu.copy_gmem_to_smem(
+                    key_transposed_ref.at[next_key_transposed_slice],
+                    key_for_dq_smem.at[slot],
+                    key_for_dq_barriers.at[slot],
+                )
+                plgpu.barrier_wait(value_consumed_barriers.at[slot])
+                plgpu.copy_gmem_to_smem(
+                    value_ref.at[next_kv_slice],
+                    value_smem.at[slot],
+                    value_barriers.at[slot],
+                )
+
+    row_operand_scratch = plgpu.SMEM(
+        (max_concurrent_steps, block_kv, head_dim),
+        dtype,
+        transforms=row_operand_smem_transforms,
+    )
+    transposed_key_scratch = plgpu.SMEM(
+        (max_concurrent_steps, head_dim, block_kv),
+        dtype,
+        transforms=transposed_key_smem_transforms,
+    )
+    return plgpu.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct(query.shape, dtype),
+        scratch_types=(
+            (
+                row_operand_scratch,
+                transposed_key_scratch,
+                row_operand_scratch,
+            ),
+            (
+                plgpu.Barrier(num_barriers=max_concurrent_steps),
+                plgpu.Barrier(num_barriers=max_concurrent_steps),
+                plgpu.Barrier(num_barriers=max_concurrent_steps),
+            ),
+            (
+                plgpu.Barrier(
+                    num_arrivals=num_compute_wgs,
+                    num_barriers=max_concurrent_steps,
+                ),
+                plgpu.Barrier(
+                    num_arrivals=num_compute_wgs,
+                    num_barriers=max_concurrent_steps,
+                ),
+            ),
+        ),
+        compiler_params=plgpu.CompilerParams(
+            approx_math=False,
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+        ),
+        grid=(query_heads, num_query_supertiles, batch_size),
+        grid_names=("heads", "query_supertiles", "batch"),
+        num_threads=num_compute_wgs + 1,
+        thread_name="wg",
+    )(
+        query,
+        key,
+        key_transposed,
+        value,
+        gradient,
+        log_normalizer_transposed,
+        delta_transposed,
+    )
+
+
 def _mosaic_attention_backward_warp_specialized(
     query: jax.Array,
     key: jax.Array,
@@ -3234,6 +3781,530 @@ def _mosaic_attention_backward_warp_specialized(
     )
 
 
+def _mosaic_attention_backward_warp_specialized_dkv(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    output: jax.Array,
+    log_normalizer: jax.Array,
+    upstream_gradient: jax.Array,
+    *,
+    is_causal: bool = False,
+    _config: WarpSpecializedDKVConfig | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute non-atomic dK/dV with generated head-width resources.
+
+    A key-major consumer retains complete FP32 dK and dV accumulators while a
+    producer pipelines row-major and transposed Q/dO views. The duplicate
+    O(ND) input views avoid shape-specific register-load mappings and are
+    negligible beside the O(N**2*D) contractions at the intended scale.
+    """
+
+    if query.dtype not in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
+        raise ValueError("warp-specialized dK/dV requires FP16 or BF16")
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError("query, key, and value must have the same dtype")
+    if query.shape != output.shape or query.shape != upstream_gradient.shape:
+        raise ValueError("output and upstream gradient must match query shape")
+    if query.shape[1] != key.shape[1]:
+        raise ValueError(
+            "warp-specialized dK/dV requires square self-attention"
+        )
+    if query.shape[2] != key.shape[2]:
+        raise ValueError(
+            "non-atomic warp-specialized dK/dV requires equal Q and K/V heads"
+        )
+    if query.shape[3] != key.shape[3] or query.shape[3] != value.shape[3]:
+        raise ValueError("query, key, and value head dimensions must match")
+
+    batch_size, query_length, query_heads, head_dim = query.shape
+    kv_length, kv_heads = key.shape[1:3]
+    config = (
+        _warp_specialized_dkv_config_for_head_dim(head_dim)
+        if _config is None
+        else _config
+    )
+    if config is None:
+        raise ValueError(
+            f"no warp-specialized dK/dV configuration is available for D={head_dim}"
+        )
+    block_q = config.block_q
+    block_kv = config.block_kv
+    num_compute_wgs = config.num_compute_wgs
+    kv_superblock = config.kv_superblock
+    if query_length % block_q:
+        raise ValueError(f"query length must be divisible by {block_q}")
+    if kv_length % kv_superblock:
+        raise ValueError(f"key/value length must be divisible by {kv_superblock}")
+
+    num_query_tiles = query_length // block_q
+    num_kv_supertiles = kv_length // kv_superblock
+    pipeline_depth = min(config.pipeline_stages, num_query_tiles)
+    dtype = query.dtype
+    scale = float(head_dim**-0.5)
+    log2e = math.log2(math.e)
+    lhs_layout, rhs_layout, accumulator_layout = _mma_layouts(dtype, block_kv)
+    column_layout = accumulator_layout.reduce(0)
+    row_operand_swizzle = _smem_swizzle_for_trailing_dimension(head_dim, dtype)
+    row_operand_smem_transforms = _smem_transforms_for_trailing_dimension(
+        head_dim,
+        dtype,
+    )
+    transposed_operand_swizzle = _smem_swizzle_for_trailing_dimension(
+        block_q,
+        dtype,
+    )
+    transposed_operand_smem_transforms = (
+        _smem_transforms_for_trailing_dimension(block_q, dtype)
+    )
+
+    gradient = upstream_gradient.astype(dtype)
+    query_transposed = jnp.transpose(query, (0, 2, 3, 1))
+    gradient_transposed = jnp.transpose(gradient, (0, 2, 3, 1))
+    delta = jnp.sum(
+        upstream_gradient.astype(jnp.float32) * output.astype(jnp.float32),
+        axis=-1,
+    )
+    log_normalizer_transposed = jnp.transpose(log_normalizer, (0, 2, 1))
+    delta_transposed = jnp.transpose(delta, (0, 2, 1))
+
+    @plgpu.inline_mgpu(
+        arg_types=(plgpu.RefType(row_operand_smem_transforms),),
+        return_type=plgpu.ShapeDtypeStruct(
+            (head_dim, block_q),
+            dtype,
+            layout=rhs_layout,
+        ),
+    )
+    def load_row_as_transposed_rhs(_, smem_ref):
+        transposed_ref = mgpu.memref_transpose(smem_ref, (1, 0, 3, 2))
+        return mgpu.FragmentedArray.load_tiled(
+            transposed_ref,
+            swizzle=row_operand_swizzle,
+            layout=rhs_layout.to_mgpu(),
+            optimized=True,
+            tiling_rank=2,
+        )
+
+    @plgpu.inline_mgpu(
+        arg_types=(plgpu.RefType(transposed_operand_smem_transforms),),
+        return_type=plgpu.ShapeDtypeStruct(
+            (block_q, head_dim),
+            dtype,
+            layout=rhs_layout,
+        ),
+    )
+    def load_transposed_as_direct_rhs(_, smem_ref):
+        transposed_ref = mgpu.memref_transpose(smem_ref, (1, 0, 3, 2))
+        return mgpu.FragmentedArray.load_tiled(
+            transposed_ref,
+            swizzle=transposed_operand_swizzle,
+            layout=rhs_layout.to_mgpu(),
+            optimized=True,
+            tiling_rank=2,
+        )
+
+    @plgpu.inline_mgpu(
+        arg_types=(
+            accumulator_layout,
+            accumulator_layout,
+            rhs_layout,
+        ),
+        return_type=plgpu.ShapeDtypeStruct(
+            (block_kv, head_dim),
+            jnp.float32,
+            layout=accumulator_layout,
+        ),
+    )
+    def mma_with_accumulator_lhs(_, accumulator, matrix, rhs):
+        native_lhs_layout = lhs_layout.to_mgpu()
+        lhs = mgpu.FragmentedArray(
+            _registers=matrix.registers.reshape(
+                native_lhs_layout.registers_shape(matrix.shape)
+            ),
+            _layout=native_lhs_layout,
+            _is_signed=matrix.is_signed,
+        )
+        return mgpu.mma(accumulator, lhs, rhs)
+
+    def kernel(
+        query_ref,
+        query_transposed_ref,
+        key_ref,
+        value_ref,
+        gradient_ref,
+        gradient_transposed_ref,
+        lse_transposed_ref,
+        delta_transposed_ref,
+        key_gradient_ref,
+        value_gradient_ref,
+        smem_buffers,
+        ready_barriers,
+        consumed_barriers,
+    ):
+        batch = lax.axis_index("batch")
+        kv_head = lax.axis_index("kv_heads")
+        wg_index = lax.axis_index("wg")
+        kv_supertile = lax.axis_index("kv_supertiles")
+        (
+            query_smem,
+            query_transposed_smem,
+            gradient_smem,
+            gradient_transposed_smem,
+        ) = smem_buffers
+        (
+            query_ready,
+            query_transposed_ready,
+            gradient_ready,
+            gradient_transposed_ready,
+        ) = ready_barriers
+        (
+            query_consumed,
+            query_transposed_consumed,
+            gradient_consumed,
+            gradient_transposed_consumed,
+        ) = consumed_barriers
+        if is_causal:
+            query_start = kv_supertile * num_compute_wgs
+        else:
+            query_start = 0
+        producer_query_count = num_query_tiles - query_start
+
+        @pl.when(wg_index < num_compute_wgs)
+        def compute_warpgroup():
+            plgpu.set_max_registers(config.compute_registers, action="increase")
+            kv_tile = kv_supertile * num_compute_wgs + wg_index
+            kv_base = kv_tile * block_kv
+            kv_slice = pl.ds(kv_base, block_kv)
+            key_fragment = plgpu.load(
+                key_ref.at[batch, kv_slice, kv_head],
+                layout=lhs_layout,
+                optimized=False,
+            )
+            value_fragment = plgpu.load(
+                value_ref.at[batch, kv_slice, kv_head],
+                layout=lhs_layout,
+                optimized=False,
+            )
+            key_gradient = plgpu.layout_cast(
+                jnp.zeros((block_kv, head_dim), dtype=jnp.float32),
+                accumulator_layout,
+            )
+            value_gradient = plgpu.layout_cast(
+                jnp.zeros((block_kv, head_dim), dtype=jnp.float32),
+                accumulator_layout,
+            )
+            if is_causal:
+                key_indices = plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (block_kv, block_q),
+                    0,
+                    layout=accumulator_layout,
+                )
+                query_indices = plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (block_kv, block_q),
+                    1,
+                    layout=accumulator_layout,
+                )
+                diagonal_mask = query_indices >= key_indices
+
+            def process_query_tile(query_offset, gradients):
+                key_gradient, value_gradient = gradients
+                query_tile = query_start + query_offset
+                query_base = query_tile * block_q
+                query_slice = pl.ds(query_base, block_q)
+                slot = lax.rem(
+                    query_offset,
+                    jnp.asarray(pipeline_depth, query_offset.dtype),
+                )
+
+                plgpu.barrier_wait(query_ready.at[slot])
+                query_for_scores = load_row_as_transposed_rhs(
+                    query_smem.at[slot]
+                )
+                scores_transposed = plgpu.mma(
+                    plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_kv, block_q),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    ),
+                    key_fragment,
+                    query_for_scores,
+                )
+                plgpu.barrier_arrive(query_consumed.at[slot])
+                scores_transposed *= scale
+                lse = plgpu.load(
+                    lse_transposed_ref.at[
+                        batch,
+                        kv_head,
+                        query_slice,
+                    ],
+                    layout=column_layout,
+                    optimized=False,
+                )
+                lse_broadcast = plgpu.layout_cast(
+                    lax.broadcast_in_dim(
+                        lse,
+                        scores_transposed.shape,
+                        (1,),
+                    ),
+                    accumulator_layout,
+                )
+                probabilities_transposed = jnp.exp2(
+                    (scores_transposed - lse_broadcast) * log2e
+                )
+                if is_causal:
+                    probabilities_transposed = lax.cond(
+                        query_tile == kv_tile,
+                        lambda matrix: jnp.where(
+                            diagonal_mask,
+                            matrix,
+                            jnp.zeros_like(matrix),
+                        ),
+                        lambda matrix: matrix,
+                        probabilities_transposed,
+                    )
+                    probabilities_transposed = lax.cond(
+                        query_tile >= kv_tile,
+                        lambda matrix: matrix,
+                        jnp.zeros_like,
+                        probabilities_transposed,
+                    )
+
+                plgpu.barrier_wait(gradient_ready.at[slot])
+                gradient_for_dp = load_row_as_transposed_rhs(
+                    gradient_smem.at[slot]
+                )
+                dp_transposed = plgpu.mma(
+                    plgpu.layout_cast(
+                        jnp.zeros(
+                            (block_kv, block_q),
+                            dtype=jnp.float32,
+                        ),
+                        accumulator_layout,
+                    ),
+                    value_fragment,
+                    gradient_for_dp,
+                )
+                plgpu.barrier_arrive(gradient_consumed.at[slot])
+                delta_tile = plgpu.load(
+                    delta_transposed_ref.at[
+                        batch,
+                        kv_head,
+                        query_slice,
+                    ],
+                    layout=column_layout,
+                    optimized=False,
+                )
+                delta_broadcast = plgpu.layout_cast(
+                    lax.broadcast_in_dim(
+                        delta_tile,
+                        dp_transposed.shape,
+                        (1,),
+                    ),
+                    accumulator_layout,
+                )
+                ds_transposed = probabilities_transposed * (
+                    dp_transposed - delta_broadcast
+                )
+
+                plgpu.barrier_wait(query_transposed_ready.at[slot])
+                query_for_dk = load_transposed_as_direct_rhs(
+                    query_transposed_smem.at[slot]
+                )
+                key_gradient = mma_with_accumulator_lhs(
+                    key_gradient,
+                    ds_transposed.astype(dtype),
+                    query_for_dk,
+                )
+                plgpu.barrier_arrive(query_transposed_consumed.at[slot])
+                plgpu.barrier_wait(gradient_transposed_ready.at[slot])
+                gradient_for_dv = load_transposed_as_direct_rhs(
+                    gradient_transposed_smem.at[slot]
+                )
+                value_gradient = mma_with_accumulator_lhs(
+                    value_gradient,
+                    probabilities_transposed.astype(dtype),
+                    gradient_for_dv,
+                )
+                plgpu.barrier_arrive(
+                    gradient_transposed_consumed.at[slot]
+                )
+                return key_gradient, value_gradient
+
+            key_gradient, value_gradient = lax.fori_loop(
+                0,
+                producer_query_count,
+                process_query_tile,
+                (key_gradient, value_gradient),
+            )
+            key_gradient_ref[
+                batch,
+                kv_slice,
+                kv_head,
+            ] = (key_gradient * scale).astype(dtype)
+            value_gradient_ref[
+                batch,
+                kv_slice,
+                kv_head,
+            ] = value_gradient.astype(dtype)
+
+        @pl.when(wg_index == num_compute_wgs)
+        def memory_warpgroup():
+            plgpu.set_max_registers(
+                config.producer_registers,
+                action="decrease",
+            )
+            for slot in range(pipeline_depth):
+                @pl.when(slot < producer_query_count)
+                def prefill_pipeline():
+                    query_tile = query_start + slot
+                    query_slice = pl.ds(query_tile * block_q, block_q)
+                    row_slice = (
+                        batch,
+                        query_slice,
+                        kv_head,
+                    )
+                    transposed_slice = (
+                        batch,
+                        kv_head,
+                        slice(None),
+                        query_slice,
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        query_ref.at[row_slice],
+                        query_smem.at[slot],
+                        query_ready.at[slot],
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        query_transposed_ref.at[transposed_slice],
+                        query_transposed_smem.at[slot],
+                        query_transposed_ready.at[slot],
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        gradient_ref.at[row_slice],
+                        gradient_smem.at[slot],
+                        gradient_ready.at[slot],
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        gradient_transposed_ref.at[transposed_slice],
+                        gradient_transposed_smem.at[slot],
+                        gradient_transposed_ready.at[slot],
+                    )
+
+            @pl.loop(
+                0,
+                jnp.maximum(producer_query_count - pipeline_depth, 0),
+            )
+            def refill_pipeline(query_offset):
+                slot = lax.rem(
+                    query_offset,
+                    jnp.asarray(pipeline_depth, query_offset.dtype),
+                )
+                next_query_tile = (
+                    query_start + query_offset + pipeline_depth
+                )
+                next_query_slice = pl.ds(
+                    next_query_tile * block_q,
+                    block_q,
+                )
+                next_row_slice = (
+                    batch,
+                    next_query_slice,
+                    kv_head,
+                )
+                next_transposed_slice = (
+                    batch,
+                    kv_head,
+                    slice(None),
+                    next_query_slice,
+                )
+                plgpu.barrier_wait(query_consumed.at[slot])
+                plgpu.copy_gmem_to_smem(
+                    query_ref.at[next_row_slice],
+                    query_smem.at[slot],
+                    query_ready.at[slot],
+                )
+                plgpu.barrier_wait(query_transposed_consumed.at[slot])
+                plgpu.copy_gmem_to_smem(
+                    query_transposed_ref.at[next_transposed_slice],
+                    query_transposed_smem.at[slot],
+                    query_transposed_ready.at[slot],
+                )
+                plgpu.barrier_wait(gradient_consumed.at[slot])
+                plgpu.copy_gmem_to_smem(
+                    gradient_ref.at[next_row_slice],
+                    gradient_smem.at[slot],
+                    gradient_ready.at[slot],
+                )
+                plgpu.barrier_wait(gradient_transposed_consumed.at[slot])
+                plgpu.copy_gmem_to_smem(
+                    gradient_transposed_ref.at[next_transposed_slice],
+                    gradient_transposed_smem.at[slot],
+                    gradient_transposed_ready.at[slot],
+                )
+
+    row_operand_scratch = plgpu.SMEM(
+        (pipeline_depth, block_q, head_dim),
+        dtype,
+        transforms=row_operand_smem_transforms,
+    )
+    transposed_operand_scratch = plgpu.SMEM(
+        (pipeline_depth, head_dim, block_q),
+        dtype,
+        transforms=transposed_operand_smem_transforms,
+    )
+    barriers = tuple(
+        plgpu.Barrier(num_barriers=pipeline_depth)
+        for _ in range(4)
+    )
+    consumed_barriers = tuple(
+        plgpu.Barrier(
+            num_arrivals=num_compute_wgs,
+            num_barriers=pipeline_depth,
+        )
+        for _ in range(4)
+    )
+    key_gradient, value_gradient = plgpu.kernel(
+        kernel,
+        out_type=(
+            jax.ShapeDtypeStruct(key.shape, dtype),
+            jax.ShapeDtypeStruct(value.shape, dtype),
+        ),
+        scratch_types=(
+            (
+                row_operand_scratch,
+                transposed_operand_scratch,
+                row_operand_scratch,
+                transposed_operand_scratch,
+            ),
+            barriers,
+            consumed_barriers,
+        ),
+        compiler_params=plgpu.CompilerParams(
+            approx_math=False,
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+        ),
+        grid=(kv_heads, num_kv_supertiles, batch_size),
+        grid_names=("kv_heads", "kv_supertiles", "batch"),
+        num_threads=num_compute_wgs + 1,
+        thread_name="wg",
+    )(
+        query,
+        query_transposed,
+        key,
+        value,
+        gradient,
+        gradient_transposed,
+        log_normalizer_transposed,
+        delta_transposed,
+    )
+    return key_gradient, value_gradient
+
+
 def _mosaic_attention_backward_warp_specialized_causal_dkv(
     query: jax.Array,
     key: jax.Array,
@@ -3763,24 +4834,81 @@ def _mosaic_attention_backward_warp_specialized_causal_split(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute causal gradients with separate non-atomic dQ and dK/dV passes."""
 
-    query_gradient, _, _ = _mosaic_attention_backward_warp_specialized(
-        query,
-        key,
-        value,
-        output,
-        log_normalizer,
-        upstream_gradient,
-        is_causal=True,
-        compute_kv_gradients=False,
-    )
-    key_gradient, value_gradient = (
-        _mosaic_attention_backward_warp_specialized_causal_dkv(
+    if query.shape[3] == 64:
+        query_gradient, _, _ = _mosaic_attention_backward_warp_specialized(
             query,
             key,
             value,
             output,
             log_normalizer,
             upstream_gradient,
+            is_causal=True,
+            compute_kv_gradients=False,
+        )
+        key_gradient, value_gradient = (
+            _mosaic_attention_backward_warp_specialized_causal_dkv(
+                query,
+                key,
+                value,
+                output,
+                log_normalizer,
+                upstream_gradient,
+            )
+        )
+    else:
+        query_gradient = _mosaic_attention_backward_warp_specialized_dq(
+            query,
+            key,
+            value,
+            output,
+            log_normalizer,
+            upstream_gradient,
+            is_causal=True,
+        )
+        key_gradient, value_gradient = (
+            _mosaic_attention_backward_warp_specialized_dkv(
+                query,
+                key,
+                value,
+                output,
+                log_normalizer,
+                upstream_gradient,
+                is_causal=True,
+            )
+        )
+    return query_gradient, key_gradient, value_gradient
+
+
+def _mosaic_attention_backward_warp_specialized_generated_split(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    output: jax.Array,
+    log_normalizer: jax.Array,
+    upstream_gradient: jax.Array,
+    *,
+    is_causal: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Combine the generated query-major and key-major backward passes."""
+
+    query_gradient = _mosaic_attention_backward_warp_specialized_dq(
+        query,
+        key,
+        value,
+        output,
+        log_normalizer,
+        upstream_gradient,
+        is_causal=is_causal,
+    )
+    key_gradient, value_gradient = (
+        _mosaic_attention_backward_warp_specialized_dkv(
+            query,
+            key,
+            value,
+            output,
+            log_normalizer,
+            upstream_gradient,
+            is_causal=is_causal,
         )
     )
     return query_gradient, key_gradient, value_gradient
@@ -3869,6 +4997,12 @@ def mosaic_attention_backward(
         is_unmasked=is_unmasked,
         is_causal=is_causal,
     )
+    use_generated_split = _can_use_generated_warp_specialized_split_backward(
+        query,
+        key,
+        is_unmasked=is_unmasked,
+        is_causal=is_causal,
+    )
     use_generic_split = _prefer_non_atomic_generic_backward(query)
 
     def run_selected(q, k, v, o, lse, do):
@@ -3880,6 +5014,16 @@ def mosaic_attention_backward(
                 o,
                 lse,
                 do,
+            )
+        if use_generated_split:
+            return _mosaic_attention_backward_warp_specialized_generated_split(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                is_causal=is_causal,
             )
         if use_generic_split:
             return _mosaic_attention_backward_two_pass(
