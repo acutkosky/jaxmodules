@@ -114,6 +114,11 @@ def test_warp_specialized_forward_selection_respects_supported_shapes():
     subkilotoken = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.float16)
     fp32 = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.float32)
     rectangular = jax.ShapeDtypeStruct((1, 8192, 2, 64), jnp.float16)
+    d128 = jax.ShapeDtypeStruct((1, 4096, 2, 128), jnp.float16)
+    d192 = jax.ShapeDtypeStruct((1, 4096, 2, 192), jnp.float16)
+    d208 = jax.ShapeDtypeStruct((1, 4096, 2, 208), jnp.float16)
+    d240 = jax.ShapeDtypeStruct((1, 4096, 2, 240), jnp.float16)
+    d256 = jax.ShapeDtypeStruct((1, 4096, 2, 256), jnp.float16)
 
     assert _can_use_warp_specialized_forward(
         large,
@@ -154,6 +159,38 @@ def test_warp_specialized_forward_selection_respects_supported_shapes():
     assert not _can_use_warp_specialized_forward(
         fp32,
         fp32,
+        is_unmasked=True,
+        is_causal=False,
+    )
+    for shape in (d128, d192):
+        assert _can_use_warp_specialized_forward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=False,
+        )
+        assert _can_use_warp_specialized_forward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=True,
+        )
+    for shape in (d208, d240):
+        assert _can_use_warp_specialized_forward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=False,
+        )
+        assert not _can_use_warp_specialized_forward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=True,
+        )
+    assert not _can_use_warp_specialized_forward(
+        d256,
+        d256,
         is_unmasked=True,
         is_causal=False,
     )
@@ -205,19 +242,45 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize(
-    ("dtype", "tolerance", "is_causal"),
+    ("dtype", "tolerance", "is_causal", "head_dim"),
     [
-        (jnp.float16, 2e-3, False),
-        (jnp.float16, 2e-3, True),
-        (jnp.bfloat16, 2e-2, False),
-        (jnp.bfloat16, 2e-2, True),
+        (jnp.float16, 2e-3, False, 64),
+        (jnp.float16, 2e-3, True, 64),
+        (jnp.bfloat16, 2e-2, False, 64),
+        (jnp.bfloat16, 2e-2, True, 64),
+        (jnp.float16, 2e-3, False, 128),
+        (jnp.float16, 2e-3, True, 128),
+        (jnp.bfloat16, 2e-2, False, 128),
+        (jnp.bfloat16, 2e-2, True, 128),
+        (jnp.float16, 2e-3, False, 80),
+        (jnp.float16, 2e-3, True, 80),
+        (jnp.float16, 2e-3, False, 192),
+        (jnp.float16, 2e-3, True, 192),
+        (jnp.float16, 2e-3, False, 240),
     ],
 )
-def test_warp_specialized_forward_matches_xla(dtype, tolerance, is_causal):
+def test_warp_specialized_forward_matches_xla(
+    dtype,
+    tolerance,
+    is_causal,
+    head_dim,
+):
     keys = jax.random.split(jax.random.key(5), 3)
-    query = jax.random.normal(keys[0], (1, 1024, 2, 64), dtype=dtype)
-    key = jax.random.normal(keys[1], (1, 1024, 1, 64), dtype=dtype)
-    value = jax.random.normal(keys[2], (1, 1024, 1, 64), dtype=dtype)
+    query = jax.random.normal(
+        keys[0],
+        (1, 1024, 2, head_dim),
+        dtype=dtype,
+    )
+    key = jax.random.normal(
+        keys[1],
+        (1, 1024, 1, head_dim),
+        dtype=dtype,
+    )
+    value = jax.random.normal(
+        keys[2],
+        (1, 1024, 1, head_dim),
+        dtype=dtype,
+    )
 
     output, log_normalizer = jax.jit(
         lambda q, k, v: _mosaic_attention_forward_warp_specialized(
@@ -283,20 +346,22 @@ def test_warp_specialized_causal_forward_composes_with_vmap():
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize(
-    ("sequence_length", "query_heads", "kv_heads"),
+    ("sequence_length", "query_heads", "kv_heads", "head_dim"),
     [
-        (4096, 1, 1),
-        (1024, 2, 1),
+        (4096, 1, 1, 64),
+        (1024, 2, 1, 64),
+        (1024, 2, 2, 128),
     ],
 )
 def test_warp_specialized_causal_custom_vjp_matches_xla(
     sequence_length,
     query_heads,
     kv_heads,
+    head_dim,
 ):
     keys = jax.random.split(jax.random.key(53), 4)
-    query_shape = (1, sequence_length, query_heads, 64)
-    kv_shape = (1, sequence_length, kv_heads, 64)
+    query_shape = (1, sequence_length, query_heads, head_dim)
+    kv_shape = (1, sequence_length, kv_heads, head_dim)
     query = jax.random.normal(keys[0], query_shape, dtype=jnp.float16)
     key = jax.random.normal(keys[1], kv_shape, dtype=jnp.float16)
     value = jax.random.normal(keys[2], kv_shape, dtype=jnp.float16)

@@ -310,13 +310,35 @@ def _effective_tile(
             "block_q": case.block_size,
             "block_kv": case.kv_block_size,
         }
-    if case.implementation == "mosaic-warp":
-        return {"block_q": 64, "block_kv": 64}
-    if case.implementation != "mosaic":
+    if case.implementation not in {"mosaic", "mosaic-warp"}:
         return None
 
-    from jaxmodules._mosaic_attention import _select_config
+    from jaxmodules._mosaic_attention import (
+        _select_config,
+        _select_warp_specialized_forward_config,
+        _warp_specialized_forward_config_for_head_dim,
+    )
 
+    is_causal = case.mask == "causal"
+    if case.implementation == "mosaic-warp":
+        warp_config = _warp_specialized_forward_config_for_head_dim(
+            case.head_dim,
+            is_causal=is_causal,
+        )
+    else:
+        warp_config = _select_warp_specialized_forward_config(
+            query,
+            key,
+            is_unmasked=case.mask in {"causal", "unmasked"},
+            is_causal=is_causal,
+        )
+    if warp_config is not None:
+        return {
+            "block_q": warp_config.block_q,
+            "block_kv": warp_config.block_kv,
+            "num_compute_wgs": warp_config.num_compute_wgs,
+            "pipeline_stages": warp_config.pipeline_stages,
+        }
     config = _select_config(query, key)
     if config is None:
         return None
