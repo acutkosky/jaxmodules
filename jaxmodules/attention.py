@@ -1410,8 +1410,12 @@ def _masked_attention_via_map_bwd(
             )
             return values
 
-        _, vjp_fn = jax.vjp(get_values, q, K, V)
-        dq, dK, dV = vjp_fn(g)
+        values, vjp_fn = jax.vjp(get_values, q, K, V)
+        # The tiled implementation accumulates custom-kernel outputs in FP32
+        # before the public function casts them back to Q.dtype.  Transpose that
+        # output cast explicitly: low-precision cotangents otherwise do not
+        # match the FP32 output expected by ``vjp_fn``.
+        dq, dK, dV = vjp_fn(g.astype(values.dtype))
 
         dK_carry = dK_carry + dK
         dV_carry = dV_carry + dV

@@ -1588,6 +1588,77 @@ def test_masked_attention_different_kernel():
     assert not jnp.allclose(output, output_default, rtol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_custom_kernel_low_precision_backward(dtype, is_causal):
+    """Custom kernels transpose the low-precision public output cast."""
+    N, H, d = 8, 2, 16
+    query, key, value = (
+        0.2 * jax.random.normal(random_key, (N, H, d), dtype=dtype)
+        for random_key in jax.random.split(jax.random.PRNGKey(42), 3)
+    )
+
+    def custom_kernel(q, k):
+        return jnp.exp(jnp.dot(q, k) / (2 * jnp.sqrt(k.shape[-1])))
+
+    def reference(q, k, v):
+        weights = fancy_vmap(
+            custom_kernel,
+            "weights[q, h, k] = custom_kernel(q[q, h, :], k[k, h, :])",
+        )(q, k).astype(jnp.float32)
+        if is_causal:
+            indices = jnp.arange(N)
+            weights = jnp.where(
+                indices[:, None, None] >= indices[None, None, :],
+                weights,
+                0,
+            )
+        normalizer = jnp.sum(weights, axis=-1, keepdims=True)
+        numerator = jnp.einsum(
+            "qhk,khe->qhe",
+            weights,
+            v,
+            preferred_element_type=jnp.float32,
+        )
+        return (numerator / normalizer).astype(dtype)
+
+    def implementation_loss(q, k, v):
+        output = masked_attention_via_map(
+            q,
+            k,
+            v,
+            kernel_fn=custom_kernel,
+            block_size=N,
+            is_causal=is_causal,
+        )
+        return jnp.mean(output.astype(jnp.float32) ** 2)
+
+    def reference_loss(q, k, v):
+        return jnp.mean(reference(q, k, v).astype(jnp.float32) ** 2)
+
+    actual = jax.jit(
+        jax.value_and_grad(implementation_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+    expected = jax.jit(
+        jax.value_and_grad(reference_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+
+    assert jnp.allclose(actual[0], expected[0], rtol=2e-2, atol=2e-3)
+    for actual_gradient, expected_gradient in zip(
+        actual[1],
+        expected[1],
+        strict=True,
+    ):
+        assert actual_gradient.dtype == dtype
+        assert jnp.all(jnp.isfinite(actual_gradient))
+        assert jnp.allclose(
+            actual_gradient,
+            expected_gradient,
+            rtol=5e-2,
+            atol=5e-3,
+        )
+
+
 @pytest.mark.parametrize("N,L", [(8, 8), (16, 16), (32, 32), (64, 32)])
 def test_masked_attention_different_lengths(N, L):
     """Test masked_attention_via_map with different query and key lengths"""
