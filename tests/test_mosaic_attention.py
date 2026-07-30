@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from jaxmodules._mosaic_attention import (
+    _can_use_generated_warp_specialized_split_backward,
     _can_use_warp_specialized_causal_split_backward,
     _can_use_warp_specialized_forward,
     _mosaic_attention_backward_warp_specialized,
@@ -204,6 +205,10 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
     small_mha = jax.ShapeDtypeStruct((1, 2048, 2, 64), jnp.float16)
     subkilotoken_mha = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.float16)
     large_gqa_key = jax.ShapeDtypeStruct((1, 4096, 1, 64), jnp.float16)
+    d192 = jax.ShapeDtypeStruct((1, 4096, 2, 192), jnp.float16)
+    d176 = jax.ShapeDtypeStruct((1, 4096, 2, 176), jnp.float16)
+    d240 = jax.ShapeDtypeStruct((1, 4096, 2, 240), jnp.float16)
+    d256 = jax.ShapeDtypeStruct((1, 4096, 2, 256), jnp.float16)
 
     assert _can_use_warp_specialized_causal_split_backward(
         large_mha,
@@ -241,6 +246,20 @@ def test_causal_split_backward_selection_respects_supported_mha_cases():
         is_unmasked=True,
         is_causal=False,
     )
+    for shape in (d176, d240):
+        assert _can_use_generated_warp_specialized_split_backward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=True,
+        )
+    for shape in (d192, d256):
+        assert not _can_use_generated_warp_specialized_split_backward(
+            shape,
+            shape,
+            is_unmasked=True,
+            is_causal=True,
+        )
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
@@ -354,6 +373,9 @@ def test_warp_specialized_causal_forward_composes_with_vmap():
         (4096, 1, 1, 64),
         (1024, 2, 1, 64),
         (1024, 2, 2, 128),
+        (1024, 2, 2, 192),
+        (1024, 2, 2, 240),
+        (1024, 2, 2, 256),
     ],
 )
 def test_warp_specialized_causal_custom_vjp_matches_xla(
@@ -1228,6 +1250,81 @@ def test_mosaic_custom_vjp_vmaps_value_only_and_reduces_shared_qk_gradients():
         np.testing.assert_allclose(
             np.asarray(mosaic_gradient),
             np.asarray(xla_gradient),
+            rtol=5e-3,
+            atol=5e-3,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_mosaic_custom_vjp_supports_heads_as_an_external_vmap():
+    keys = jax.random.split(jax.random.key(89), 4)
+    shape = (1, 1024, 2, 80)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    def attention(q, k, v):
+        return _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=_unmasked,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=True,
+            backward_strategy="auto",
+        )
+
+    def move_heads_out(array):
+        return jnp.moveaxis(array, 2, 0)[..., None, :]
+
+    def move_heads_in(array):
+        return jnp.moveaxis(array[..., 0, :], 0, 2)
+
+    headwise_query = move_heads_out(query)
+    headwise_key = move_heads_out(key)
+    headwise_value = move_heads_out(value)
+    vmapped_output = move_heads_in(
+        jax.jit(jax.vmap(attention))(
+            headwise_query,
+            headwise_key,
+            headwise_value,
+        )
+    )
+    explicit_output = jax.jit(attention)(query, key, value)
+    np.testing.assert_allclose(
+        np.asarray(vmapped_output),
+        np.asarray(explicit_output),
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+    headwise_cotangent = move_heads_out(cotangent)
+
+    def vmapped_loss(q, k, v):
+        output = jax.vmap(attention)(q, k, v)
+        return jnp.sum(output.astype(jnp.float32) * headwise_cotangent)
+
+    def explicit_loss(q, k, v):
+        output = attention(q, k, v)
+        return jnp.sum(output.astype(jnp.float32) * cotangent)
+
+    vmapped_gradients = jax.jit(
+        jax.grad(vmapped_loss, argnums=(0, 1, 2))
+    )(headwise_query, headwise_key, headwise_value)
+    explicit_gradients = jax.jit(
+        jax.grad(explicit_loss, argnums=(0, 1, 2))
+    )(query, key, value)
+    for vmapped_gradient, explicit_gradient in zip(
+        vmapped_gradients,
+        explicit_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(move_heads_in(vmapped_gradient)),
+            np.asarray(explicit_gradient),
             rtol=5e-3,
             atol=5e-3,
         )

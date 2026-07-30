@@ -464,6 +464,15 @@ def _warp_specialized_dq_config_for_head_dim(
             producer_registers=32,
             pipeline_stages=2,
         )
+    if 144 <= head_dim <= 256 and head_dim % 16 == 0:
+        return WarpSpecializedDQConfig(
+            block_q=64,
+            block_kv=64,
+            num_compute_wgs=1,
+            compute_registers=240,
+            producer_registers=32,
+            pipeline_stages=1,
+        )
     return None
 
 
@@ -472,7 +481,7 @@ def _warp_specialized_dkv_config_for_head_dim(
 ) -> WarpSpecializedDKVConfig | None:
     """Generate a locally accumulated dK/dV resource shape."""
 
-    if 80 <= head_dim <= 128 and head_dim % 16 == 0:
+    if 80 <= head_dim <= 256 and head_dim % 16 == 0:
         return WarpSpecializedDKVConfig(
             block_q=64,
             block_kv=64,
@@ -483,6 +492,21 @@ def _warp_specialized_dkv_config_for_head_dim(
             split_gradients=head_dim >= 96,
         )
     return None
+
+
+def _prefer_generated_warp_specialized_backward(
+    head_dim: int,
+    *,
+    is_causal: bool,
+) -> bool:
+    """Whether generated 64-row kernels beat the generic tiled backward."""
+
+    if not 80 <= head_dim <= 240 or head_dim % 16:
+        return False
+    # At D=192 the causal kernel crosses a register-residency boundary while
+    # the generic 64-row kernel remains efficient. The full unmasked traversal
+    # amortizes that cliff and still favors producer/consumer staging.
+    return not (is_causal and head_dim == 192)
 
 
 def _select_warp_specialized_forward_config(
@@ -526,15 +550,7 @@ def _can_use_warp_specialized_causal_split_backward(
 
     return (
         is_causal
-        and (
-            query.shape[3] == 64
-            or (
-                _warp_specialized_dq_config_for_head_dim(query.shape[3])
-                is not None
-                and _warp_specialized_dkv_config_for_head_dim(query.shape[3])
-                is not None
-            )
-        )
+        and query.shape[3] == 64
         and query.shape[2] == key.shape[2]
         and query.shape[1] >= 1024
         and _can_use_warp_specialized_forward(
@@ -562,6 +578,10 @@ def _can_use_generated_warp_specialized_split_backward(
         is_unmasked
         and dq_config is not None
         and dkv_config is not None
+        and _prefer_generated_warp_specialized_backward(
+            query.shape[3],
+            is_causal=is_causal,
+        )
         and query.shape[1] == key.shape[1]
         and query.shape[2] == key.shape[2]
         and query.shape[1] >= minimum_length
@@ -3837,8 +3857,19 @@ def _mosaic_attention_backward_warp_specialized_dkv(
         )
     block_q = config.block_q
     block_kv = config.block_kv
-    num_compute_wgs = config.num_compute_wgs
-    kv_superblock = config.kv_superblock
+    if gradient_kind == "both":
+        num_compute_wgs = config.num_compute_wgs
+        if head_dim > 96:
+            compute_registers = 256
+            producer_registers = 24
+        else:
+            compute_registers = config.compute_registers
+            producer_registers = config.producer_registers
+    else:
+        num_compute_wgs = 1
+        compute_registers = 240
+        producer_registers = 32
+    kv_superblock = block_kv * num_compute_wgs
     if query_length % block_q:
         raise ValueError(f"query length must be divisible by {block_q}")
     if kv_length % kv_superblock:
@@ -3846,9 +3877,19 @@ def _mosaic_attention_backward_warp_specialized_dkv(
 
     num_query_tiles = query_length // block_q
     num_kv_supertiles = kv_length // kv_superblock
-    requested_pipeline_depth = (
-        config.pipeline_stages if gradient_kind == "both" else 2
+    stage_transposed_operands = not (
+        gradient_kind == "both" and head_dim > 96
     )
+    if gradient_kind == "both":
+        requested_pipeline_depth = (
+            config.pipeline_stages
+            if stage_transposed_operands
+            else (2 if head_dim <= 192 else 1)
+        )
+    elif gradient_kind == "key":
+        requested_pipeline_depth = 2 if head_dim <= 128 else 1
+    else:
+        requested_pipeline_depth = 2 if head_dim <= 192 else 1
     pipeline_depth = min(requested_pipeline_depth, num_query_tiles)
     dtype = query.dtype
     scale = float(head_dim**-0.5)
@@ -3981,7 +4022,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
 
         @pl.when(wg_index < num_compute_wgs)
         def compute_warpgroup():
-            plgpu.set_max_registers(config.compute_registers, action="increase")
+            plgpu.set_max_registers(compute_registers, action="increase")
             kv_tile = kv_supertile * num_compute_wgs + wg_index
             kv_base = kv_tile * block_kv
             kv_slice = pl.ds(kv_base, block_kv)
@@ -4039,7 +4080,6 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                     query_offset,
                     jnp.asarray(pipeline_depth, query_offset.dtype),
                 )
-
                 plgpu.barrier_wait(query_ready.at[slot])
                 query_for_scores = load_row_as_transposed_rhs(
                     query_smem.at[slot]
@@ -4133,33 +4173,67 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                         dp_transposed - delta_broadcast
                     )
 
-                    plgpu.barrier_wait(query_transposed_ready.at[slot])
-                    query_for_dk = load_transposed_as_direct_rhs(
-                        query_transposed_smem.at[slot]
-                    )
+                    if stage_transposed_operands:
+                        plgpu.barrier_wait(
+                            query_transposed_ready.at[slot]
+                        )
+                        query_for_dk = load_transposed_as_direct_rhs(
+                            query_transposed_smem.at[slot]
+                        )
+                    else:
+                        query_for_dk = plgpu.load(
+                            plgpu.transpose_ref(
+                                query_transposed_ref.at[
+                                    batch,
+                                    kv_head,
+                                    :,
+                                    query_slice,
+                                ],
+                                (1, 0),
+                            ),
+                            layout=rhs_layout,
+                            optimized=False,
+                        )
                     key_gradient = mma_with_accumulator_lhs(
                         key_gradient,
                         ds_transposed.astype(dtype),
                         query_for_dk,
                     )
-                    plgpu.barrier_arrive(
-                        query_transposed_consumed.at[slot]
-                    )
+                    if stage_transposed_operands:
+                        plgpu.barrier_arrive(
+                            query_transposed_consumed.at[slot]
+                        )
                 if compute_value_gradient:
-                    plgpu.barrier_wait(
-                        gradient_transposed_ready.at[slot]
-                    )
-                    gradient_for_dv = load_transposed_as_direct_rhs(
-                        gradient_transposed_smem.at[slot]
-                    )
+                    if stage_transposed_operands:
+                        plgpu.barrier_wait(
+                            gradient_transposed_ready.at[slot]
+                        )
+                        gradient_for_dv = load_transposed_as_direct_rhs(
+                            gradient_transposed_smem.at[slot]
+                        )
+                    else:
+                        gradient_for_dv = plgpu.load(
+                            plgpu.transpose_ref(
+                                gradient_transposed_ref.at[
+                                    batch,
+                                    kv_head,
+                                    :,
+                                    query_slice,
+                                ],
+                                (1, 0),
+                            ),
+                            layout=rhs_layout,
+                            optimized=False,
+                        )
                     value_gradient = mma_with_accumulator_lhs(
                         value_gradient,
                         probabilities_transposed.astype(dtype),
                         gradient_for_dv,
                     )
-                    plgpu.barrier_arrive(
-                        gradient_transposed_consumed.at[slot]
-                    )
+                    if stage_transposed_operands:
+                        plgpu.barrier_arrive(
+                            gradient_transposed_consumed.at[slot]
+                        )
                 if compute_key_gradient and compute_value_gradient:
                     return key_gradient, value_gradient
                 if compute_key_gradient:
@@ -4194,7 +4268,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
         @pl.when(wg_index == num_compute_wgs)
         def memory_warpgroup():
             plgpu.set_max_registers(
-                config.producer_registers,
+                producer_registers,
                 action="decrease",
             )
             for slot in range(pipeline_depth):
@@ -4219,22 +4293,24 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                         query_ready.at[slot],
                     )
                     if compute_key_gradient:
-                        plgpu.copy_gmem_to_smem(
-                            query_transposed_ref.at[transposed_slice],
-                            query_transposed_smem.at[slot],
-                            query_transposed_ready.at[slot],
-                        )
+                        if stage_transposed_operands:
+                            plgpu.copy_gmem_to_smem(
+                                query_transposed_ref.at[transposed_slice],
+                                query_transposed_smem.at[slot],
+                                query_transposed_ready.at[slot],
+                            )
                         plgpu.copy_gmem_to_smem(
                             gradient_ref.at[row_slice],
                             gradient_smem.at[slot],
                             gradient_ready.at[slot],
                         )
                     if compute_value_gradient:
-                        plgpu.copy_gmem_to_smem(
-                            gradient_transposed_ref.at[transposed_slice],
-                            gradient_transposed_smem.at[slot],
-                            gradient_transposed_ready.at[slot],
-                        )
+                        if stage_transposed_operands:
+                            plgpu.copy_gmem_to_smem(
+                                gradient_transposed_ref.at[transposed_slice],
+                                gradient_transposed_smem.at[slot],
+                                gradient_transposed_ready.at[slot],
+                            )
 
             @pl.loop(
                 0,
@@ -4270,14 +4346,15 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                     query_ready.at[slot],
                 )
                 if compute_key_gradient:
-                    plgpu.barrier_wait(
-                        query_transposed_consumed.at[slot]
-                    )
-                    plgpu.copy_gmem_to_smem(
-                        query_transposed_ref.at[next_transposed_slice],
-                        query_transposed_smem.at[slot],
-                        query_transposed_ready.at[slot],
-                    )
+                    if stage_transposed_operands:
+                        plgpu.barrier_wait(
+                            query_transposed_consumed.at[slot]
+                        )
+                        plgpu.copy_gmem_to_smem(
+                            query_transposed_ref.at[next_transposed_slice],
+                            query_transposed_smem.at[slot],
+                            query_transposed_ready.at[slot],
+                        )
                     plgpu.barrier_wait(gradient_consumed.at[slot])
                     plgpu.copy_gmem_to_smem(
                         gradient_ref.at[next_row_slice],
@@ -4285,14 +4362,15 @@ def _mosaic_attention_backward_warp_specialized_dkv(
                         gradient_ready.at[slot],
                     )
                 if compute_value_gradient:
-                    plgpu.barrier_wait(
-                        gradient_transposed_consumed.at[slot]
-                    )
-                    plgpu.copy_gmem_to_smem(
-                        gradient_transposed_ref.at[next_transposed_slice],
-                        gradient_transposed_smem.at[slot],
-                        gradient_transposed_ready.at[slot],
-                    )
+                    if stage_transposed_operands:
+                        plgpu.barrier_wait(
+                            gradient_transposed_consumed.at[slot]
+                        )
+                        plgpu.copy_gmem_to_smem(
+                            gradient_transposed_ref.at[next_transposed_slice],
+                            gradient_transposed_smem.at[slot],
+                            gradient_transposed_ready.at[slot],
+                        )
 
     row_operand_scratch = plgpu.SMEM(
         (pipeline_depth, block_q, head_dim),
@@ -4307,7 +4385,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
     unused_scratch = plgpu.SMEM((1,), dtype)
     query_transposed_scratch = (
         transposed_operand_scratch
-        if compute_key_gradient
+        if compute_key_gradient and stage_transposed_operands
         else unused_scratch
     )
     gradient_scratch = (
@@ -4317,7 +4395,7 @@ def _mosaic_attention_backward_warp_specialized_dkv(
     )
     gradient_transposed_scratch = (
         transposed_operand_scratch
-        if compute_value_gradient
+        if compute_value_gradient and stage_transposed_operands
         else unused_scratch
     )
     barriers = tuple(

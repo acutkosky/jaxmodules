@@ -13,8 +13,9 @@ from jaxmodules._mosaic_attention import (
     _mosaic_attention_backward_warp_specialized_dkv,
     _mosaic_attention_backward_warp_specialized_dkv_split,
     _mosaic_attention_backward_warp_specialized_dq,
-    _mosaic_attention_forward_warp_specialized,
+    mosaic_attention_forward,
 )
+from jaxmodules.attention import _unmasked
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -29,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--unmasked", action="store_true")
     parser.add_argument("--split-dkv", action="store_true")
+    parser.add_argument(
+        "--gradient-kind",
+        choices=("both", "key", "value"),
+        default="both",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
     return parser
@@ -60,10 +66,11 @@ def main() -> None:
     is_causal = not args.unmasked
 
     forward = jax.jit(
-        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+        lambda q, k, v: mosaic_attention_forward(
             q,
             k,
             v,
+            _unmasked,
             is_causal=is_causal,
         )
     ).lower(query, key, value).compile()
@@ -91,9 +98,21 @@ def main() -> None:
         upstream,
     ).compile()
     if args.split_dkv:
+        if args.gradient_kind != "both":
+            raise ValueError("--split-dkv requires --gradient-kind=both")
         dkv_function = _mosaic_attention_backward_warp_specialized_dkv_split
     else:
-        dkv_function = _mosaic_attention_backward_warp_specialized_dkv
+        def dkv_function(q, k, v, o, lse, do, *, is_causal):
+            return _mosaic_attention_backward_warp_specialized_dkv(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                is_causal=is_causal,
+                gradient_kind=args.gradient_kind,
+            )
 
     dkv = jax.jit(
         lambda q, k, v, o, lse, do: (
@@ -140,7 +159,7 @@ def main() -> None:
         f"dtype={args.dtype} causal={is_causal}: "
         f"dQ={dq_seconds * 1e3:.3f} ms, "
         f"dK/dV={dkv_seconds * 1e3:.3f} ms "
-        f"(split={args.split_dkv})"
+        f"(split={args.split_dkv}, kind={args.gradient_kind})"
     )
 
 
