@@ -25,7 +25,7 @@ from typing import Any, Literal, cast
 IMPLEMENTATIONS = ("mosaic", "mosaic-warp", "mapped", "xla", "cudnn")
 MODES = ("forward", "backward")
 DTYPES = ("float32", "bfloat16", "float16")
-MASKS = ("causal", "unmasked", "general")
+MASKS = ("causal", "unmasked", "general", "general-dense")
 CUDA_VERSION_FUNCTIONS = (
     "cuda_driver_get_version",
     "cuda_runtime_build_version",
@@ -103,7 +103,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask", choices=MASKS, default="causal")
     parser.add_argument(
         "--mapped-backward-strategy",
-        choices=("auto", "minimal"),
+        choices=("auto", "minimal", "one_pass"),
         default="auto",
     )
     parser.add_argument("--warmup", type=_positive_int, default=2)
@@ -299,10 +299,42 @@ def _make_inputs(case: Case) -> tuple[Any, Any, Any]:
     return query, key, value
 
 
+def _effective_tile(
+    case: Case,
+    query: Any,
+    key: Any,
+) -> dict[str, int] | None:
+    """Report the score tile actually selected by an explicit tiled kernel."""
+    if case.implementation == "mapped":
+        return {
+            "block_q": case.block_size,
+            "block_kv": case.kv_block_size,
+        }
+    if case.implementation == "mosaic-warp":
+        return {"block_q": 64, "block_kv": 64}
+    if case.implementation != "mosaic":
+        return None
+
+    from jaxmodules._mosaic_attention import _select_config
+
+    config = _select_config(query, key)
+    if config is None:
+        return None
+    return {
+        "block_q": config.block_q,
+        "block_kv": config.block_kv,
+    }
+
+
 def _general_mask(batch: Any, head: Any, query: Any, key: Any) -> Any:
     """Representative noncausal, batch/head-dependent coordinate mask."""
     radius = 256 + 16 * (head % 2) + 8 * batch
     return (abs(query - key) <= radius) & ((query + 2 * key + head) % 5 != 1)
+
+
+def _dense_general_mask(batch: Any, head: Any, query: Any, key: Any) -> Any:
+    """Representative coordinate mask with no fully empty score tiles."""
+    return (query + 2 * key + head + batch) % 5 != 1
 
 
 def _make_function(case: Case) -> Any:
@@ -324,10 +356,11 @@ def _make_function(case: Case) -> Any:
         "causal": _unmasked,
         "unmasked": _unmasked,
         "general": _general_mask,
+        "general-dense": _dense_general_mask,
     }[case.mask]
 
     if case.implementation == "mosaic-warp":
-        if case.mask == "general":
+        if case.mask in {"general", "general-dense"}:
             raise ValueError(
                 "mosaic-warp supports only unmasked or maximal-causal attention"
             )
@@ -377,8 +410,13 @@ def _make_function(case: Case) -> Any:
 
         def attention(query: Any, key: Any, value: Any) -> Any:
             dense_mask = None
-            if case.mask == "general":
-                dense_mask = _general_mask(
+            if case.mask in {"general", "general-dense"}:
+                dense_mask_fn = (
+                    _general_mask
+                    if case.mask == "general"
+                    else _dense_general_mask
+                )
+                dense_mask = dense_mask_fn(
                     jnp.arange(case.batch_size)[:, None, None, None],
                     jnp.arange(case.query_heads)[None, :, None, None],
                     jnp.arange(case.seq_len)[None, None, :, None],
@@ -429,6 +467,7 @@ def _run_worker(case: Case) -> dict[str, Any]:
         query, key, value = _make_inputs(case)
         device = query.device
         input_stats = _memory_stats(device)
+        result["effective_tile"] = _effective_tile(case, query, key)
 
         function = _make_function(case)
         compile_start = time.perf_counter()
@@ -529,8 +568,8 @@ def _format_bytes(value: int | None) -> str:
 
 def _print_results(results: list[dict[str, Any]]) -> None:
     heading = (
-        "seq | hdim | mask     | qblk | kvblk | strategy | mode | implementation | "
-        "median | tokens/s | device peak* | compiler temp | status"
+        "seq | hdim | mask     | requested | tile  | strategy | mode | "
+        "implementation | median | tokens/s | device peak* | compiler temp | status"
     )
     print(heading)
     print("-" * len(heading))
@@ -547,11 +586,17 @@ def _print_results(results: list[dict[str, Any]]) -> None:
         else:
             latency = throughput = peak = temporary = "-"
             status = f"{result.get('error_type')}: {result.get('error')}"
+        effective_tile = result.get("effective_tile")
+        tile = (
+            "-"
+            if effective_tile is None
+            else f"{effective_tile['block_q']}x{effective_tile['block_kv']}"
+        )
         print(
             f"{case['seq_len']:>3} | {case['head_dim']:>4} | "
             f"{case['mask']:<8} | "
-            f"{case['block_size']:>4} | "
-            f"{case['kv_block_size']:>5} | "
+            f"{case['block_size']:>3}x{case['kv_block_size']:<3} | "
+            f"{tile:>5} | "
             f"{case['mapped_backward_strategy']:<8} | {case['mode']:<8} | "
             f"{case['implementation']:<14} | {latency:>9} | "
             f"{throughput:>9} | {peak:>12} | {temporary:>13} | {status}"

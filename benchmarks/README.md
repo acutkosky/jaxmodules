@@ -16,6 +16,9 @@ from 1K through 32K context.
 The [non-atomic causal-backward results](results/rtx5090_causal_split_backward_2026-07-29.md)
 compare the split query-major/key-major VJP with the previous atomic backward
 and cuDNN from 1K through 128K context.
+The [flexible-head results](results/rtx5090_flexible_dimensions_2026-07-29.md)
+cover 8-head, 1,024-dimensional-per-token attention at scale and validate
+per-head dimensions from 64 through 2,048.
 
 Run the smoke suite while iterating:
 
@@ -75,10 +78,11 @@ dispatches to it automatically at supported context sizes.
 
 `--block-size` accepts multiple values so that mapped attention is tuned at
 each workload rather than compared against XLA and cuDNN at an arbitrary tile
-size. Mosaic forward and backward currently use internal 64x64 tiles, so the
-requested block sizes do not change Mosaic. The block-size field is also
-ignored by XLA and cuDNN, but those cases are still repeated to keep each
-result independently isolated.
+size. Mosaic tunes independently: the D=64 kernels use internal 64x64 score
+tiles and the dimension-generic D=80..2048 kernels use 32x32 tiles. The
+requested block sizes therefore do not change Mosaic. Every JSON record and
+printed row identifies both the requested and effective tile. XLA and cuDNN
+report no effective tile because their libraries choose internally.
 
 By default, each `--block-size` is used for both query and K/V tiles. Pass one
 or more `--kv-block-size` values to benchmark the Cartesian product of query
@@ -94,26 +98,28 @@ uv run python benchmarks/benchmark_mapped_attention.py \
   --iterations 10
 ```
 
-Mapped and Mosaic backward use their faster strategies by default. To
-benchmark the generic two-pass variants that eliminate sequence-sized FP32
-gradient carries, pass `--mapped-backward-strategy minimal`. Large
-maximal-causal MHA uses separate query-major dQ and key-major dK/dV passes; the
-latter owns complete gradient tiles and avoids global atomics. Other
-warp-specialized cases use query-major programs with FP32 atomic dK/dV
-accumulation. Inputs, outputs, forward residuals, or score-tile temporaries may
-dominate the measured peak on other shapes.
+Mapped and Mosaic backward choose a strategy by default. To benchmark the
+generic two-pass variant that eliminates sequence-sized FP32 gradient carries,
+pass `--mapped-backward-strategy minimal`. To force a single score-tile
+traversal, pass `--mapped-backward-strategy one_pass`; Mosaic then uses FP32
+atomic dK/dV accumulation. The latter can help sufficiently sparse masks but
+uses larger compiler temporaries. Inputs, outputs, forward residuals, or
+score-tile temporaries may dominate the measured peak on other shapes.
 
 The mapped and Mosaic standard-attention paths return the input dtype. They
 compute softmax reductions and low-precision matrix-product accumulations in
 FP32, matching the conventional FlashAttention precision policy. Tile and
 backward-strategy sweeps do not relax that policy.
 
-Use `--mask unmasked`, `--mask causal`, or `--mask general`. The general case
-uses a noncausal batch/head-dependent radius-plus-modulo callable for Mosaic
-and mapped attention. XLA and cuDNN receive the equivalent dense boolean mask,
-so their memory results include the cost of representing that general mask.
+Use `--mask unmasked`, `--mask causal`, `--mask general`, or
+`--mask general-dense`. The general case uses a sparse noncausal
+batch/head-dependent radius-plus-modulo callable; general-dense uses a
+coordinate-dependent mask with no fully empty tiles. XLA and cuDNN receive
+equivalent dense boolean masks, so their memory results include the cost of
+representing either general mask.
 
 cuDNN results are reported as unavailable when the current backend or input
 configuration does not support cuDNN attention. The XLA and mapped
 implementations remain usable on CPU; Mosaic requires a supported GPU and
-float16 or bfloat16 inputs with 64-wide heads.
+float16 or bfloat16 inputs with a head dimension that is a multiple of 16 from
+64 through 2048.
