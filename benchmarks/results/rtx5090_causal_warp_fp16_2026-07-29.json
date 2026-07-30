@@ -1,0 +1,3938 @@
+[
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "forward",
+      "seq_len": 1024,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.33891559500079893,
+    "compiled_memory": {
+      "argument_size_in_bytes": 1572864,
+      "output_size_in_bytes": 524288,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 540928,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 23,
+      "bytes_in_use": 2096640,
+      "peak_bytes_in_use": 36699648,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "latency_median_seconds": 6.802249936299631e-05,
+    "latency_min_seconds": 6.564299928868422e-05,
+    "latency_mean_seconds": 6.879903321532765e-05,
+    "tokens_per_second": 15053842.619564898,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 2096640,
+      "peak_bytes_in_use": 2097152,
+      "largest_alloc_size": 1048064,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 512,
+      "pool_bytes": 2097152,
+      "peak_pool_bytes": 2097152
+    },
+    "final_memory": {
+      "num_allocs": 93,
+      "bytes_in_use": 2620928,
+      "peak_bytes_in_use": 36699648,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "peak_bytes_above_input_baseline": 34603008
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "forward",
+      "seq_len": 1024,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.2206050619997768,
+    "compiled_memory": {
+      "argument_size_in_bytes": 1572864,
+      "output_size_in_bytes": 524288,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 256,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 2095872,
+      "peak_bytes_in_use": 2096896,
+      "largest_alloc_size": 1047296,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 512,
+      "pool_bytes": 2097152,
+      "peak_pool_bytes": 2097152
+    },
+    "latency_median_seconds": 7.563199960713973e-05,
+    "latency_min_seconds": 7.194499994511716e-05,
+    "latency_mean_seconds": 7.665976663702167e-05,
+    "tokens_per_second": 13539242.71894212,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 2095872,
+      "peak_bytes_in_use": 2096896,
+      "largest_alloc_size": 1047296,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 512,
+      "pool_bytes": 2097152,
+      "peak_pool_bytes": 2097152
+    },
+    "final_memory": {
+      "num_allocs": 86,
+      "bytes_in_use": 2620160,
+      "peak_bytes_in_use": 3144704,
+      "largest_alloc_size": 1047296,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 3145728,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "peak_bytes_above_input_baseline": 1048832
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "backward",
+      "seq_len": 1024,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 1.0552419639998334,
+    "compiled_memory": {
+      "argument_size_in_bytes": 1572864,
+      "output_size_in_bytes": 1572888,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 3179288,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 37,
+      "bytes_in_use": 2096640,
+      "peak_bytes_in_use": 36699648,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "latency_median_seconds": 0.00017896600047606626,
+    "latency_min_seconds": 0.000171841999872413,
+    "latency_mean_seconds": 0.0001826148000266888,
+    "tokens_per_second": 5721757.190058807,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 2096640,
+      "peak_bytes_in_use": 2097152,
+      "largest_alloc_size": 1048064,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 512,
+      "pool_bytes": 2097152,
+      "peak_pool_bytes": 2097152
+    },
+    "final_memory": {
+      "num_allocs": 212,
+      "bytes_in_use": 3669504,
+      "peak_bytes_in_use": 36699648,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "peak_bytes_above_input_baseline": 34603008
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "backward",
+      "seq_len": 1024,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.4802056309999898,
+    "compiled_memory": {
+      "argument_size_in_bytes": 1572864,
+      "output_size_in_bytes": 1572888,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 3179264,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 2096640,
+      "peak_bytes_in_use": 2097152,
+      "largest_alloc_size": 1048064,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 512,
+      "pool_bytes": 2097152,
+      "peak_pool_bytes": 2097152
+    },
+    "latency_median_seconds": 0.000195306499790604,
+    "latency_min_seconds": 0.0001858890000221436,
+    "latency_mean_seconds": 0.0001948861333100164,
+    "tokens_per_second": 5243041.071842831,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 2096640,
+      "peak_bytes_in_use": 2097152,
+      "largest_alloc_size": 1048064,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 512,
+      "pool_bytes": 2097152,
+      "peak_pool_bytes": 2097152
+    },
+    "final_memory": {
+      "num_allocs": 191,
+      "bytes_in_use": 3669504,
+      "peak_bytes_in_use": 8421888,
+      "largest_alloc_size": 3179264,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "peak_bytes_above_input_baseline": 6325248
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "forward",
+      "seq_len": 2048,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.34511234699948545,
+    "compiled_memory": {
+      "argument_size_in_bytes": 3145728,
+      "output_size_in_bytes": 1048576,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 1081600,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 23,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 39845376,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 39845888,
+      "peak_pool_bytes": 39845888
+    },
+    "latency_median_seconds": 9.624550011722022e-05,
+    "latency_min_seconds": 9.047999992617406e-05,
+    "latency_mean_seconds": 9.649833345974912e-05,
+    "tokens_per_second": 21278916.91046003,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 4194304,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "final_memory": {
+      "num_allocs": 93,
+      "bytes_in_use": 5242368,
+      "peak_bytes_in_use": 39845376,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 39845888,
+      "peak_pool_bytes": 39845888
+    },
+    "peak_bytes_above_input_baseline": 35651584
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "forward",
+      "seq_len": 2048,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.21763151600043784,
+    "compiled_memory": {
+      "argument_size_in_bytes": 3145728,
+      "output_size_in_bytes": 1048576,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 256,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 4194304,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "latency_median_seconds": 9.999750000133645e-05,
+    "latency_min_seconds": 9.470699933444848e-05,
+    "latency_mean_seconds": 0.00010077196666316012,
+    "tokens_per_second": 20480512.0125266,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 4194304,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "final_memory": {
+      "num_allocs": 86,
+      "bytes_in_use": 5242368,
+      "peak_bytes_in_use": 6291200,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 1048576,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "peak_bytes_above_input_baseline": 2097408
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "backward",
+      "seq_len": 2048,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 1.0648395530006383,
+    "compiled_memory": {
+      "argument_size_in_bytes": 3145728,
+      "output_size_in_bytes": 3145752,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 6357784,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 37,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 39845376,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 39845888,
+      "peak_pool_bytes": 39845888
+    },
+    "latency_median_seconds": 0.0002976480000143056,
+    "latency_min_seconds": 0.00029314899984456133,
+    "latency_mean_seconds": 0.00030000450005900347,
+    "tokens_per_second": 6880610.653864863,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 4194304,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "final_memory": {
+      "num_allocs": 212,
+      "bytes_in_use": 7339520,
+      "peak_bytes_in_use": 39845376,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 29360128,
+      "pool_bytes": 39845888,
+      "peak_pool_bytes": 39845888
+    },
+    "peak_bytes_above_input_baseline": 35651584
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "backward",
+      "seq_len": 2048,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.4786184559998219,
+    "compiled_memory": {
+      "argument_size_in_bytes": 3145728,
+      "output_size_in_bytes": 3145752,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 6357760,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 4194304,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "latency_median_seconds": 0.0002935850002359075,
+    "latency_min_seconds": 0.0002817679996951483,
+    "latency_mean_seconds": 0.00030352623337724557,
+    "tokens_per_second": 6975833.228381384,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 4193792,
+      "peak_bytes_in_use": 4194304,
+      "largest_alloc_size": 2096640,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 6291456,
+      "peak_pool_bytes": 6291456
+    },
+    "final_memory": {
+      "num_allocs": 191,
+      "bytes_in_use": 7339520,
+      "peak_bytes_in_use": 16843264,
+      "largest_alloc_size": 7340032,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 31457280,
+      "peak_pool_bytes": 31457280
+    },
+    "peak_bytes_above_input_baseline": 12649472
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "forward",
+      "seq_len": 4096,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.34265513900027145,
+    "compiled_memory": {
+      "argument_size_in_bytes": 6291456,
+      "output_size_in_bytes": 2097152,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 2162944,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 23,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 44040192,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 48234496,
+      "peak_pool_bytes": 48234496
+    },
+    "latency_median_seconds": 0.00013766350002697436,
+    "latency_min_seconds": 0.00013252799999463605,
+    "latency_mean_seconds": 0.00014106983338327457,
+    "tokens_per_second": 29753711.035949346,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 6291968,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 6291456,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 93,
+      "bytes_in_use": 8388608,
+      "peak_bytes_in_use": 44040192,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 48234496,
+      "peak_pool_bytes": 48234496
+    },
+    "peak_bytes_above_input_baseline": 37748736
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "forward",
+      "seq_len": 4096,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.21373259500069253,
+    "compiled_memory": {
+      "argument_size_in_bytes": 6291456,
+      "output_size_in_bytes": 2097152,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 256,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 6291968,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 6291456,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "latency_median_seconds": 0.000168291000136378,
+    "latency_min_seconds": 0.00015773500035720645,
+    "latency_mean_seconds": 0.0001675969332306219,
+    "tokens_per_second": 24338794.092855375,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 6291968,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 6291456,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 86,
+      "bytes_in_use": 8388608,
+      "peak_bytes_in_use": 10486016,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 4194304,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "peak_bytes_above_input_baseline": 4194560
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "backward",
+      "seq_len": 4096,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 1.071204370000487,
+    "compiled_memory": {
+      "argument_size_in_bytes": 6291456,
+      "output_size_in_bytes": 6291480,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 12714776,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 37,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 50331648,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 81788928,
+      "peak_pool_bytes": 81788928
+    },
+    "latency_median_seconds": 0.0006904995002514625,
+    "latency_min_seconds": 0.00068706900037796,
+    "latency_mean_seconds": 0.0006971054000132426,
+    "tokens_per_second": 5931937.674840229,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 6292480,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 6291456,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 212,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 50331648,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 81788928,
+      "peak_pool_bytes": 81788928
+    },
+    "peak_bytes_above_input_baseline": 44040192
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "backward",
+      "seq_len": 4096,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.4783939660001124,
+    "compiled_memory": {
+      "argument_size_in_bytes": 6291456,
+      "output_size_in_bytes": 6291480,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 12714752,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 6292480,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 6291456,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "latency_median_seconds": 0.0005061639999439649,
+    "latency_min_seconds": 0.0004976330001227325,
+    "latency_mean_seconds": 0.0006121989666705,
+    "tokens_per_second": 8092238.879994329,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 6291456,
+      "peak_bytes_in_use": 6292480,
+      "largest_alloc_size": 2097152,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 6291456,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 191,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 31589376,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 65011712,
+      "peak_pool_bytes": 65011712
+    },
+    "peak_bytes_above_input_baseline": 25297920
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "forward",
+      "seq_len": 8192,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.33299393099969166,
+    "compiled_memory": {
+      "argument_size_in_bytes": 12582912,
+      "output_size_in_bytes": 4194304,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 4325632,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 23,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 54525952,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 81788928,
+      "peak_pool_bytes": 81788928
+    },
+    "latency_median_seconds": 0.0002734224999585422,
+    "latency_min_seconds": 0.0002699959995879908,
+    "latency_mean_seconds": 0.00027474443334843575,
+    "tokens_per_second": 29960957.862802498,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 12583424,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 93,
+      "bytes_in_use": 16777216,
+      "peak_bytes_in_use": 54525952,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 81788928,
+      "peak_pool_bytes": 81788928
+    },
+    "peak_bytes_above_input_baseline": 41943040
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "forward",
+      "seq_len": 8192,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.21578923200013378,
+    "compiled_memory": {
+      "argument_size_in_bytes": 12582912,
+      "output_size_in_bytes": 4194304,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 256,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 12583424,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "latency_median_seconds": 0.00040601699947728775,
+    "latency_min_seconds": 0.00040115200044965604,
+    "latency_mean_seconds": 0.00040812439992805595,
+    "tokens_per_second": 20176495.098841924,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 12583424,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 86,
+      "bytes_in_use": 16777216,
+      "peak_bytes_in_use": 20971776,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 31457280,
+      "peak_pool_bytes": 31457280
+    },
+    "peak_bytes_above_input_baseline": 8388864
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "backward",
+      "seq_len": 8192,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 1.0894978470005299,
+    "compiled_memory": {
+      "argument_size_in_bytes": 12582912,
+      "output_size_in_bytes": 12582936,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 25428760,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 37,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 62914560,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 81788928,
+      "peak_pool_bytes": 81788928
+    },
+    "latency_median_seconds": 0.0016617914998278138,
+    "latency_min_seconds": 0.0016325810001944774,
+    "latency_mean_seconds": 0.0017584274666963514,
+    "tokens_per_second": 4929619.630891608,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 12583424,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 212,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 71303424,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 33554432,
+      "pool_bytes": 81788928,
+      "peak_pool_bytes": 81788928
+    },
+    "peak_bytes_above_input_baseline": 58720512
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "backward",
+      "seq_len": 8192,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.4819257680001101,
+    "compiled_memory": {
+      "argument_size_in_bytes": 12582912,
+      "output_size_in_bytes": 12582936,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 25428736,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 16,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 12583424,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "latency_median_seconds": 0.0011784004996115982,
+    "latency_min_seconds": 0.0011541649992068415,
+    "latency_mean_seconds": 0.001275410733372458,
+    "tokens_per_second": 6951796.1021741675,
+    "input_memory": {
+      "num_allocs": 16,
+      "bytes_in_use": 12582912,
+      "peak_bytes_in_use": 12583424,
+      "largest_alloc_size": 4194304,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 2097152,
+      "pool_bytes": 14680064,
+      "peak_pool_bytes": 14680064
+    },
+    "final_memory": {
+      "num_allocs": 191,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 63177728,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 67108864,
+      "pool_bytes": 132120576,
+      "peak_pool_bytes": 132120576
+    },
+    "peak_bytes_above_input_baseline": 50594816
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "forward",
+      "seq_len": 16384,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.338273461999961,
+    "compiled_memory": {
+      "argument_size_in_bytes": 25165824,
+      "output_size_in_bytes": 8388608,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 8651008,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 26,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 75497472,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 67108864,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "latency_median_seconds": 0.0007754839998597163,
+    "latency_min_seconds": 0.0007681309998588404,
+    "latency_mean_seconds": 0.0008762395665447305,
+    "tokens_per_second": 21127450.731367555,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 25166592,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 35651584,
+      "peak_pool_bytes": 35651584
+    },
+    "final_memory": {
+      "num_allocs": 96,
+      "bytes_in_use": 33554432,
+      "peak_bytes_in_use": 75497472,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 67108864,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "peak_bytes_above_input_baseline": 50331648
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "forward",
+      "seq_len": 16384,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.21597945899975457,
+    "compiled_memory": {
+      "argument_size_in_bytes": 25165824,
+      "output_size_in_bytes": 8388608,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 256,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 19,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 25166592,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 35651584,
+      "peak_pool_bytes": 35651584
+    },
+    "latency_median_seconds": 0.0010991904996444646,
+    "latency_min_seconds": 0.0010670410001694108,
+    "latency_mean_seconds": 0.0011982820332377742,
+    "tokens_per_second": 14905514.563034741,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 25166592,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 35651584,
+      "peak_pool_bytes": 35651584
+    },
+    "final_memory": {
+      "num_allocs": 89,
+      "bytes_in_use": 33554432,
+      "peak_bytes_in_use": 41943296,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 25165824,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "peak_bytes_above_input_baseline": 16777472
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "backward",
+      "seq_len": 16384,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 1.073756589000368,
+    "compiled_memory": {
+      "argument_size_in_bytes": 25165824,
+      "output_size_in_bytes": 25165848,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 50856728,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 40,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 92274688,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 67108864,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "latency_median_seconds": 0.005666987000495283,
+    "latency_min_seconds": 0.005298775999108329,
+    "latency_mean_seconds": 0.00625597930005218,
+    "tokens_per_second": 2891130.683477494,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 25166592,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 35651584,
+      "peak_pool_bytes": 35651584
+    },
+    "final_memory": {
+      "num_allocs": 215,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 134217984,
+      "largest_alloc_size": 67108864,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 58720256,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "peak_bytes_above_input_baseline": 109052160
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "backward",
+      "seq_len": 16384,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.48128797200024565,
+    "compiled_memory": {
+      "argument_size_in_bytes": 25165824,
+      "output_size_in_bytes": 25165848,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 50856704,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 19,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 25166592,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 35651584,
+      "peak_pool_bytes": 35651584
+    },
+    "latency_median_seconds": 0.0033611729995755013,
+    "latency_min_seconds": 0.0033452830002715928,
+    "latency_mean_seconds": 0.003754650866570349,
+    "tokens_per_second": 4874488.757963132,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 25165824,
+      "peak_bytes_in_use": 25166592,
+      "largest_alloc_size": 8388608,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 8388608,
+      "pool_bytes": 35651584,
+      "peak_pool_bytes": 35651584
+    },
+    "final_memory": {
+      "num_allocs": 194,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 134217984,
+      "largest_alloc_size": 67108864,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 58720256,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "peak_bytes_above_input_baseline": 109052160
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "forward",
+      "seq_len": 32768,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.32775220300027286,
+    "compiled_memory": {
+      "argument_size_in_bytes": 50331648,
+      "output_size_in_bytes": 16777216,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 17301760,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 26,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 117440512,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 67108864,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "latency_median_seconds": 0.0026257585000166728,
+    "latency_min_seconds": 0.0025746780002009473,
+    "latency_mean_seconds": 0.0028144922333012802,
+    "tokens_per_second": 12479441.654589305,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 50332416,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "final_memory": {
+      "num_allocs": 96,
+      "bytes_in_use": 67108864,
+      "peak_bytes_in_use": 117440512,
+      "largest_alloc_size": 33554432,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 50331648,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "peak_bytes_above_input_baseline": 67108864
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "forward",
+      "seq_len": 32768,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.217390293999415,
+    "compiled_memory": {
+      "argument_size_in_bytes": 50331648,
+      "output_size_in_bytes": 16777216,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 256,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 19,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 50332416,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "latency_median_seconds": 0.0034633200002645026,
+    "latency_min_seconds": 0.0034030510005322867,
+    "latency_mean_seconds": 0.0038470692666730125,
+    "tokens_per_second": 9461441.62176681,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 50332416,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "final_memory": {
+      "num_allocs": 89,
+      "bytes_in_use": 67108864,
+      "peak_bytes_in_use": 83886336,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 50331648,
+      "pool_bytes": 136314880,
+      "peak_pool_bytes": 136314880
+    },
+    "peak_bytes_above_input_baseline": 33554688
+  },
+  {
+    "case": {
+      "implementation": "mosaic",
+      "mode": "backward",
+      "seq_len": 32768,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 1.0783641899997747,
+    "compiled_memory": {
+      "argument_size_in_bytes": 50331648,
+      "output_size_in_bytes": 50331672,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 101712664,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 40,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 150994944,
+      "largest_alloc_size": 67108864,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 134217728,
+      "pool_bytes": 270532608,
+      "peak_pool_bytes": 270532608
+    },
+    "latency_median_seconds": 0.02227791699988302,
+    "latency_min_seconds": 0.01884271600010834,
+    "latency_mean_seconds": 0.021434300099887574,
+    "tokens_per_second": 1470873.6009821773,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 50332416,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "final_memory": {
+      "num_allocs": 215,
+      "bytes_in_use": 100663296,
+      "peak_bytes_in_use": 268435712,
+      "largest_alloc_size": 134217728,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 117440512,
+      "pool_bytes": 270532608,
+      "peak_pool_bytes": 270532608
+    },
+    "peak_bytes_above_input_baseline": 218104064
+  },
+  {
+    "case": {
+      "implementation": "cudnn",
+      "mode": "backward",
+      "seq_len": 32768,
+      "block_size": 64,
+      "kv_block_size": 64,
+      "batch_size": 1,
+      "query_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 64,
+      "dtype": "float16",
+      "mask": "causal",
+      "mapped_backward_strategy": "auto",
+      "warmup": 5,
+      "iterations": 30,
+      "seed": 0
+    },
+    "status": "ok",
+    "jax_version": "0.11.0",
+    "backend": "gpu",
+    "device": "cuda:0",
+    "environment": {
+      "schema_version": 1,
+      "python": {
+        "version": "3.12.11",
+        "implementation": "CPython"
+      },
+      "operating_system": {
+        "id": "ubuntu",
+        "version_id": "26.04",
+        "pretty_name": "Ubuntu 26.04 LTS"
+      },
+      "kernel_release": "7.0.0-28-generic",
+      "machine": "x86_64",
+      "packages": {
+        "jax": "0.11.0",
+        "jax-cuda12-pjrt": "0.11.0",
+        "jax-cuda12-plugin": "0.11.0",
+        "jaxlib": "0.11.0",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "nvidia-cuda-cccl-cu12": "12.9.27",
+        "nvidia-cuda-cupti-cu12": "12.8.90",
+        "nvidia-cuda-nvcc-cu12": "12.9.86",
+        "nvidia-cuda-nvrtc-cu12": "12.8.93",
+        "nvidia-cuda-runtime-cu12": "12.8.90",
+        "nvidia-cudnn-cu12": "9.10.2.21",
+        "nvidia-cufft-cu12": "11.3.3.83",
+        "nvidia-cufile-cu12": "1.13.1.3",
+        "nvidia-curand-cu12": "10.3.9.90",
+        "nvidia-cusolver-cu12": "11.7.3.90",
+        "nvidia-cusparse-cu12": "12.5.8.93",
+        "nvidia-cusparselt-cu12": "0.7.1",
+        "nvidia-nccl-cu12": "2.27.3",
+        "nvidia-nvjitlink-cu12": "12.8.93",
+        "nvidia-nvshmem-cu12": "3.7.2",
+        "nvidia-nvtx-cu12": "12.8.90",
+        "triton": "3.4.0"
+      },
+      "jax": {
+        "version": "0.11.0",
+        "backend": "gpu",
+        "device": {
+          "description": "cuda:0",
+          "id": 0,
+          "kind": "NVIDIA GeForce RTX 5090",
+          "platform": "gpu",
+          "local_hardware_id": 0
+        },
+        "platform_version": "PJRT C API\ncuda 12090",
+        "cuda_versions": {
+          "available": true,
+          "versions": {
+            "cuda_driver_get_version": 13000,
+            "cuda_runtime_build_version": 12090,
+            "cuda_runtime_get_version": 12080,
+            "cudnn_build_version": 90800,
+            "cudnn_get_version": 91002,
+            "cublas_build_version": 120901,
+            "cublas_get_version": 120804,
+            "cufft_build_version": 11401,
+            "cufft_get_version": 11303,
+            "cupti_build_version": 28,
+            "cupti_get_version": 26,
+            "cusolver_build_version": 11705,
+            "cusolver_get_version": 11703,
+            "cusparse_build_version": 12510,
+            "cusparse_get_version": 12508
+          }
+        }
+      },
+      "nvidia_smi": {
+        "available": true,
+        "gpus": [
+          {
+            "driver_version": "580.173.02",
+            "name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "pci_bus_id": "00000000:01:00.0",
+            "memory_total_mib": "32607"
+          }
+        ]
+      },
+      "environment_variables": {
+        "CUDA_VISIBLE_DEVICES": null,
+        "JAX_COMPILATION_CACHE_DIR": null,
+        "JAX_PLATFORMS": null,
+        "LD_LIBRARY_PATH": null,
+        "XLA_FLAGS": null,
+        "XLA_PYTHON_CLIENT_ALLOCATOR": null,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": null,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      }
+    },
+    "compile_seconds": 0.480744424000477,
+    "compiled_memory": {
+      "argument_size_in_bytes": 50331648,
+      "output_size_in_bytes": 50331672,
+      "alias_size_in_bytes": 0,
+      "temp_size_in_bytes": 101712640,
+      "generated_code_size_in_bytes": 0
+    },
+    "memory_after_compile": {
+      "num_allocs": 19,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 50332416,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "latency_median_seconds": 0.011645082999621081,
+    "latency_min_seconds": 0.01108986700000969,
+    "latency_mean_seconds": 0.012624365500020456,
+    "tokens_per_second": 2813891.494037976,
+    "input_memory": {
+      "num_allocs": 19,
+      "bytes_in_use": 50331648,
+      "peak_bytes_in_use": 50332416,
+      "largest_alloc_size": 16777216,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 16777216,
+      "pool_bytes": 69206016,
+      "peak_pool_bytes": 69206016
+    },
+    "final_memory": {
+      "num_allocs": 194,
+      "bytes_in_use": 100663296,
+      "peak_bytes_in_use": 268435712,
+      "largest_alloc_size": 134217728,
+      "bytes_limit": 25249710080,
+      "bytes_reserved": 0,
+      "peak_bytes_reserved": 0,
+      "largest_free_block_bytes": 117440512,
+      "pool_bytes": 270532608,
+      "peak_pool_bytes": 270532608
+    },
+    "peak_bytes_above_input_baseline": 218104064
+  }
+]

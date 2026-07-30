@@ -10,6 +10,9 @@ show the benchmark format and the large-context crossover.
 The [warp-specialized results](results/rtx5090_warp_specialized_2026-07-27.md)
 compare its input-precision FP16/BF16 performance and memory with cuDNN through
 128K context.
+The [causal warp-specialized results](results/rtx5090_causal_warp_2026-07-29.md)
+compare the maximal-causal fast path with the previous Mosaic kernel and cuDNN
+from 1K through 32K context.
 
 Run the smoke suite while iterating:
 
