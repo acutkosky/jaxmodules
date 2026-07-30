@@ -8,20 +8,51 @@ between implementations.
 from __future__ import annotations
 
 import argparse
+import csv
+import importlib.metadata
 import json
 import os
+import platform
 import statistics
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Literal, cast
 
 IMPLEMENTATIONS = ("mosaic", "mosaic-warp", "mapped", "xla", "cudnn")
 MODES = ("forward", "backward")
 DTYPES = ("float32", "bfloat16", "float16")
 MASKS = ("causal", "unmasked", "general")
+CUDA_VERSION_FUNCTIONS = (
+    "cuda_driver_get_version",
+    "cuda_runtime_build_version",
+    "cuda_runtime_get_version",
+    "cudnn_build_version",
+    "cudnn_get_version",
+    "cublas_build_version",
+    "cublas_get_version",
+    "cufft_build_version",
+    "cufft_get_version",
+    "cupti_build_version",
+    "cupti_get_version",
+    "cusolver_build_version",
+    "cusolver_get_version",
+    "cusparse_build_version",
+    "cusparse_get_version",
+)
+REPRODUCIBILITY_ENVIRONMENT_VARIABLES = (
+    "CUDA_VISIBLE_DEVICES",
+    "JAX_COMPILATION_CACHE_DIR",
+    "JAX_PLATFORMS",
+    "LD_LIBRARY_PATH",
+    "XLA_FLAGS",
+    "XLA_PYTHON_CLIENT_ALLOCATOR",
+    "XLA_PYTHON_CLIENT_MEM_FRACTION",
+    "XLA_PYTHON_CLIENT_PREALLOCATE",
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +140,137 @@ def _compiled_memory_stats(compiled: Any) -> dict[str, int]:
     return {field: int(getattr(stats, field)) for field in fields}
 
 
+def _error_metadata(error: BaseException) -> dict[str, str]:
+    return {
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+
+
+def _relevant_distribution_versions() -> dict[str, str]:
+    """Return package versions that can affect JAX GPU code generation."""
+    versions = {}
+    for distribution in importlib.metadata.distributions():
+        name = distribution.metadata.get("Name")
+        if name is None:
+            continue
+        normalized_name = name.lower()
+        if normalized_name in {"jax", "jaxlib", "triton"} or normalized_name.startswith(
+            ("jax-cuda", "nvidia-")
+        ):
+            versions[name] = distribution.version
+    return dict(sorted(versions.items(), key=lambda item: item[0].lower()))
+
+
+def _jax_cuda_versions() -> dict[str, Any]:
+    """Read both compile-time and runtime CUDA library versions from JAX."""
+    try:
+        from jax._src.lib import cuda_versions  # noqa: PLC0415
+    except (AttributeError, ImportError) as error:
+        return {"available": False, **_error_metadata(error)}
+
+    values = {}
+    errors = {}
+    for function_name in CUDA_VERSION_FUNCTIONS:
+        function = getattr(cuda_versions, function_name, None)
+        if function is None:
+            continue
+        try:
+            values[function_name] = int(function())
+        except Exception as error:  # noqa: BLE001 - metadata must be best effort.
+            errors[function_name] = _error_metadata(error)
+
+    result: dict[str, Any] = {"available": bool(values), "versions": values}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def _nvidia_smi_metadata() -> dict[str, Any]:
+    """Query the host driver and physical GPUs without initializing CUDA."""
+    fields = (
+        "driver_version",
+        "name",
+        "compute_capability",
+        "pci_bus_id",
+        "memory_total_mib",
+    )
+    query_fields = (
+        "driver_version",
+        "name",
+        "compute_cap",
+        "pci.bus_id",
+        "memory.total",
+    )
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed diagnostic command.
+            [  # noqa: S607 - nvidia-smi is intentionally resolved through PATH.
+                "nvidia-smi",
+                f"--query-gpu={','.join(query_fields)}",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        return {"available": False, **_error_metadata(error)}
+    rows = [
+        [value.strip() for value in row]
+        for row in csv.reader(completed.stdout.splitlines())
+        if row
+    ]
+    gpus = [
+        dict(zip(fields, row, strict=True)) for row in rows if len(row) == len(fields)
+    ]
+    return {"available": True, "gpus": gpus}
+
+
+def _environment_metadata(jax: ModuleType, device: object) -> dict[str, Any]:
+    """Capture enough of the software and hardware stack to reproduce a run."""
+    try:
+        os_release = platform.freedesktop_os_release()
+    except OSError as error:
+        os_metadata: dict[str, Any] = _error_metadata(error)
+    else:
+        os_metadata = {
+            key.lower(): os_release[key]
+            for key in ("ID", "VERSION_ID", "PRETTY_NAME")
+            if key in os_release
+        }
+
+    client = getattr(device, "client", None)
+    return {
+        "schema_version": 1,
+        "python": {
+            "version": platform.python_version(),
+            "implementation": platform.python_implementation(),
+        },
+        "operating_system": os_metadata,
+        "kernel_release": platform.release(),
+        "machine": platform.machine(),
+        "packages": _relevant_distribution_versions(),
+        "jax": {
+            "version": jax.__version__,
+            "backend": jax.default_backend(),
+            "device": {
+                "description": str(device),
+                "id": getattr(device, "id", None),
+                "kind": getattr(device, "device_kind", None),
+                "platform": getattr(device, "platform", None),
+                "local_hardware_id": getattr(device, "local_hardware_id", None),
+            },
+            "platform_version": getattr(client, "platform_version", None),
+            "cuda_versions": _jax_cuda_versions(),
+        },
+        "nvidia_smi": _nvidia_smi_metadata(),
+        "environment_variables": {
+            name: os.environ.get(name) for name in REPRODUCIBILITY_ENVIRONMENT_VARIABLES
+        },
+    }
+
+
 def _make_inputs(case: Case) -> tuple[Any, Any, Any]:
     import jax
     import jax.numpy as jnp
@@ -140,9 +302,7 @@ def _make_inputs(case: Case) -> tuple[Any, Any, Any]:
 def _general_mask(batch: Any, head: Any, query: Any, key: Any) -> Any:
     """Representative noncausal, batch/head-dependent coordinate mask."""
     radius = 256 + 16 * (head % 2) + 8 * batch
-    return (abs(query - key) <= radius) & (
-        (query + 2 * key + head) % 5 != 1
-    )
+    return (abs(query - key) <= radius) & ((query + 2 * key + head) % 5 != 1)
 
 
 def _make_function(case: Case) -> Any:
@@ -252,7 +412,15 @@ def _run_worker(case: Case) -> dict[str, Any]:
     result: dict[str, Any] = {"case": asdict(case), "status": "ok"}
     result["jax_version"] = jax.__version__
     result["backend"] = jax.default_backend()
-    result["device"] = str(jax.devices()[0])
+    device = jax.devices()[0]
+    result["device"] = str(device)
+    try:
+        result["environment"] = _environment_metadata(jax, device)
+    except Exception as error:  # noqa: BLE001 - never fail a run on metadata.
+        result["environment"] = {
+            "schema_version": 1,
+            "error": _error_metadata(error),
+        }
 
     try:
         query, key, value = _make_inputs(case)

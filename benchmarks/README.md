@@ -49,6 +49,14 @@ statistics. The benchmark reports:
 - input-buffer baseline and peak allocation above that baseline;
 - compiler-estimated argument, output, temporary, and aliased bytes.
 
+JSON results also include a versioned `environment` record for each worker:
+Python, operating system and kernel; JAX, JAXlib, CUDA-plugin, CUDA-library,
+cuDNN, and Triton package versions; the CUDA and cuDNN build/runtime versions
+reported by JAX; NVIDIA driver, GPU, compute capability, PCI bus, and physical
+memory reported by `nvidia-smi`; and relevant JAX/XLA/CUDA environment
+variables. Metadata collection is best-effort and does not turn an otherwise
+valid benchmark into a failure.
+
 Each worker is terminated after five minutes by default so a pathological
 compile or allocation does not prevent later implementations from running.
 Use `--case-timeout-seconds` to change that limit.
