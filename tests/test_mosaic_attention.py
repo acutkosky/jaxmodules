@@ -13,6 +13,7 @@ from jaxmodules._mosaic_attention import (
     _mosaic_attention_backward_warp_specialized,
     _mosaic_attention_backward_warp_specialized_causal_split,
     _mosaic_attention_backward_warp_specialized_dkv,
+    _mosaic_attention_backward_warp_specialized_dkv_split,
     _mosaic_attention_backward_warp_specialized_dq,
     _mosaic_attention_forward_warp_specialized,
     _prefer_non_atomic_generic_backward,
@@ -571,12 +572,21 @@ def test_warp_specialized_backward_matches_xla(
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize("head_dim", [80, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_generated_warp_specialized_dq_matches_xla(head_dim, is_causal):
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(jnp.float16, 3e-3), (jnp.bfloat16, 2e-2)],
+)
+def test_generated_warp_specialized_dq_matches_xla(
+    head_dim,
+    is_causal,
+    dtype,
+    tolerance,
+):
     keys = jax.random.split(jax.random.key(71), 4)
     shape = (1, 1024, 2, head_dim)
-    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
-    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
-    value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
+    query = jax.random.normal(keys[0], shape, dtype=dtype)
+    key = jax.random.normal(keys[1], shape, dtype=dtype)
+    value = jax.random.normal(keys[2], shape, dtype=dtype)
     cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
 
     output, log_normalizer = jax.jit(
@@ -615,17 +625,82 @@ def test_generated_warp_specialized_dq_matches_xla(head_dim, is_causal):
     np.testing.assert_allclose(
         np.asarray(query_gradient),
         np.asarray(expected),
-        rtol=3e-3,
-        atol=3e-3,
+        rtol=tolerance,
+        atol=tolerance,
     )
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
 @pytest.mark.parametrize("head_dim", [80, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_generated_warp_specialized_dkv_matches_xla(head_dim, is_causal):
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(jnp.float16, 3e-3), (jnp.bfloat16, 2e-2)],
+)
+def test_generated_warp_specialized_dkv_matches_xla(
+    head_dim,
+    is_causal,
+    dtype,
+    tolerance,
+):
     keys = jax.random.split(jax.random.key(73), 4)
     shape = (1, 1024, 2, head_dim)
+    query = jax.random.normal(keys[0], shape, dtype=dtype)
+    key = jax.random.normal(keys[1], shape, dtype=dtype)
+    value = jax.random.normal(keys[2], shape, dtype=dtype)
+    cotangent = jax.random.normal(keys[3], shape, dtype=jnp.float32)
+
+    output, log_normalizer = jax.jit(
+        lambda q, k, v: _mosaic_attention_forward_warp_specialized(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+        )
+    )(query, key, value)
+    gradients = jax.jit(
+        lambda q, k, v, o, lse, do: (
+            _mosaic_attention_backward_warp_specialized_dkv(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                do,
+                is_causal=is_causal,
+            )
+        )
+    )(query, key, value, output, log_normalizer, cotangent)
+
+    def xla_loss(k, v):
+        attention = jax.nn.dot_product_attention(
+            query,
+            k,
+            v,
+            is_causal=is_causal,
+            implementation="xla",
+        )
+        return jnp.sum(attention.astype(jnp.float32) * cotangent)
+
+    expected = jax.jit(jax.grad(xla_loss, argnums=(0, 1)))(key, value)
+    for gradient, expected_gradient in zip(
+        gradients,
+        expected,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(gradient),
+            np.asarray(expected_gradient),
+            rtol=tolerance,
+            atol=tolerance,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_split_warp_specialized_dkv_matches_xla(is_causal):
+    keys = jax.random.split(jax.random.key(79), 4)
+    shape = (1, 1024, 2, 128)
     query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
     key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
     value = jax.random.normal(keys[2], shape, dtype=jnp.float16)
@@ -641,7 +716,7 @@ def test_generated_warp_specialized_dkv_matches_xla(head_dim, is_causal):
     )(query, key, value)
     gradients = jax.jit(
         lambda q, k, v, o, lse, do: (
-            _mosaic_attention_backward_warp_specialized_dkv(
+            _mosaic_attention_backward_warp_specialized_dkv_split(
                 q,
                 k,
                 v,
@@ -1072,6 +1147,89 @@ def test_mosaic_custom_vjp_composes_with_jit_and_vmap():
             np.asarray(mapped_gradient),
             rtol=3e-3,
             atol=3e-3,
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="requires Mosaic GPU")
+def test_mosaic_custom_vjp_vmaps_value_only_and_reduces_shared_qk_gradients():
+    keys = jax.random.split(jax.random.key(83), 5)
+    shape = (1, 1024, 2, 80)
+    query = jax.random.normal(keys[0], shape, dtype=jnp.float16)
+    key = jax.random.normal(keys[1], shape, dtype=jnp.float16)
+    values = jax.random.normal(keys[2], (3, *shape), dtype=jnp.float16)
+    cotangents = jax.random.normal(
+        keys[3],
+        values.shape,
+        dtype=jnp.float32,
+    )
+
+    def mosaic_attention(q, k, v):
+        return _masked_attention_via_mosaic(
+            q,
+            k,
+            v,
+            mask_fn=_unmasked,
+            block_size=64,
+            kv_block_size=64,
+            window_size=None,
+            is_causal=True,
+            backward_strategy="auto",
+        )
+
+    def xla_attention(q, k, v):
+        return jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="xla",
+        )
+
+    mosaic_vmapped = jax.jit(
+        jax.vmap(mosaic_attention, in_axes=(None, None, 0))
+    )
+    xla_vmapped = jax.jit(
+        jax.vmap(xla_attention, in_axes=(None, None, 0))
+    )
+    mosaic_output = mosaic_vmapped(query, key, values)
+    xla_output = xla_vmapped(query, key, values)
+    np.testing.assert_allclose(
+        np.asarray(mosaic_output),
+        np.asarray(xla_output),
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+    def loss(attention_fn, q, k, vs):
+        outputs = jax.vmap(attention_fn, in_axes=(None, None, 0))(
+            q,
+            k,
+            vs,
+        )
+        return jnp.sum(outputs.astype(jnp.float32) * cotangents)
+
+    mosaic_gradients = jax.jit(
+        jax.grad(
+            lambda q, k, vs: loss(mosaic_attention, q, k, vs),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, values)
+    xla_gradients = jax.jit(
+        jax.grad(
+            lambda q, k, vs: loss(xla_attention, q, k, vs),
+            argnums=(0, 1, 2),
+        )
+    )(query, key, values)
+    for mosaic_gradient, xla_gradient in zip(
+        mosaic_gradients,
+        xla_gradients,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(mosaic_gradient),
+            np.asarray(xla_gradient),
+            rtol=5e-3,
+            atol=5e-3,
         )
 
 
