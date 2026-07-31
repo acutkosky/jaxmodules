@@ -129,6 +129,11 @@ def _attn_kq_block_fn(
         v_block.dtype,
         jnp.float32,
     )
+    operand_dtype = jnp.result_type(
+        q_block.dtype,
+        k_block.dtype,
+        v_block.dtype,
+    )
     q_block = rearrange(q_block, "B Lq (Hkv MQA) dq -> B Lq Hkv MQA dq", Hkv=Hkv)
 
     mask = _materialize_mask(
@@ -183,9 +188,12 @@ def _attn_kq_block_fn(
         )
         probabilities = jnp.exp(scores - safe_new_max)
         local_normalizer = jnp.sum(probabilities, axis=-1, keepdims=True)
+        # The online softmax state remains FP32. Only the tensor-core operand
+        # is staged at the common input precision; the contraction still
+        # accumulates into the FP32 numerator.
         local_numerator = jnp.einsum(
             "bqhmk,bkhe->bqhme",
-            probabilities,
+            probabilities.astype(operand_dtype),
             v_block,
             precision=_attention_dot_precision(q_block.dtype),
             preferred_element_type=accumulator_dtype,
@@ -846,6 +854,12 @@ def _standard_attention_tile_backward(
     is_causal,
 ):
     """Recompute one score tile and return its Q, K, and V contributions."""
+    operand_dtype = jnp.result_type(
+        q_block.dtype,
+        k_block.dtype,
+        v_block.dtype,
+        grad_block.dtype,
+    )
     mask = _materialize_mask(
         mask_fn,
         batch_size,
@@ -873,24 +887,29 @@ def _standard_attention_tile_backward(
         preferred_element_type=accumulator_dtype,
     )
     dS = probabilities * (dP - delta_block)
+    # Preserve FP32 softmax arithmetic while staging the three contraction
+    # operands at no lower precision than the inputs. Their results and all
+    # cross-tile gradient carries remain FP32.
+    dS_operand = dS.astype(operand_dtype)
+    probability_operand = probabilities.astype(operand_dtype)
 
     dQ = scale * jnp.einsum(
         "bqhgk,bkhd->bqhgd",
-        dS,
+        dS_operand,
         k_block,
         precision=dot_precision,
         preferred_element_type=accumulator_dtype,
     )
     dK = scale * jnp.einsum(
         "bqhgk,bqhgd->bkhd",
-        dS,
+        dS_operand,
         q_block,
         precision=dot_precision,
         preferred_element_type=accumulator_dtype,
     )
     dV = jnp.einsum(
         "bqhgk,bqhge->bkhe",
-        probabilities,
+        probability_operand,
         grad_block,
         precision=dot_precision,
         preferred_element_type=accumulator_dtype,
@@ -2062,8 +2081,8 @@ def attention(
         FP32 atomic dK/dV accumulation, which can help sparse masks but uses
         larger compiler temporaries. None of the strategies changes
         contraction or accumulation precision for a given input dtype. The
-        strategy applies to the optimized default kernel; custom kernels retain
-        their generic custom-VJP path.
+        strategy applies to the optimized default kernel; custom kernels use
+        an analytic tiled VJP around the arbitrary callable.
 
     Returns:
         Attention values with the same dtype as ``Q``. Softmax reductions and
