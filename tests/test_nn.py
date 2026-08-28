@@ -200,6 +200,91 @@ class TestSoftmaxCrossEntropy:
 
         np.testing.assert_allclose(to_numpy(loss_jax), to_numpy(loss_torch), rtol=1e-6)
 
+    @pytest.mark.parametrize("reduction", ["none", "sum", "mean"])
+    @pytest.mark.parametrize("label_smoothing", [0.0, 0.2])
+    def test_weighted_probabilistic_targets(self, reduction, label_smoothing):
+        """Class weights are applied once for probabilistic targets."""
+        logits = np.array(
+            [[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]],
+            dtype=np.float32,
+        )
+        targets = np.array(
+            [[0.2, 0.3, 0.5], [0.6, 0.1, 0.3]],
+            dtype=np.float32,
+        )
+        weights = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+        loss_jax = softmax_cross_entropy(
+            jnp.asarray(logits),
+            jnp.asarray(targets),
+            weight=jnp.asarray(weights),
+            reduction=reduction,
+            label_smoothing=label_smoothing,
+        )
+        loss_torch = F.cross_entropy(
+            torch.tensor(logits),
+            torch.tensor(targets),
+            weight=torch.tensor(weights),
+            reduction=reduction,
+            label_smoothing=label_smoothing,
+        )
+
+        np.testing.assert_allclose(
+            to_numpy(loss_jax),
+            to_numpy(loss_torch),
+            rtol=1e-6,
+        )
+
+    def test_weighted_label_smoothing_mean(self):
+        """Mean reduction uses hard target weights despite label smoothing."""
+        logits = np.array(
+            [[1.0, 2.0, 3.0], [0.5, -1.0, 2.0], [2.0, 0.2, -0.5]],
+            dtype=np.float32,
+        )
+        targets = np.array([0, 0, 0], dtype=np.int64)
+        weights = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+        loss_jax = softmax_cross_entropy(
+            jnp.asarray(logits),
+            jnp.asarray(targets),
+            weight=jnp.asarray(weights),
+            label_smoothing=0.5,
+        )
+        loss_torch = F.cross_entropy(
+            torch.tensor(logits),
+            torch.tensor(targets),
+            weight=torch.tensor(weights),
+            label_smoothing=0.5,
+        )
+
+        np.testing.assert_allclose(
+            to_numpy(loss_jax),
+            to_numpy(loss_torch),
+            rtol=1e-6,
+        )
+
+    def test_python_integer_target(self):
+        """A Python integer target works for a single vector of logits."""
+        logits_jax = jnp.array([1.0, 2.0, 3.0])
+        logits_torch = torch.tensor(to_numpy(logits_jax))
+
+        loss_jax = softmax_cross_entropy(logits_jax, 2)
+        loss_torch = F.cross_entropy(logits_torch, torch.tensor(2))
+
+        np.testing.assert_allclose(
+            to_numpy(loss_jax),
+            to_numpy(loss_torch),
+            rtol=1e-6,
+        )
+
+    def test_invalid_reduction(self):
+        with pytest.raises(ValueError, match="reduction"):
+            softmax_cross_entropy(
+                jnp.array([[1.0, 2.0]]),
+                jnp.array([0]),
+                reduction="typo",
+            )
+
     def test_edge_cases(self):
         """Test edge cases"""
         # Single sample, single class

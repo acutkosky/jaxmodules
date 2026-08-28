@@ -148,11 +148,14 @@ class StandardizeNorm(StatefulLayer, strict=True):
             centered_x = x_flat - running_mean
 
             if self.full_matrix:
-                new_cov = jnp.matmul(
-                    centered_x.transpose(),
-                    centered_x,
-                    precision=self.precision,
-                ) / N
+                new_cov = (
+                    jnp.matmul(
+                        centered_x.transpose(),
+                        centered_x,
+                        precision=self.precision,
+                    )
+                    / N
+                )
                 new_cov = lax.pmean(new_cov, self.axis_name)
             else:
                 new_cov = jnp.mean(centered_x**2, axis=0)
@@ -184,6 +187,14 @@ class StandardizeNorm(StatefulLayer, strict=True):
 
 
 class CausalNorm(StatefulLayer):
+    """Normalize rows using statistics from their causal prefixes.
+
+    The prefix mean minimizes average squared L2 residual subject to the selected
+    mean resolution: a per-channel vector, one scalar shared by every channel, or
+    the fixed zero vector. Scalar variance is the resulting squared L2 value;
+    diagonal and matrix variance retain the corresponding residual moments.
+    """
+
     eps: float = field(static=True)
     mean_resolution: str = field(static=True)
     var_resolution: str = field(static=True)
@@ -205,28 +216,52 @@ class CausalNorm(StatefulLayer):
         self.precision = precision
 
     def __call__(self, x: jax.Array, return_stats=False):
-        T, C = x.shape
+        T, _ = x.shape
 
+        counts = jnp.arange(1, T + 1, dtype=x.dtype).reshape((T, 1))
         if self.mean_resolution == "none":
-            centered_x = x
+            means = jnp.zeros_like(x)
+            vector_residuals = x
+            correction = jnp.ones_like(counts)
+            mean_offsets = jnp.zeros_like(x)
         else:
-            means = jnp.cumsum(x, axis=0) / jnp.arange(1, T + 1).reshape((T, 1))
+            vector_means = jnp.cumsum(x, axis=0) / counts
+            if self.mean_resolution == "diag":
+                means = vector_means
+            else:
+                means = jnp.mean(vector_means, axis=1, keepdims=True)
 
-            if self.mean_resolution == "scalar":
-                means = jnp.mean(means, axis=1, keepdims=True)
-            centered_x = x - means
+            # Welford's update can be expressed in terms of the residual against
+            # the updated mean as
+            #
+            #   M2[t] = M2[t - 1]
+            #           + t / (t - 1) * (x[t] - mean[t]) ** 2.
+            #
+            # This form retains the parallel cumulative sums used here while
+            # avoiding the cancellation in E[x**2] - E[x]**2.
+            vector_residuals = x - vector_means
+            correction = jnp.where(
+                counts > 1,
+                counts / jnp.maximum(counts - 1, 1),
+                jnp.zeros_like(counts),
+            )
+            mean_offsets = vector_means - means
+
+        centered_x = x - means
 
         if self.var_resolution == "scalar":
-            vars = jnp.cumsum(centered_x**2, axis=0) / jnp.arange(1, T + 1).reshape(
-                (T, 1)
+            diagonal_vars = (
+                jnp.cumsum(correction * vector_residuals**2, axis=0) / counts
+                + mean_offsets**2
             )
-            vars = jnp.sum(vars, axis=1, keepdims=True) + self.eps
+            vars = jnp.sum(diagonal_vars, axis=1, keepdims=True) + self.eps
 
             result = centered_x / jnp.sqrt(vars)
 
         elif self.var_resolution == "diag":
             vars = (
-                jnp.cumsum(centered_x**2, axis=0) / jnp.arange(1, T + 1).reshape((T, 1))
+                jnp.cumsum(correction * vector_residuals**2, axis=0) / counts
+                + mean_offsets**2
                 + self.eps
             )
 
@@ -234,11 +269,18 @@ class CausalNorm(StatefulLayer):
         elif self.var_resolution == "matrix":
             vars = jnp.einsum(
                 "ti,tj->tij",
-                centered_x,
-                centered_x,
+                vector_residuals,
+                vector_residuals,
                 precision=self.precision,
             )
-            vars = jnp.cumsum(vars, axis=0) / jnp.arange(1, T + 1).reshape((T, 1, 1))
+            vars = jnp.cumsum(vars * correction[..., None], axis=0) / counts[
+                ..., None
+            ] + jnp.einsum(
+                "ti,tj->tij",
+                mean_offsets,
+                mean_offsets,
+                precision=self.precision,
+            )
 
             preconditioner = matrix_inverse_sqrt(
                 vars,

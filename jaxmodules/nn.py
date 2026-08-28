@@ -62,72 +62,75 @@ def softmax_cross_entropy(
     # we avoid subtracting the normalizer from all values, just from the values
     # for the correct labels.
 
+    if reduction not in {"none", "mean", "sum"}:
+        raise ValueError(
+            f"reduction must be one of 'none', 'mean', or 'sum'; got {reduction!r}"
+        )
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise ValueError(
+            f"label_smoothing must be between 0 and 1; got {label_smoothing}"
+        )
+
     if axis is None:
         axis = input.ndim - 1
     if axis < 0:
         axis = input.ndim + axis
 
-    C = input.shape[axis]
+    num_classes = input.shape[axis]
 
-    if weight is not None:
+    class_weight = None if weight is None else jnp.asarray(weight)
+    if class_weight is not None:
         weight_shape = (
             (1,) * axis + (input.shape[axis],) + (1,) * (input.ndim - axis - 1)
         )
-        weight = weight.reshape(weight_shape)
+        weight = class_weight.reshape(weight_shape)
 
-    if isinstance(target, int) or target.ndim != input.ndim:
+    target = jnp.asarray(target)
+
+    if target.ndim != input.ndim:
         no_ignore = jax.lax.stop_gradient(target != ignore_index)
-        logits_max = jnp.max(
-            input, axis=axis, keepdims=True
-        )  # , where=no_ignore, initial=-jnp.inf)
+        logits_max = jnp.max(input, axis=axis, keepdims=True)
         logits = input - jax.lax.stop_gradient(logits_max)
-
-        broadcast_shape = logits.shape[:axis] + (1,) + logits.shape[axis + 1 :]
-
-        log_normalizers = jax.nn.logsumexp(
-            logits, b=no_ignore.reshape(broadcast_shape), axis=axis
-        )
+        log_normalizers = jax.nn.logsumexp(logits, axis=axis)
 
         labels_no_ignore = jnp.where(no_ignore, target, 0)
-
         label_logits = jnp.take_along_axis(
-            logits, labels_no_ignore[..., None], axis=axis
-        )[..., 0]
+            logits,
+            jnp.expand_dims(labels_no_ignore, axis=axis),
+            axis=axis,
+        ).squeeze(axis=axis)
+        negative_log_likelihood = log_normalizers - label_logits
 
-        if label_smoothing != 0 or weight is not None:
-            one_hot_labels = jax.nn.one_hot(labels_no_ignore, num_classes=C, axis=axis)
-            target_probs = (
-                one_hot_labels * (1.0 - label_smoothing)
-                + jnp.ones_like(one_hot_labels) / C * label_smoothing
-            )
-
-            if weight is not None:
-                target_probs = target_probs * weight
-                log_normalizers = log_normalizers * jnp.sum(target_probs, axis=axis)
-                target_normalizer = jnp.sum(
-                    target_probs, where=no_ignore.reshape(broadcast_shape)
-                )
-
-            losses = -(
-                jnp.sum(
-                    target_probs * logits,
-                    where=no_ignore.reshape(broadcast_shape),
-                    axis=axis,
-                )
-                - log_normalizers
-            )
+        if class_weight is None:
+            if label_smoothing == 0.0:
+                losses = negative_log_likelihood
+            else:
+                smooth_losses = log_normalizers - jnp.mean(logits, axis=axis)
+                losses = (1.0 - label_smoothing) * negative_log_likelihood
+                losses = losses + label_smoothing * smooth_losses
         else:
-            label_logits = jnp.take_along_axis(
-                logits, labels_no_ignore.reshape(broadcast_shape), axis=axis
+            target_weights = jnp.take(class_weight, labels_no_ignore)
+            if label_smoothing == 0.0:
+                losses = target_weights * negative_log_likelihood
+            else:
+                smooth_losses = (
+                    log_normalizers * jnp.sum(class_weight)
+                    - jnp.sum(logits * weight, axis=axis)
+                ) / num_classes
+                losses = (
+                    (1.0 - label_smoothing) * target_weights * negative_log_likelihood
+                    + label_smoothing * smooth_losses
+                )
+            target_normalizer = jnp.sum(
+                target_weights,
+                where=no_ignore,
             )
-            label_logits = label_logits.reshape(labels_no_ignore.shape)
-            losses = log_normalizers - label_logits
 
         losses = jnp.where(no_ignore, losses, 0.0)
     else:
         target_probs = (
             target * (1.0 - label_smoothing)
-            + jnp.ones_like(target) / C * label_smoothing
+            + jnp.ones_like(target) / num_classes * label_smoothing
         )
 
         logits_max = jnp.max(input, axis=axis, keepdims=True)
@@ -135,23 +138,21 @@ def softmax_cross_entropy(
 
         log_normalizers = jax.nn.logsumexp(logits, axis=axis)
 
-        if weight is not None:
+        if class_weight is not None:
             target_probs = target_probs * weight
-            log_normalizers = log_normalizers * jnp.sum(
-                target_probs * weight, axis=axis
-            )
-            target_normalizer = jnp.sum(target_probs)
 
-        losses = -(jnp.sum(target_probs * logits, axis=axis) - log_normalizers)
+        losses = log_normalizers * jnp.sum(target_probs, axis=axis) - jnp.sum(
+            target_probs * logits, axis=axis
+        )
 
         no_ignore = None
 
     if reduction == "none":
         return losses
     if reduction == "mean":
-        if weight is None:
+        if target.ndim == input.ndim:
+            return jnp.mean(losses)
+        if class_weight is None:
             return jnp.mean(losses, where=no_ignore)
-        else:
-            return jnp.sum(losses, where=no_ignore) / target_normalizer
-    if reduction == "sum":
-        return jnp.sum(losses, where=no_ignore)
+        return jnp.sum(losses, where=no_ignore) / target_normalizer
+    return jnp.sum(losses, where=no_ignore)

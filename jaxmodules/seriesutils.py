@@ -24,7 +24,7 @@ def patch_series(
 
     splits serie into patches of length patch_len to return an array of shape:
 
-    [(L-patch_len+1)//stride, patch_len, ...]
+    [1 + (L-patch_len)//stride, patch_len, ...]
 
     result[i,j,...] is series[i*stride + j, ...]
 
@@ -36,6 +36,11 @@ def patch_series(
         tuple of int (left, right): apply this amount of zero-padding to the left and the right respetively.
 
     """
+
+    if patch_len <= 0:
+        raise ValueError(f"patch_len must be positive; got {patch_len}")
+    if stride <= 0:
+        raise ValueError(f"stride must be positive; got {stride}")
 
     if padding is None:
         padding = (0, 0)
@@ -54,8 +59,13 @@ def patch_series(
         series = jnp.pad(series, pad_width, mode="constant", constant_values=0)
 
     L = series.shape[0]
+    if patch_len > L:
+        raise ValueError(
+            f"patch_len ({patch_len}) cannot exceed the padded series length ({L})"
+        )
+
     # Number of patches
-    num_patches = 1 + (L - patch_len + 1) // stride
+    num_patches = 1 + (L - patch_len) // stride
 
     # Indices along the first dimension to gather from
     patch_starts = jnp.arange(num_patches) * stride  # shape: [num_patches]
