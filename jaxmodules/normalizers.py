@@ -1,5 +1,5 @@
 from collections.abc import Hashable, Sequence
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import jax
 import jax.lax as lax
@@ -13,7 +13,7 @@ from equinox import field
 from einops import rearrange
 
 
-def matrix_inverse_sqrt(M, eps=0):
+def matrix_inverse_sqrt(M, eps=0, *, precision=None):
     eig_vals, eig_vecs = jnp.linalg.eigh(M)
 
     inv_eig_vals = 1.0 / jnp.sqrt(jnp.maximum(eig_vals, eps))
@@ -23,6 +23,7 @@ def matrix_inverse_sqrt(M, eps=0):
         eig_vecs,
         inv_eig_vals,
         eig_vecs,
+        precision=precision,
     )
 
     return result
@@ -38,6 +39,7 @@ class StandardizeNorm(StatefulLayer, strict=True):
     eps: float = field(static=True)
     momentum: float = field(static=True)
     full_matrix: bool = field(static=True)
+    precision: Any = field(static=True)
 
     def __init__(
         self,
@@ -48,6 +50,7 @@ class StandardizeNorm(StatefulLayer, strict=True):
         momentum: float = 0.99,
         inference: bool = False,
         dtype=None,
+        precision=None,
     ):
         """**Arguments:**
 
@@ -69,6 +72,7 @@ class StandardizeNorm(StatefulLayer, strict=True):
             if `channelwise_affine` is `True`. Defaults to either
             `jax.numpy.float32` or `jax.numpy.float64` depending on whether JAX is in
             64-bit mode.
+        - `precision`: Optional JAX contraction precision for full-matrix statistics.
         """
         dtype = jnp.float32 if dtype is None else dtype
         self.full_matrix = full_matrix
@@ -90,6 +94,7 @@ class StandardizeNorm(StatefulLayer, strict=True):
         self.input_size = input_size
         self.eps = eps
         self.momentum = momentum
+        self.precision = precision
 
     @jax.named_scope("normalizers.StandardizeNorm")
     def __call__(
@@ -143,9 +148,11 @@ class StandardizeNorm(StatefulLayer, strict=True):
             centered_x = x_flat - running_mean
 
             if self.full_matrix:
-                new_cov = (
-                    centered_x.transpose() @ centered_x / N
-                )  # [d, N] @ [d, N] -> [d, d]
+                new_cov = jnp.matmul(
+                    centered_x.transpose(),
+                    centered_x,
+                    precision=self.precision,
+                ) / N
                 new_cov = lax.pmean(new_cov, self.axis_name)
             else:
                 new_cov = jnp.mean(centered_x**2, axis=0)
@@ -157,9 +164,17 @@ class StandardizeNorm(StatefulLayer, strict=True):
             centered_x = x_flat - running_mean
 
         if self.full_matrix:
-            preconditioner = matrix_inverse_sqrt(running_cov, self.eps)
+            preconditioner = matrix_inverse_sqrt(
+                running_cov,
+                self.eps,
+                precision=self.precision,
+            )
 
-            normalized = centered_x @ preconditioner
+            normalized = jnp.matmul(
+                centered_x,
+                preconditioner,
+                precision=self.precision,
+            )
         else:
             preconditioner = 1.0 / jnp.sqrt(running_cov + self.eps)
             normalized = centered_x * preconditioner
@@ -172,12 +187,14 @@ class CausalNorm(StatefulLayer):
     eps: float = field(static=True)
     mean_resolution: str = field(static=True)
     var_resolution: str = field(static=True)
+    precision: Any = field(static=True)
 
     def __init__(
         self,
         mean_resolution: str = "diag",
         var_resolution: str = "diag",
         eps: float = 1e-6,
+        precision=None,
     ):
         assert mean_resolution in ["diag", "scalar", "none"]
         assert var_resolution in ["diag", "scalar", "matrix"]
@@ -185,6 +202,7 @@ class CausalNorm(StatefulLayer):
         self.mean_resolution = mean_resolution
         self.var_resolution = var_resolution
         self.eps = eps
+        self.precision = precision
 
     def __call__(self, x: jax.Array, return_stats=False):
         T, C = x.shape
@@ -214,12 +232,26 @@ class CausalNorm(StatefulLayer):
 
             result = centered_x / jnp.sqrt(vars)
         elif self.var_resolution == "matrix":
-            vars = jnp.einsum("ti,tj->tij", centered_x, centered_x)
+            vars = jnp.einsum(
+                "ti,tj->tij",
+                centered_x,
+                centered_x,
+                precision=self.precision,
+            )
             vars = jnp.cumsum(vars, axis=0) / jnp.arange(1, T + 1).reshape((T, 1, 1))
 
-            preconditioner = matrix_inverse_sqrt(vars, self.eps)
+            preconditioner = matrix_inverse_sqrt(
+                vars,
+                self.eps,
+                precision=self.precision,
+            )
 
-            result = jnp.einsum("ti,tij->tj", centered_x, preconditioner)
+            result = jnp.einsum(
+                "ti,tij->tj",
+                centered_x,
+                preconditioner,
+                precision=self.precision,
+            )
 
         if return_stats:
             return result, means, vars

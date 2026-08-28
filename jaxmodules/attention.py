@@ -45,8 +45,11 @@ def default_kernel(q, k):
     return jnp.exp(jnp.dot(q, k) / jnp.sqrt(k.shape[-1]))
 
 
-def _attention_dot_precision(dtype):
-    """Use explicit GPU TF32 multiplies with FP32 accumulation for FP32."""
+def _attention_dot_precision(dtype, precision=None):
+    """Resolve an override or use the attention-specific default policy."""
+
+    if precision is not None:
+        return precision
 
     if (
         jnp.dtype(dtype) == jnp.dtype(jnp.float32)
@@ -111,6 +114,7 @@ def _attn_kq_block_fn(
     v_block, # [B, Lk, Hkv, dv]
     mask_fn,
     kernel_fn,
+    precision=None,
     is_causal=False,
 ):
     B, Lq, Hq, dq = q_block.shape
@@ -160,7 +164,7 @@ def _attn_kq_block_fn(
             "bqhmd,bkhd->bqhmk",
             q_block,
             k_block,
-            precision=_attention_dot_precision(q_block.dtype),
+            precision=_attention_dot_precision(q_block.dtype, precision),
             preferred_element_type=accumulator_dtype,
         )
         scores = scores / jnp.sqrt(jnp.asarray(dq, dtype=accumulator_dtype))
@@ -189,7 +193,7 @@ def _attn_kq_block_fn(
             "bqhmk,bkhe->bqhme",
             probabilities.astype(operand_dtype),
             v_block,
-            precision=_attention_dot_precision(q_block.dtype),
+            precision=_attention_dot_precision(q_block.dtype, precision),
             preferred_element_type=accumulator_dtype,
         )
 
@@ -215,6 +219,7 @@ def _attn_kq_block_fn(
             "bqhgk,bkhe->bqhge",
             scores,
             v_block,
+            precision=precision,
         )
         new_normalizer = normalizer + local_normalizer
         numerator = numerator + local_numerator
@@ -230,6 +235,7 @@ def _make_attention_kq_scanner(
     kernel_fn,
     q_idx,
     q_block,
+    precision,
     is_causal,
 ):
     def scan_fn(
@@ -249,6 +255,7 @@ def _make_attention_kq_scanner(
             v_block,
             mask_fn,
             kernel_fn,
+            precision=precision,
             is_causal=is_causal,
         )
         return (max_score, normalizer, numerator), None
@@ -266,6 +273,7 @@ def _attn_block_fn(
     kernel_fn,
     window_left,
     window_num_blocks,
+    precision=None,
     is_causal=False,
     use_causal_block_skipping=True,
 ):
@@ -356,6 +364,7 @@ def _attn_block_fn(
                 v_block[i],
                 mask_fn,
                 kernel_fn,
+                precision=precision,
                 is_causal=is_causal,
             )
             return (max_score, normalizer, numerator)
@@ -377,6 +386,7 @@ def _attn_block_fn(
             kernel_fn,
             q_idx,
             q_block,
+            precision,
             is_causal,
         )
         (max_score, normalizer, numerator), _ = jax.lax.scan(
@@ -486,6 +496,7 @@ def _single_tile_attention(
     kernel_fn,
     mask_fn,
     is_causal,
+    precision=None,
 ):
     """Evaluate one bounded score tile without scan or online-softmax state."""
     B, query_length, query_heads, query_dim = Q.shape
@@ -523,7 +534,7 @@ def _single_tile_attention(
                 "bqhd,bkhd->bhqk",
                 query_group,
                 K,
-                precision=_attention_dot_precision(Q.dtype),
+                precision=_attention_dot_precision(Q.dtype, precision),
                 preferred_element_type=accumulator_dtype,
             )
             scores *= jnp.asarray(
@@ -567,7 +578,7 @@ def _single_tile_attention(
                 "bhqk,bkhe->bqhe",
                 probability_operand,
                 V,
-                precision=_attention_dot_precision(Q.dtype),
+                precision=_attention_dot_precision(Q.dtype, precision),
                 preferred_element_type=accumulator_dtype,
             )
 
@@ -589,6 +600,7 @@ def _single_tile_attention(
             "bqhk,bkhe->bqhe",
             weights,
             V,
+            precision=precision,
         )
         safe_normalizer = jnp.where(
             normalizer > 0,
@@ -635,6 +647,7 @@ def _masked_attention_via_map_impl(
     kv_block_size=None,
     window_size=None,
     is_causal=False,
+    precision=None,
 ) -> Array:
 
     B, L, Hk, d = K.shape
@@ -682,6 +695,7 @@ def _masked_attention_via_map_impl(
             kernel_fn,
             window_left,
             window_num_blocks,
+            precision=precision,
             is_causal=is_causal,
         )
 
@@ -713,6 +727,7 @@ def _masked_attention_via_map_impl(
         "window_size",
         "is_causal",
         "backward_strategy",
+        "precision",
     ],
 )
 def _masked_attention_via_map(
@@ -726,6 +741,7 @@ def _masked_attention_via_map(
     window_size=None,
     is_causal=False,
     backward_strategy="auto",
+    precision=None,
 ) -> Array:
     del backward_strategy
     values, _ = _masked_attention_via_map_impl(
@@ -738,6 +754,7 @@ def _masked_attention_via_map(
         kv_block_size=kv_block_size,
         window_size=window_size,
         is_causal=is_causal,
+        precision=precision,
     )
     return values.astype(Q.dtype)
 
@@ -753,6 +770,7 @@ def _masked_attention_via_map_fwd(
     window_size=None,
     is_causal=False,
     backward_strategy="auto",
+    precision=None,
 ) -> Tuple[Array, Tuple[Array, Array, Array, Array, Array]]:
     values, log_normalizer = _masked_attention_via_map_impl(
         Q,
@@ -764,6 +782,7 @@ def _masked_attention_via_map_fwd(
         kv_block_size=kv_block_size,
         window_size=window_size,
         is_causal=is_causal,
+        precision=precision,
     )
     del backward_strategy
     return values.astype(Q.dtype), (Q, K, V, values, log_normalizer)
@@ -923,6 +942,7 @@ def _standard_attention_backward_query_major(
     kv_block_size,
     window_size,
     is_causal,
+    precision=None,
 ):
     """Explicit tiled backward for standard scaled-dot-product attention."""
     B, N, Hq, d = Q.shape
@@ -937,7 +957,7 @@ def _standard_attention_backward_query_major(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = _attention_dot_precision(Q.dtype)
+    dot_precision = _attention_dot_precision(Q.dtype, precision)
 
     q_blocks = rearrange(
         Q,
@@ -1098,6 +1118,7 @@ def _standard_attention_backward_key_major(
     kv_block_size,
     window_size,
     is_causal,
+    precision=None,
 ):
     """Tiled backward carrying dQ and emitting each completed dK/dV tile."""
     B, N, Hq, d = Q.shape
@@ -1111,7 +1132,7 @@ def _standard_attention_backward_key_major(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = _attention_dot_precision(Q.dtype)
+    dot_precision = _attention_dot_precision(Q.dtype, precision)
 
     q_blocks = rearrange(
         Q,
@@ -1276,6 +1297,7 @@ def _standard_attention_backward_two_pass(
     kv_block_size,
     window_size,
     is_causal,
+    precision=None,
 ):
     """Minimize memory by completing Q and K/V gradients in separate passes."""
     B, N, Hq, d = Q.shape
@@ -1288,7 +1310,7 @@ def _standard_attention_backward_two_pass(
         jnp.float32,
     )
     scale = jnp.asarray(d**-0.5, dtype=accumulator_dtype)
-    dot_precision = _attention_dot_precision(Q.dtype)
+    dot_precision = _attention_dot_precision(Q.dtype, precision)
 
     q_blocks = rearrange(
         Q,
@@ -1498,6 +1520,7 @@ def _standard_attention_backward(
     window_size,
     is_causal,
     backward_strategy,
+    precision=None,
 ):
     """Choose the traversal with the smaller full-precision gradient carry."""
     if backward_strategy == "minimal":
@@ -1513,6 +1536,7 @@ def _standard_attention_backward(
             kv_block_size,
             window_size,
             is_causal,
+            precision,
         )
 
     query_carry_size = math.prod(Q.shape)
@@ -1534,6 +1558,7 @@ def _standard_attention_backward(
         kv_block_size,
         window_size,
         is_causal,
+        precision,
     )
 
 
@@ -1550,6 +1575,7 @@ def _custom_kernel_attention_backward(
     kv_block_size,
     window_size,
     is_causal,
+    precision=None,
 ):
     """Differentiate weighted attention while treating kernel_fn as opaque."""
     B, N, Hq, _ = Q.shape
@@ -1561,7 +1587,7 @@ def _custom_kernel_attention_backward(
         upstream_grad.dtype,
         jnp.float32,
     )
-    dot_precision = _attention_dot_precision(Q.dtype)
+    dot_precision = _attention_dot_precision(Q.dtype, precision)
 
     q_blocks = rearrange(
         Q,
@@ -1773,6 +1799,7 @@ def _masked_attention_via_map_bwd(
     window_size,
     is_causal,
     backward_strategy,
+    precision,
     res,
     upstream_grad,
 ):
@@ -1815,6 +1842,7 @@ def _masked_attention_via_map_bwd(
             window_size,
             is_causal,
             backward_strategy,
+            precision,
         )
 
     del backward_strategy
@@ -1831,6 +1859,7 @@ def _masked_attention_via_map_bwd(
         kv_block_size,
         window_size,
         is_causal,
+        precision,
     )
 
 
@@ -2017,6 +2046,65 @@ def _can_use_mosaic_attention(
     return supports_mosaic_attention(Q, K, V, mask_fn)
 
 
+def _canonical_precision_for_mosaic(precision):
+    """Canonicalize the public Precision forms needed for compatibility checks."""
+    if isinstance(precision, str):
+        try:
+            return (jax.lax.Precision(precision),) * 2
+        except ValueError:
+            try:
+                return jax.lax.DotAlgorithmPreset[precision]
+            except KeyError:
+                return precision
+    if isinstance(precision, jax.lax.Precision):
+        return (precision, precision)
+    if isinstance(precision, (tuple, list)) and len(precision) == 2:
+        try:
+            return tuple(jax.lax.Precision(value) for value in precision)
+        except ValueError:
+            return precision
+    return precision
+
+
+def _mosaic_supports_precision(dtype, precision):
+    """Whether Mosaic's fixed MMA policy satisfies an explicit request."""
+    if precision is None:
+        return True
+
+    precision = _canonical_precision_for_mosaic(precision)
+    dtype = jnp.dtype(dtype)
+    if isinstance(precision, tuple) and all(
+        isinstance(value, jax.lax.Precision) for value in precision
+    ):
+        if dtype == jnp.dtype(jnp.float32):
+            return all(
+                value in (jax.lax.Precision.DEFAULT, jax.lax.Precision.HIGH)
+                for value in precision
+            )
+        # JAX Precision enum settings only affect FP32 contractions. Mosaic
+        # uses the native FP16/BF16 inputs and accumulates into FP32.
+        return dtype in (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
+
+    if precision == jax.lax.DotAlgorithmPreset.DEFAULT:
+        return True
+    compatible_algorithm = {
+        jnp.dtype(jnp.float16): jax.lax.DotAlgorithmPreset.F16_F16_F32,
+        jnp.dtype(jnp.bfloat16): jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+        jnp.dtype(jnp.float32): jax.lax.DotAlgorithmPreset.TF32_TF32_F32,
+    }.get(dtype)
+    return precision == compatible_algorithm
+
+
+def _check_mosaic_precision(dtype, precision):
+    if _mosaic_supports_precision(dtype, precision):
+        return
+    raise ValueError(
+        "Mosaic attention cannot honor the requested contraction precision. "
+        "Use a compatible precision, omit the override, or pass "
+        "implementation='xla' to explicitly select the JAX/XLA path."
+    )
+
+
 def attention(
     Q: Array,
     K: Array,
@@ -2024,11 +2112,13 @@ def attention(
     *,
     is_causal: bool = False,
     kernel_fn: Callable[[Array, Array], float] = default_kernel,
+    precision=None,
     mask_fn: Optional[Union[Callable[int, Array], Array]] = None,
     block_size: Optional[int] = None,
     kv_block_size: Optional[int] = None,
     window_size: Optional[Tuple[int, int]] = None,
     backward_strategy: str = "auto",
+    implementation: str = "auto",
 ) -> Array:
     """Compute memory-efficient attention with automatic backend dispatch.
 
@@ -2048,6 +2138,10 @@ def attention(
         Low-precision inputs use their native tensor-core multiplies with FP32
         accumulation. On GPU, FP32 inputs use TF32 tensor-core multiplies with
         FP32 accumulation; CPU fallback retains full FP32 contractions.
+    precision: Optional JAX contraction precision passed to every native
+        ``jnp.einsum`` in the forward and backward computations. ``None``
+        preserves the dtype-specific policy described above. Mosaic accepts
+        explicit settings only when its fixed MMA policy satisfies them.
     mask_fn: takes integers b, h, q, k or h, q, kand returns a boolean specifying
         the attention mask for the bth item in batch, hth head and the qth query and kth key.
         If ``is_causal`` is true, this user mask is intersected with the causal
@@ -2077,6 +2171,11 @@ def attention(
         contraction or accumulation precision for a given input dtype. The
         strategy applies to the optimized default kernel; custom kernels use
         an analytic tiled VJP around the arbitrary callable.
+    implementation: ``"auto"`` chooses the bounded single-tile, Mosaic, or
+        mapped XLA implementation according to the inputs. ``"xla"``
+        explicitly disables Mosaic. ``"mosaic"`` requires Mosaic support.
+        Automatic dispatch raises rather than silently falling back when
+        Mosaic supports the inputs but cannot honor ``precision``.
 
     Returns:
         Attention values with the same dtype as ``Q``. Softmax reductions and
@@ -2117,6 +2216,8 @@ def attention(
         raise ValueError(
             "backward_strategy must be 'auto', 'minimal', or 'one_pass'"
         )
+    if implementation not in ("auto", "xla", "mosaic"):
+        raise ValueError("implementation must be 'auto', 'xla', or 'mosaic'")
 
     # Canonicalize mask_fn to 4-arg form
     mask_fn = _canonicalize_mask_fn(mask_fn, is_causal)
@@ -2150,7 +2251,7 @@ def attention(
     # multi-tile state through one-element loops. The callable mask API is
     # unchanged: larger supported coordinate-only JAX expressions use Mosaic
     # GPU, while every other case retains the established mapped implementation.
-    if _can_use_single_tile_attention(
+    can_use_single_tile = _can_use_single_tile_attention(
         Q,
         K,
         V,
@@ -2158,24 +2259,31 @@ def attention(
         effective_kv_block_size,
         window_size,
         backward_strategy,
+    )
+    can_use_mosaic = False
+    if implementation != "xla" and not (
+        implementation == "auto" and can_use_single_tile
     ):
-        result = _single_tile_attention(
+        can_use_mosaic = _can_use_mosaic_attention(
             Q,
             K,
             V,
-            kernel_fn=kernel_fn,
-            mask_fn=mask_fn,
-            is_causal=is_causal,
+            kernel_fn,
+            mask_fn,
+            window_size,
+            backward_strategy,
         )
-    elif _can_use_mosaic_attention(
-        Q,
-        K,
-        V,
-        kernel_fn,
-        mask_fn,
-        window_size,
-        backward_strategy,
+
+    if implementation == "mosaic" and not can_use_mosaic:
+        raise ValueError(
+            "Mosaic attention does not support this dtype, shape, mask, "
+            "kernel, window, or backward strategy."
+        )
+
+    if implementation == "mosaic" or (
+        implementation == "auto" and can_use_mosaic
     ):
+        _check_mosaic_precision(Q.dtype, precision)
         result = _masked_attention_via_mosaic(
             Q,
             K,
@@ -2186,6 +2294,16 @@ def attention(
             window_size=window_size,
             is_causal=is_causal,
             backward_strategy=backward_strategy,
+        )
+    elif can_use_single_tile:
+        result = _single_tile_attention(
+            Q,
+            K,
+            V,
+            kernel_fn=kernel_fn,
+            mask_fn=mask_fn,
+            is_causal=is_causal,
+            precision=precision,
         )
     else:
         result = _masked_attention_via_map(
@@ -2199,6 +2317,7 @@ def attention(
             window_size=window_size,
             is_causal=is_causal,
             backward_strategy=backward_strategy,
+            precision=precision,
         )
 
     # Remove padding and batch dimension
@@ -2224,6 +2343,7 @@ def _flex_attention(
     scale: Optional[Array] = None,
     enable_gqa: bool = False,
     return_lse=False,
+    precision=None,
 ):
     """
     Flexible attention implementation that supports block-sparse attention patterns.
@@ -2238,6 +2358,7 @@ def _flex_attention(
         scale: Optional scaling factor for attention scores. If None, uses 1/sqrt(E)
         enable_gqa: If True, enables grouped-query attention where Hq can be larger than Hkv
         return_lse: If True, returns log-sum-exp of attention scores along with output (currently not supported)
+        precision: Optional JAX contraction precision passed to ``jnp.einsum``.
 
     Returns:
         If return_lse is False:
@@ -2303,6 +2424,7 @@ def _flex_attention(
             "qd,kd->qk",
             query[b, h, g, l],
             key[b, h, s],
+            precision=precision,
         ) * scale
         if score_mod is not None:
             score = multi_vmap(
@@ -2369,6 +2491,7 @@ def _flex_attention(
             "qk,ke->qe",
             jnp.exp(score_normalized),
             value[b, h, s],
+            precision=precision,
         )
 
         max_score_delta = max_score - jnp.where(
@@ -2454,7 +2577,8 @@ def _flex_attention(
 
 
 flex_attention = jax.jit(
-    _flex_attention, static_argnames=["score_mod", "enable_gqa", "return_lse"]
+    _flex_attention,
+    static_argnames=["score_mod", "enable_gqa", "return_lse", "precision"],
 )
 
 
@@ -2467,6 +2591,7 @@ def _flex_attention_slow(
     scale: Optional[Array] = None,
     enable_gqa: bool = False,
     return_lse=False,
+    precision=None,
 ):
     """
     Slower but more slightly more straightforward implementation of flex_attention.
@@ -2481,6 +2606,7 @@ def _flex_attention_slow(
         scale: Optional scaling factor for attention scores. If None, uses 1/sqrt(E)
         enable_gqa: If True, enables grouped-query attention where Hq can be larger than Hkv
         return_lse: If True, returns log-sum-exp of attention scores along with output
+        precision: Optional JAX contraction precision passed to ``jnp.einsum``.
 
     Returns:
         If return_lse is False:
@@ -2531,6 +2657,7 @@ def _flex_attention_slow(
         "bhglqd,bhskd->bhglsqk",
         query,
         key,
+        precision=precision,
     ) * scale
     if score_mod is not None:
 
@@ -2583,6 +2710,7 @@ def _flex_attention_slow(
         "bhglqs,bhse->bhglqe",
         scores,
         value,
+        precision=precision,
     )
 
     output_values = rearrange(output_values, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev")
@@ -2590,5 +2718,6 @@ def _flex_attention_slow(
     return output_values
 
 flex_attention_slow = jax.jit(
-    _flex_attention_slow, static_argnames=["score_mod", "enable_gqa", "return_lse"]
+    _flex_attention_slow,
+    static_argnames=["score_mod", "enable_gqa", "return_lse", "precision"],
 )

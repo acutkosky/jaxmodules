@@ -58,8 +58,10 @@ and outputs. Dense causal and unmasked FP32 attention with 64- to 128-wide
 heads additionally uses producer/consumer operand staging; wider heads and
 general callable masks retain the dimension-generic Mosaic kernel rather than
 failing. The callable API is unchanged. Unsupported callables, shapes, dtypes,
-custom score kernels, and explicit windowing conservatively retain the
-`jax.lax.map` implementation.
+custom score kernels and explicit windowing conservatively retain the
+`jax.lax.map` implementation. Explicit precision settings must match Mosaic's
+fixed MMA policy or select `implementation="xla"`; automatic dispatch never
+silently changes implementations to satisfy a precision override.
 
 Key features:
 - Memory-efficient block-wise processing using `jax.lax.map`
@@ -67,6 +69,8 @@ Key features:
 - Customizable attention masks via `mask_fn`
 - Support for causal masking
 - Optional windowing for local attention patterns
+- Optional `precision` override for every JAX-native contraction
+- Explicit `auto`, `xla`, and `mosaic` implementation selection
 - Configurable block sizes for memory/performance trade-offs
 - Compatible with `jax.jit`, `jax.vmap`, and the existing custom VJP
 
