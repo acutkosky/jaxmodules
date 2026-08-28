@@ -5,15 +5,9 @@ from typing import Callable, Union, Optional, Dict, Any, NamedTuple, Tuple
 from jaxtyping import Array, Float, UInt
 import equinox as eqx
 from einops import rearrange, repeat
-from jaxmodules.vectorize import array_from_coords, multi_vmap, multi_vmap_transposed_in_axes, nested_fori_loop, fancy_vmap#, einsum
+from jaxmodules.vectorize import array_from_coords, multi_vmap, multi_vmap_transposed_in_axes, nested_fori_loop, fancy_vmap
 from jaxmodules.block_mask import BlockMask
 from functools import partial
-from einops import einsum
-
-def use_custom_einsum():
-    global einsum
-    from jaxmodules.vectorize import einsum as use_custom_einsum
-    einsum = use_custom_einsum
 
 
 def threshold_kernel(threshold: Optional[float] = None):
@@ -217,10 +211,10 @@ def _attn_kq_block_fn(
         scores = jnp.where(mask, scores, jnp.zeros_like(scores))
 
         local_normalizer = jnp.sum(scores, axis=-1, keepdims=True)
-        local_numerator = einsum(
+        local_numerator = jnp.einsum(
+            "bqhgk,bkhe->bqhge",
             scores,
             v_block,
-            "B Lq Hkv MQA Lk, B Lk Hkv d -> B Lq Hkv MQA d",
         )
         new_normalizer = normalizer + local_normalizer
         numerator = numerator + local_numerator
@@ -591,10 +585,10 @@ def _single_tile_attention(
             jnp.zeros_like(weights),
         )
         normalizer = jnp.sum(weights, axis=-1, keepdims=True)
-        numerator = einsum(
+        numerator = jnp.einsum(
+            "bqhk,bkhe->bqhe",
             weights,
             V,
-            "B Q H K, B K H e -> B Q H e",
         )
         safe_normalizer = jnp.where(
             normalizer > 0,
@@ -2305,7 +2299,11 @@ def _flex_attention(
     value = rearrange(value, "B Hvk (S KVb) Ev -> B Hvk S KVb Ev", KVb=KV_BLOCK_SIZE)
 
     def get_score_for_query_kv_block(b, h, g, l, s):
-        score = einsum(query[b, h, g, l], key[b, h, s], "Qb E, KVb E -> Qb KVb") * scale
+        score = jnp.einsum(
+            "qd,kd->qk",
+            query[b, h, g, l],
+            key[b, h, s],
+        ) * scale
         if score_mod is not None:
             score = multi_vmap(
                 lambda score, qidx, kidx: score_mod(
@@ -2367,8 +2365,10 @@ def _flex_attention(
 
         score_normalized = score - next_max_score
         score_normalized = jnp.where(mask, score_normalized, inf_block)
-        value_for_block = einsum(
-            jnp.exp(score_normalized), value[b, h, s], "Qb KVb, KVb Ev -> Qb Ev"
+        value_for_block = jnp.einsum(
+            "qk,ke->qe",
+            jnp.exp(score_normalized),
+            value[b, h, s],
         )
 
         max_score_delta = max_score - jnp.where(
@@ -2527,10 +2527,11 @@ def _flex_attention_slow(
     )
     key = rearrange(key, "B Hkv (S KVb) E -> B Hkv S KVb E", KVb=KV_BLOCK_SIZE)
 
-    scores = (
-        einsum(query, key, "B Hkv G L Qb E, B Hkv S KVb E -> B Hkv G L S Qb KVb")
-        * scale
-    )
+    scores = jnp.einsum(
+        "bhglqd,bhskd->bhglsqk",
+        query,
+        key,
+    ) * scale
     if score_mod is not None:
 
         def block_grouped_score_mod(score, b, h, g, l, s, qb, kb):
@@ -2578,8 +2579,10 @@ def _flex_attention_slow(
 
     scores = jax.nn.softmax(scores, axis=-1)
 
-    output_values = einsum(
-        scores, value, "B Hkv G L Qb S, B Hkv S Ev -> B Hkv G L Qb Ev"
+    output_values = jnp.einsum(
+        "bhglqs,bhse->bhglqe",
+        scores,
+        value,
     )
 
     output_values = rearrange(output_values, "B Hkv G L Qb Ev -> B (Hkv G) (L Qb) Ev")

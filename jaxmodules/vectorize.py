@@ -3,7 +3,6 @@ from jax import numpy as jnp
 from typing import Callable, List, Tuple, Dict, Any, Union, Sequence, Optional
 from jaxtyping import Array, Float, Int, PyTree
 import numpy as np
-import einops
 import re
 
 def array_from_coords(shape: Tuple[int, ...], fn: Callable[..., Array]) -> Array:
@@ -252,136 +251,6 @@ def nested_fori_loop(
         init_val=init_val,
     )
 
-def _remove_repeated_elements(lst):
-    return [x for i, x in enumerate(lst) if x not in lst[:i]]
-
-'''
-This is an implementation of einsum that uses the same pattern parsing as einops.
-However, einops relies on jnp.einsum as a backend. This sounds reasonable,
-but for some reason jnp.einops introduces a lot of floating point error that
-is not present in this version that just relies on jax.vmap.
-'''
-def einsum(*args):
-
-    pattern = args[-1]
-    args = list(args[:-1])
-
-
-
-    in_patterns, out_patterns = pattern.split("->")
-    in_patterns = in_patterns.split(",")
-    in_patterns = [p.strip() for p in in_patterns]
-    in_patterns = [
-        [p.strip() for p in in_pattern.split(" ") if p != ""] for in_pattern in in_patterns
-    ]
-    out_patterns = out_patterns.strip()
-    out_patterns = out_patterns.split(" ")
-    out_patterns = [p.strip() for p in out_patterns if p != ""]
-
-
-    assert len(in_patterns) == len(args), "number of input patterns must match number of arguments"
-
-
-    # first, let's preprocess out all the repeated indices in input patterns. Hopefully
-    # we can rely on baseline einsum for this since it's just memory routing and no floating point operations.
-
-    for idx in range(len(in_patterns)):
-        in_pattern = in_patterns[idx]
-        unique_pattern = _remove_repeated_elements(in_pattern)
-        if len(unique_pattern) < len(in_pattern):
-            in_patterns[idx] = unique_pattern
-            args[idx] = einops.einsum(args[idx], " ".join(in_pattern) + " -> " + " ".join(unique_pattern))
-            
-        
-    # handle ellipses
-    max_ellipsis_shape = []
-
-    for idx in range(len(in_patterns)):
-        in_pattern = in_patterns[idx]
-        arg = args[idx]
-        if arg.ndim != len(in_pattern):
-            # there must be exactly one ellipsis in this pattern
-            ellipsis_count = sum(p == "..." for p in in_pattern)
-            if ellipsis_count != 1:
-                raise ValueError(f"pattern {in_pattern} has {ellipsis_count} ellipses, but there must be exactly one.")
-            ellipsis_idx = in_pattern.index("...")
-
-            ellipsis_shape = arg.shape[ellipsis_idx:len(arg.shape)-len(in_pattern[ellipsis_idx+1:])]
-            if len(max_ellipsis_shape) < len(ellipsis_shape):
-                assert all([x == y for x, y in zip(max_ellipsis_shape, ellipsis_shape[-len(max_ellipsis_shape):])]), "ellipsis shapes must broadcast"
-                max_ellipsis_shape = ellipsis_shape
-            else:
-                assert all([x == y for x, y in zip(max_ellipsis_shape[-len(ellipsis_shape):], ellipsis_shape)]), "ellipsis shapes must broadcast"
-
-            new_in_pattern = in_pattern[:ellipsis_idx] + list(range(-len(ellipsis_shape), 0)) + in_pattern[ellipsis_idx+1:]
-            in_patterns[idx] = new_in_pattern
-
-    out_axes = []
-    idx = 0
-    if '...' in out_patterns:
-        out_patterns = out_patterns[:out_patterns.index('...')] + list(range(-len(max_ellipsis_shape), 0)) + out_patterns[out_patterns.index('...')+1:]
-
-    out_axes = list(range(len(out_patterns)))
-
-
-    def get_in_axis(p):
-        out_axes_map = {
-            name: i for i, name in enumerate(p)
-        }
-        axes = list(out_axes_map.get(out, None) for out in out_patterns)
-        return axes
-
-    in_axes=[get_in_axis(p) for p in in_patterns]
-
-    summed_in_axes = [
-        [p for p in in_pattern if p not in out_patterns] for in_pattern in in_patterns
-    ]
-
-    max_summed_in_axis = []
-    for summed_in_axis in summed_in_axes:
-        if len(max_summed_in_axis) < len(summed_in_axis):
-            max_summed_in_axis = summed_in_axis
-
-    def broadcast_and_multiply(axes_prod, axes_factor, ar_prod, ar_factor):
-        axes_broadcast = axes_prod + [ax for ax in axes_factor if ax not in axes_prod]
-
-        prod_shape_map = {ax: shape for ax, shape in zip(axes_prod, ar_prod.shape)}
-        factor_shape_map = {ax: shape for ax, shape in zip(axes_factor, ar_factor.shape)}
-
-        prod_shape = [prod_shape_map.get(ax, 1) for ax in axes_broadcast]
-        ar_prod = jnp.reshape(ar_prod, prod_shape)
-
-        factor_position_map = {ax: i for i, ax in enumerate(axes_factor)}
-        ar_factor = jnp.reshape(ar_factor, list(ar_factor.shape) + [1] * (len(axes_broadcast) - len(ar_factor.shape)))
-        idx = len(axes_factor)
-        for ax in axes_broadcast:
-            if ax in factor_position_map:
-                continue
-            else:
-                factor_position_map[ax] = idx
-                idx += 1
-
-        ar_factor = jnp.transpose(ar_factor, [factor_position_map[ax] for ax in axes_broadcast])
-
-        return ar_factor * ar_prod, axes_broadcast
-
-    def sum_prod(*args):
-        prod = args[0]
-        prod_shape = summed_in_axes[0]
-        for arg, factor_shape in zip(args[1:], summed_in_axes[1:]):
-            prod, prod_shape = broadcast_and_multiply(prod_shape, factor_shape, prod, arg)
-        return jnp.sum(prod)
-
-    if len(out_axes) == 0:
-        return sum_prod(*args)
-
-    return multi_vmap_transposed_in_axes(
-        sum_prod,
-        in_axes=in_axes,
-        out_axes=out_axes
-    )(*args)
-
-
 def _split_string_no_whitespace(s: str) -> List[str]:
     return [x for x in s.split(' ') if x != ""]
 
@@ -525,4 +394,3 @@ def fancy_vmap(fn: Callable, fmt: str) -> Callable:
     in_axes = [make_in_axes(out_idx) for out_idx in out_axes_list]
 
     return multi_vmap(fn, in_axes=in_axes, out_axes=out_axes_list)
-

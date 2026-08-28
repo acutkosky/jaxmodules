@@ -10,7 +10,7 @@ import equinox as eqx
 from equinox.nn import StateIndex, StatefulLayer, State
 from equinox import field
 
-from einops import einsum, rearrange
+from einops import rearrange
 
 
 def matrix_inverse_sqrt(M, eps=0):
@@ -18,8 +18,11 @@ def matrix_inverse_sqrt(M, eps=0):
 
     inv_eig_vals = 1.0 / jnp.sqrt(jnp.maximum(eig_vals, eps))
 
-    result = einsum(
-        eig_vecs, inv_eig_vals, eig_vecs, "... d1 d2, ... d2, ... d3 d2 -> ... d1  d3"
+    result = jnp.einsum(
+        "...ij,...j,...kj->...ik",
+        eig_vecs,
+        inv_eig_vals,
+        eig_vecs,
     )
 
     return result
@@ -211,12 +214,12 @@ class CausalNorm(StatefulLayer):
 
             result = centered_x / jnp.sqrt(vars)
         elif self.var_resolution == "matrix":
-            vars = einsum(centered_x, centered_x, "t c1, t c2 -> t c1 c2")
+            vars = jnp.einsum("ti,tj->tij", centered_x, centered_x)
             vars = jnp.cumsum(vars, axis=0) / jnp.arange(1, T + 1).reshape((T, 1, 1))
 
             preconditioner = matrix_inverse_sqrt(vars, self.eps)
 
-            result = einsum(centered_x, preconditioner, "t c, t c c2 -> t c2")
+            result = jnp.einsum("ti,tij->tj", centered_x, preconditioner)
 
         if return_stats:
             return result, means, vars

@@ -4,10 +4,8 @@ import jax.numpy as jnp
 import torch
 import numpy as np
 from torch.nn.attention import flex_attention as torch_fa
-from jaxmodules.attention import flex_attention, flex_attention_slow, use_custom_einsum
+from jaxmodules.attention import flex_attention, flex_attention_slow
 from jaxmodules.block_mask import BlockMask, create_block_mask
-
-use_custom_einsum() # required for higher precision to get the tests to pass.
 
 def jax_to_torch(x):
     """Convert JAX array to PyTorch tensor"""

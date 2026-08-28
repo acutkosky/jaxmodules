@@ -2,7 +2,7 @@ import jax
 from jax import numpy as jnp
 from jaxtyping import Array, UInt
 from jaxmodules.vectorize import array_from_coords, nested_fori_loop, multi_vmap
-from einops import rearrange, einsum
+from einops import rearrange
 from typing import Callable, NamedTuple, Tuple
 import equinox as eqx
 
@@ -425,7 +425,7 @@ def get_sparse_kv_data_from_blocks(blocks: Array):
     blocks = blocks.astype(jnp.int32)
     if blocks.ndim == 2:
         blocks = rearrange(blocks, "kv q -> 1 1 kv q")
-    kv_num_blocks = einsum(blocks, "... kv q -> ... kv")  # [b h kv q] -> [b h kv]
+    kv_num_blocks = jnp.sum(blocks, axis=-1)  # [b h kv q] -> [b h kv]
     # kv_indices = jax.vmap(jax.vmap(jax.vmap(lambda x: jnp.flip(jnp.argsort(x)))))(blocks)
     kv_indices = jnp.argsort(-blocks, axis=-1)
 

@@ -9,12 +9,8 @@ from jaxmodules.attention import (
     _unmasked,
     attention,
     masked_attention_via_map,
-    use_custom_einsum,
 )
 from jaxmodules.vectorize import fancy_vmap
-
-
-use_custom_einsum()  # Required for higher precision to get the tests to pass.
 
 # GPU FP32 attention intentionally uses TF32 tensor-core multiplies. Different
 # tile shapes can therefore round the same contraction in a different order.

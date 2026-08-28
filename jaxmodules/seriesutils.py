@@ -10,7 +10,7 @@ import equinox as eqx
 from equinox.nn import StateIndex, StatefulLayer, State
 from equinox import field
 
-from einops import einsum, rearrange
+from einops import rearrange
 
 
 def patch_series(
